@@ -149,14 +149,12 @@ impl State {
         todo!("record subscriber, recompute PTY sizes for now-viewed server-panes")
     }
 
+    /// Also used to clean up a connection that dropped without sending
+    /// an explicit `Unsubscribe` (design doc doesn't distinguish the two
+    /// cases — see `daemon::handle_connection`'s post-loop cleanup).
     pub fn unsubscribe(&mut self, subscriber: SubscriberId, workspace: WorkspaceId) {
         let _ = (subscriber, workspace);
         todo!("drop subscriber, recompute PTY sizes for now-unviewed server-panes")
-    }
-
-    pub fn unsubscribe_all_for_connection(&mut self, workspace: WorkspaceId) {
-        let _ = workspace;
-        todo!("connection dropped without an explicit Unsubscribe; clean up the same way")
     }
 
     /// Recompute and apply smallest-viewer-wins sizing (design doc "PTY
@@ -165,6 +163,27 @@ impl State {
     /// is currently viewing.
     pub fn resize_client_pane(&mut self, pane: ClientPaneId, size: Size) {
         let _ = (pane, size);
+        todo!()
+    }
+
+    // -- broadcast fan-out (used by daemon::dispatch, kept out of State so
+    //    State never performs I/O — see module doc comment) -------------
+
+    /// Every subscriber currently viewing `workspace`. `daemon::dispatch`
+    /// calls this after a layout mutation succeeds to know which
+    /// connections to push a `LayoutDelta` to.
+    pub fn subscribers_for_workspace(&self, workspace: WorkspaceId) -> Vec<SubscriberId> {
+        let _ = workspace;
+        todo!()
+    }
+
+    /// Every subscriber viewing any workspace that currently binds
+    /// `server_pane`. `daemon::dispatch` calls this after PTY output
+    /// changes (or the pane dies) to know which connections to push a
+    /// `GridDelta`/`ServerPaneDied` to, and it's also the input to
+    /// smallest-viewer-wins PTY sizing.
+    pub fn subscribers_for_server_pane(&self, server_pane: ServerPaneId) -> Vec<SubscriberId> {
+        let _ = server_pane;
         todo!()
     }
 }
