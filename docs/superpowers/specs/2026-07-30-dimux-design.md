@@ -172,16 +172,21 @@ Setup docs will include the exact `kitty.conf` snippet.
 | Chord | Action |
 |---|---|
 | `cmd-1`..`cmd-9` | switch to workspace N (create if absent) |
-| `cmd-d` | split focused client-pane vertically, open picker in new pane |
-| `cmd-shift-d` | split focused client-pane horizontally, open picker in new pane |
-| `cmd-p` | open picker to rebind focused client-pane (no split) |
+| `cmd-d` | split focused client-pane vertically, spawn a fresh server-pane and bind it into the new half |
+| `cmd-shift-d` | split focused client-pane horizontally, spawn a fresh server-pane and bind it into the new half |
 | `cmd-w` | close focused client-pane (server-pane keeps running) |
 | `cmd-shift-w` | kill focused client-pane's bound server-pane |
 | `cmd-h/j/k/l` | move focus between client-panes |
 
-The picker overlay lists all server-panes (id, name, running/dead, current
-size) plus a "spawn new" entry; selecting an existing one binds it,
-selecting "spawn new" prompts for a name/command and binds the result.
+Superseded: an earlier revision of this doc specified a `cmd-p` chord
+opening a picker overlay (choose an existing server-pane, or "spawn new")
+before binding it into the focused client-pane. That picker was built,
+then removed — `cmd-d`/`cmd-shift-d` becoming an instant "split + new
+shell" shortcut covers the common case with one keystroke instead of two,
+and the picker's only irreplaceable capability (binding a client-pane to
+an *existing* server-pane, e.g. to display one shell in two places) is
+still available via the CLI: `dimux client bind <workspace>/<pane>
+<server-name-or-id>`. There is currently no TUI keybind for that case.
 
 ## Error handling
 

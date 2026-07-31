@@ -81,7 +81,7 @@ pub mod render;
 use crate::cli::Client;
 use crate::protocol::{
     self, ClientPaneId, Event, GridSnapshot, Request, Response, ServerMessage, ServerPaneId,
-    ServerPaneInfo, SplitDir, SplitTree, WorkspaceInfo,
+    SplitDir, SplitTree, WorkspaceInfo,
 };
 use std::collections::HashMap;
 use tokio::io::AsyncReadExt;
@@ -95,7 +95,6 @@ pub enum Action {
     SwitchWorkspace(u8),
     SplitVertical,
     SplitHorizontal,
-    OpenPicker,
     CloseFocusedPane,
     KillFocusedServerPane,
     FocusLeft,
@@ -124,9 +123,6 @@ struct App {
     workspace: WorkspaceInfo,
     grids: HashMap<ServerPaneId, GridSnapshot>,
     focused: Option<ClientPaneId>,
-    picker_open: bool,
-    picker_selected: usize,
-    picker_servers: Vec<ServerPaneInfo>,
 }
 
 impl App {
@@ -153,9 +149,6 @@ impl App {
                         workspace,
                         grids: grids.into_iter().map(|g| (g.server_pane, g)).collect(),
                         focused,
-                        picker_open: false,
-                        picker_selected: 0,
-                        picker_servers: Vec::new(),
                     });
                 }
                 ServerMessage::Response(other) => {
@@ -245,72 +238,42 @@ impl App {
             self.focused = first_leaf(&workspace);
             self.workspace = workspace;
             self.grids = grids.into_iter().map(|g| (g.server_pane, g)).collect();
-            self.picker_open = false;
         }
         Ok(())
     }
 
-    /// `cmd-d`/`cmd-shift-d`: split the focused pane, then instantly show
-    /// the picker focused on the freshly created pane (design doc "Default
-    /// keybinds" — "split creates the new client-pane and instantly shows
-    /// the picker"). The updated split tree itself arrives via the
-    /// `LayoutDelta` this spawn provokes (handled by `apply_event`, not
-    /// applied manually here) — consistent with the protocol's own
-    /// philosophy of "a fresh snapshot/delta is the source of truth,
-    /// don't hand-roll the same state twice."
+    /// `cmd-d`/`cmd-shift-d`: split the focused pane and immediately bind
+    /// a freshly spawned server-pane into the new half — no menu. (The
+    /// design doc originally specified a picker here; the picker was
+    /// removed entirely in favor of this direct "split + new shell"
+    /// shortcut. Binding a client-pane to an *existing* server-pane, e.g.
+    /// to display one shell in two places, is still possible via the CLI:
+    /// `dimux client bind <workspace>/<pane> <server-name>`.)
+    ///
+    /// `split_of: self.focused` splits the focused pane if there is one;
+    /// if the workspace is empty (`self.focused` is `None`), `ClientSpawn`
+    /// creates the workspace's sole leaf instead (no split), so this is
+    /// also the entry point for spawning the very first pane.
     async fn split(
         &mut self,
         dir: SplitDir,
         write_half: &mut OwnedWriteHalf,
         read_half: &mut OwnedReadHalf,
     ) -> anyhow::Result<()> {
+        let Response::ServerPane(server) = self
+            .request(write_half, read_half, Request::ServerSpawn { name: None, cmd: None })
+            .await?
+        else {
+            return Ok(());
+        };
         let req = Request::ClientSpawn {
             workspace: self.workspace.id.to_string(),
             split_of: self.focused,
             dir: Some(dir),
-            bind: None,
+            bind: Some(server.id.to_string()),
         };
         if let Response::ClientPaneCreated { pane, .. } = self.request(write_half, read_half, req).await? {
             self.focused = Some(pane);
-            self.open_picker(write_half, read_half).await?;
-        }
-        Ok(())
-    }
-
-    /// `cmd-p`: open the picker to rebind the focused pane, no split.
-    ///
-    /// If the workspace is empty, there is no focused pane to rebind —
-    /// `self.focused` is `None` (see `first_leaf`/`reconcile_focus`, which
-    /// only ever point at an existing leaf). In that case this creates the
-    /// workspace's sole leaf first (the same `ClientSpawn` `split` uses
-    /// when starting from empty), then opens the picker on it, so `cmd-p`
-    /// is a working entry point on an empty workspace rather than a
-    /// no-op — mirrors the placeholder text `render::draw` shows for an
-    /// empty workspace: "press cmd-p to spawn a pane".
-    async fn open_picker(
-        &mut self,
-        write_half: &mut OwnedWriteHalf,
-        read_half: &mut OwnedReadHalf,
-    ) -> anyhow::Result<()> {
-        if self.focused.is_none() {
-            let req = Request::ClientSpawn {
-                workspace: self.workspace.id.to_string(),
-                split_of: None,
-                dir: None,
-                bind: None,
-            };
-            if let Response::ClientPaneCreated { pane, .. } =
-                self.request(write_half, read_half, req).await?
-            {
-                self.focused = Some(pane);
-            }
-        }
-        if let Response::ServerPaneList(list) =
-            self.request(write_half, read_half, Request::ServerList).await?
-        {
-            self.picker_servers = list;
-            self.picker_selected = 0;
-            self.picker_open = true;
         }
         Ok(())
     }
@@ -356,7 +319,7 @@ impl App {
         }
     }
 
-    /// Route one resolved `Action` (non-picker keymap) to its effect.
+    /// Route one resolved `Action` to its effect.
     async fn handle_action(
         &mut self,
         action: Action,
@@ -368,7 +331,6 @@ impl App {
             Action::SwitchWorkspace(n) => self.switch_workspace(n, write_half, read_half).await?,
             Action::SplitVertical => self.split(SplitDir::Vertical, write_half, read_half).await?,
             Action::SplitHorizontal => self.split(SplitDir::Horizontal, write_half, read_half).await?,
-            Action::OpenPicker => self.open_picker(write_half, read_half).await?,
             Action::CloseFocusedPane => self.close_focused(write_half, read_half).await?,
             Action::KillFocusedServerPane => {
                 self.kill_focused_server_pane(write_half, read_half).await?
@@ -382,73 +344,6 @@ impl App {
                 }
             }
         }
-        Ok(())
-    }
-
-    /// Route one raw picker-mode byte chunk. A distinct, simpler modal
-    /// input context than the main keymap (design doc task guidance) — no
-    /// need to reuse `keys::parse`'s chord grammar here.
-    async fn handle_picker_input(
-        &mut self,
-        bytes: &[u8],
-        write_half: &mut OwnedWriteHalf,
-        read_half: &mut OwnedReadHalf,
-    ) -> anyhow::Result<()> {
-        match parse_picker_input(bytes) {
-            PickerAction::Up => self.move_picker_selection(false),
-            PickerAction::Down => self.move_picker_selection(true),
-            PickerAction::Cancel => self.picker_open = false,
-            PickerAction::Confirm => self.confirm_picker(write_half, read_half).await?,
-            PickerAction::Ignore => {}
-        }
-        Ok(())
-    }
-
-    fn move_picker_selection(&mut self, forward: bool) {
-        // +1 for the trailing "spawn new" row (design doc "Default
-        // keybinds" — "plus a 'spawn new' entry"), which render.rs always
-        // appends after `servers` (see `render::draw_picker`).
-        let len = self.picker_servers.len() + 1;
-        self.picker_selected = if forward {
-            (self.picker_selected + 1) % len
-        } else {
-            (self.picker_selected + len - 1) % len
-        };
-    }
-
-    /// Confirm the picker's current selection: bind the focused
-    /// client-pane to the selected server-pane, spawning a fresh one
-    /// first if the trailing "spawn new" row is selected (design doc
-    /// "Default keybinds" — "selecting 'spawn new' ... binds the
-    /// result"; this task's simplified version spawns with no
-    /// name/command prompt rather than a full text-input UI).
-    async fn confirm_picker(
-        &mut self,
-        write_half: &mut OwnedWriteHalf,
-        read_half: &mut OwnedReadHalf,
-    ) -> anyhow::Result<()> {
-        let Some(pane) = self.focused else {
-            self.picker_open = false;
-            return Ok(());
-        };
-        let spawn_new_index = self.picker_servers.len();
-        let target = if self.picker_selected == spawn_new_index {
-            match self
-                .request(write_half, read_half, Request::ServerSpawn { name: None, cmd: None })
-                .await?
-            {
-                Response::ServerPane(info) => info.id.to_string(),
-                _ => {
-                    self.picker_open = false;
-                    return Ok(());
-                }
-            }
-        } else {
-            self.picker_servers[self.picker_selected].id.to_string()
-        };
-        let req = Request::ClientBind { workspace: self.workspace.id.to_string(), pane, target };
-        let _ = self.request(write_half, read_half, req).await?;
-        self.picker_open = false;
         Ok(())
     }
 }
@@ -485,35 +380,6 @@ fn cycle_focus(tree: &SplitTree, current: Option<ClientPaneId>, forward: bool) -
         None => 0,
     };
     Some(leaves[next_idx].id)
-}
-
-/// Picker-mode input, decoupled from the raw bytes that produced it (kept
-/// separate from `keys::parse`'s `Action` since the picker is a distinct
-/// modal context with its own, simpler grammar).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PickerAction {
-    Up,
-    Down,
-    Confirm,
-    Cancel,
-    Ignore,
-}
-
-/// Map one raw input chunk to a `PickerAction`. Direct byte matching
-/// (design doc task guidance: "doesn't need to reuse `keys::parse`'s
-/// chord grammar ... direct raw-byte matching is fine and simpler").
-/// Recognizes both arrow-key escape sequences and vi-style `j`/`k`, Enter
-/// (`\r` or `\n`) to confirm, and a bare `Esc` to cancel. Anything else is
-/// ignored rather than passed through — the picker is modal and has no
-/// server-pane to forward keystrokes to yet.
-fn parse_picker_input(bytes: &[u8]) -> PickerAction {
-    match bytes {
-        b"\r" | b"\n" => PickerAction::Confirm,
-        b"\x1b" => PickerAction::Cancel,
-        b"\x1b[A" | b"k" => PickerAction::Up,
-        b"\x1b[B" | b"j" => PickerAction::Down,
-        _ => PickerAction::Ignore,
-    }
 }
 
 /// RAII guard ensuring the terminal is restored (raw mode disabled,
@@ -555,11 +421,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     loop {
         terminal.draw(|frame| {
-            if app.picker_open {
-                render::draw_picker(frame, &app.picker_servers, app.picker_selected);
-            } else {
-                render::draw(frame, &app.workspace, &app.grids, app.focused);
-            }
+            render::draw(frame, &app.workspace, &app.grids, app.focused);
         })?;
 
         tokio::select! {
@@ -575,12 +437,8 @@ pub async fn run() -> anyhow::Result<()> {
                 if is_quit(bytes) {
                     break;
                 }
-                if app.picker_open {
-                    app.handle_picker_input(bytes, &mut write_half, &mut read_half).await?;
-                } else {
-                    let action = keys::parse(bytes);
-                    app.handle_action(action, bytes, &mut write_half, &mut read_half).await?;
-                }
+                let action = keys::parse(bytes);
+                app.handle_action(action, bytes, &mut write_half, &mut read_half).await?;
             }
             frame = protocol::framing::read_frame::<_, ServerMessage>(&mut read_half) => {
                 match frame {
@@ -666,36 +524,6 @@ mod tests {
         let stale = Uuid::new_v4();
         assert_eq!(cycle_focus(&tree, Some(stale), true), Some(a));
         assert_eq!(cycle_focus(&tree, Some(stale), false), Some(a));
-    }
-
-    #[test]
-    fn picker_input_enter_and_newline_confirm() {
-        assert_eq!(parse_picker_input(b"\r"), PickerAction::Confirm);
-        assert_eq!(parse_picker_input(b"\n"), PickerAction::Confirm);
-    }
-
-    #[test]
-    fn picker_input_bare_escape_cancels() {
-        assert_eq!(parse_picker_input(b"\x1b"), PickerAction::Cancel);
-    }
-
-    #[test]
-    fn picker_input_arrow_keys_move_selection() {
-        assert_eq!(parse_picker_input(b"\x1b[A"), PickerAction::Up);
-        assert_eq!(parse_picker_input(b"\x1b[B"), PickerAction::Down);
-    }
-
-    #[test]
-    fn picker_input_vi_keys_move_selection() {
-        assert_eq!(parse_picker_input(b"k"), PickerAction::Up);
-        assert_eq!(parse_picker_input(b"j"), PickerAction::Down);
-    }
-
-    #[test]
-    fn picker_input_unrecognized_bytes_are_ignored() {
-        assert_eq!(parse_picker_input(b"q"), PickerAction::Ignore);
-        assert_eq!(parse_picker_input(b""), PickerAction::Ignore);
-        assert_eq!(parse_picker_input(b"hello"), PickerAction::Ignore);
     }
 
     #[test]
