@@ -209,10 +209,35 @@ hand-parses Kitty's Cmd-chord sequences rather than using crossterm's
 event abstraction (see "Requests are sent through an `Event`-tolerant
 helper" design note in `tui/mod.rs` for why raw bytes are read at all).
 On mouse-down, it hit-tests the click position against every divider's
-current on-screen grab zone; while held, every mouse-move sends a live
-`Request::ResizeSplit` (not just the final position on release), so other
-frontends viewing the same workspace see the resize happen in real time
-too.
+current on-screen grab zone; while held, every mouse-move updates the
+drag's ratio purely locally (rendered via a workspace clone with the live
+ratio patched in — no network round-trip per move). Exactly one
+`Request::ResizeSplit` is sent, on mouse-up, committing the final
+position — other frontends see the resize once it's released, not live
+throughout the drag. (An earlier revision sent `ResizeSplit` on every
+`Drag` event; at typical drag speed this was dozens of requests per
+second, each awaited synchronously before the event loop's next stdin
+read, badly enough to stall the whole session.)
+
+At startup, the TUI enables only xterm's normal (`?1000h`) and
+button-event (`?1002h`) mouse tracking plus SGR extended coordinates
+(`?1006h`) — deliberately not any-event tracking (`?1003h`, which reports
+*every* mouse movement, including with no button held at all). An earlier
+revision used `ratatui::crossterm::event::EnableMouseCapture`, which
+enables all four unconditionally; under `?1003h`, moving the mouse over
+the window for any reason — not just dragging a divider — generated a
+mouse escape sequence dimux's parser didn't recognize (a bare-movement
+event encodes as SGR button number 3, which dimux has no binding for),
+and an unrecognized mouse byte used to fall through to the keyboard-chord
+parser, which also didn't recognize it, and wrote the raw escape sequence
+into the focused pane as literal text — the "random garbage characters"
+symptom, with enough volume during normal mouse use to also stall the
+event loop ("random hangups"). As defense in depth beyond narrowing which
+modes are requested, `tui::mouse::parse` also now recognizes *any*
+well-formed SGR mouse sequence (any button, any event kind) as
+"definitely mouse input" and discards it rather than falling through, so
+even a stray sequence from a terminal that doesn't fully honor the
+narrower mode request still can't leak into a pane as text.
 
 ## Error handling
 
