@@ -82,12 +82,18 @@
 //!   format rather than using crossterm's mouse events, for the same
 //!   reason raw bytes are read directly at all (see above) — crossterm's
 //!   `parse_event` is `pub(crate)`, not callable from here regardless.
-//!   `App::handle_mouse` hit-tests `Down` against
-//!   `render::divider_rects` (recomputed fresh every call — the tree can
-//!   change between mouse events) and, once a divider is grabbed, sends a
-//!   live `Request::ResizeSplit` on *every* `Drag` event (not just on
-//!   release), so other frontends viewing the same workspace see the
-//!   resize happen in real time too.
+//!   `App::handle_mouse` hit-tests `Down` against `render::divider_rects`
+//!   (recomputed fresh every call — the tree can change between mouse
+//!   events). **A previous version of this sent `Request::ResizeSplit` on
+//!   every single `Drag` event** — dozens of requests per second at
+//!   typical drag speed, each awaited synchronously before the next
+//!   stdin read, badly enough to stall the whole session. `Drag` now only
+//!   updates `dragging_split`'s ratio locally (no request); `run`'s draw
+//!   closure renders a workspace clone with that ratio patched in via
+//!   `SplitTree::resize_split`, so the drag still looks smooth. Exactly
+//!   one `Request::ResizeSplit` is sent, on `Up`, committing the final
+//!   position — other frontends see the resize only once it's released,
+//!   not live throughout the drag.
 
 pub mod keys;
 pub mod mouse;
@@ -161,11 +167,23 @@ struct App {
     /// current layout on every mouse event (dividers move every frame the
     /// tree does, so this can't be cached across ticks).
     frame_area: ratatui::layout::Rect,
-    /// `Some(split)` while a mouse-down on a divider's grab zone is
-    /// currently held (a drag in progress); cleared on mouse-up. Reset to
-    /// `None` on any workspace switch too, since the split it names may
-    /// no longer exist in whatever workspace is now active.
-    dragging_split: Option<crate::protocol::SplitId>,
+    /// `Some((split, live_ratio))` while a mouse-down on a divider's grab
+    /// zone is currently held (a drag in progress); cleared on mouse-up.
+    /// Reset to `None` on any workspace switch too, since the split it
+    /// names may no longer exist in whatever workspace is now active.
+    ///
+    /// `live_ratio` tracks the drag's current position locally, updated
+    /// on every `Drag` event with *no* network round-trip — only on
+    /// `Up` does `handle_mouse` send the one `Request::ResizeSplit` that
+    /// actually commits it. This is deliberate: sending a resize request
+    /// per mouse-move (the original design) flooded the daemon with
+    /// dozens of requests per second during a drag, each one blocking the
+    /// event loop's next stdin read until its response came back, badly
+    /// enough to stall the whole session. Dragging still feels smooth
+    /// because `run`'s draw closure renders a workspace clone with
+    /// `live_ratio` patched in via `SplitTree::resize_split`, reflecting
+    /// the drag immediately without touching daemon state.
+    dragging_split: Option<(crate::protocol::SplitId, f32)>,
 }
 
 impl App {
@@ -445,12 +463,12 @@ impl App {
     /// user direction: no keybind, drag only. `Down` hit-tests against the
     /// current layout's divider grab zones (recomputed fresh every call
     /// via `render::divider_rects`, since the layout can change between
-    /// mouse events); `Drag` sends a live `Request::ResizeSplit` for
-    /// whichever split is currently held (this is *every* mouse-move
-    /// while a button is held, per the "live while dragging" decision —
-    /// other attached frontends viewing the same workspace see the resize
-    /// happen in real time too, not just the final ratio on release);
-    /// `Up` ends the drag. A `Drag`/`Up` with no split currently held is
+    /// mouse events). `Drag` updates `dragging_split`'s live ratio purely
+    /// locally — no request sent — so the drag renders smoothly without
+    /// flooding the daemon (see the field doc on `dragging_split` for why
+    /// this replaced the original "send on every move" design). `Up`
+    /// commits the final position with exactly one `Request::ResizeSplit`
+    /// and clears the drag. A `Drag`/`Up` with no split currently held is
     /// a plain mouse move with no button pressed on this pane (or a drag
     /// that started outside any divider) and is ignored.
     async fn handle_mouse(
@@ -463,10 +481,15 @@ impl App {
             mouse::MouseEvent::Down { col, row } => {
                 let Some(tree) = &self.workspace.tree else { return Ok(()) };
                 let hits = render::divider_rects(tree, self.frame_area);
-                self.dragging_split = hit_test_dividers(&hits, col, row);
+                self.dragging_split = hit_test_dividers(&hits, col, row).map(|split| {
+                    let hit = hits.iter().find(|h| h.split == split).expect(
+                        "hit_test_dividers only returns a split id that came from this exact `hits` list",
+                    );
+                    (split, render::ratio_at(hit, col, row))
+                });
             }
             mouse::MouseEvent::Drag { col, row } => {
-                let Some(split) = self.dragging_split else { return Ok(()) };
+                let Some((split, _)) = self.dragging_split else { return Ok(()) };
                 let Some(tree) = &self.workspace.tree else { return Ok(()) };
                 let Some(hit) = render::divider_rects(tree, self.frame_area)
                     .into_iter()
@@ -478,16 +501,16 @@ impl App {
                     self.dragging_split = None;
                     return Ok(());
                 };
-                let new_ratio = render::ratio_at(&hit, col, row);
+                self.dragging_split = Some((split, render::ratio_at(&hit, col, row)));
+            }
+            mouse::MouseEvent::Up { .. } => {
+                let Some((split, ratio)) = self.dragging_split.take() else { return Ok(()) };
                 let req = Request::ResizeSplit {
                     workspace: self.workspace.id.to_string(),
                     split,
-                    new_ratio,
+                    new_ratio: ratio,
                 };
                 let _ = self.request(write_half, read_half, req).await?;
-            }
-            mouse::MouseEvent::Up { .. } => {
-                self.dragging_split = None;
             }
         }
         Ok(())
@@ -648,7 +671,21 @@ pub async fn run() -> anyhow::Result<()> {
     loop {
         terminal.draw(|frame| {
             app.frame_area = frame.area();
-            render::draw(frame, &app.workspace, &app.grids, app.focused);
+            // While a divider drag is in progress, render a locally
+            // patched clone with the live ratio applied -- this is what
+            // makes the drag look smooth (drawn every frame with no
+            // round-trip) even though the daemon isn't told about it
+            // until `Up` (see `dragging_split`'s field doc for why).
+            match app.dragging_split {
+                Some((split, ratio)) => {
+                    let mut preview = app.workspace.clone();
+                    if let Some(tree) = &mut preview.tree {
+                        let _ = tree.resize_split(split, ratio);
+                    }
+                    render::draw(frame, &preview, &app.grids, app.focused);
+                }
+                None => render::draw(frame, &app.workspace, &app.grids, app.focused),
+            }
             if let Some(menu) = &app.attach_menu {
                 render::draw_attach_menu(frame, &menu.servers, menu.selected);
             }
