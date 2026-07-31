@@ -153,6 +153,7 @@ dimux client spawn   <workspace> [--split <pane-id> --dir h|v] [--bind <server-n
 dimux client close   <workspace>/<pane-id>       # closes the client-pane; bound server-pane keeps running
 dimux client rename  <workspace>/<pane-id> <new-name>
 dimux client bind    <workspace>/<pane-id> <server-name-or-id>
+dimux client unbind  <workspace>/<pane-id>       # detaches; bound server-pane keeps running
 dimux client ls      [workspace]                 # omit workspace to list all
 ```
 
@@ -176,17 +177,42 @@ Setup docs will include the exact `kitty.conf` snippet.
 | `cmd-shift-d` | split focused client-pane horizontally, spawn a fresh server-pane and bind it into the new half |
 | `cmd-w` | close focused client-pane (server-pane keeps running) |
 | `cmd-shift-w` | kill focused client-pane's bound server-pane |
+| `cmd-shift-z` | detach focused client-pane (server-pane keeps running), open attach menu to pick its replacement |
 | `cmd-h/j/k/l` | move focus between client-panes |
+| *(mouse drag)* | drag a divider to resize the two panes it separates — no keybind, drag-only |
 
 Superseded: an earlier revision of this doc specified a `cmd-p` chord
 opening a picker overlay (choose an existing server-pane, or "spawn new")
 before binding it into the focused client-pane. That picker was built,
 then removed — `cmd-d`/`cmd-shift-d` becoming an instant "split + new
-shell" shortcut covers the common case with one keystroke instead of two,
-and the picker's only irreplaceable capability (binding a client-pane to
-an *existing* server-pane, e.g. to display one shell in two places) is
-still available via the CLI: `dimux client bind <workspace>/<pane>
-<server-name-or-id>`. There is currently no TUI keybind for that case.
+shell" shortcut covers the common case with one keystroke instead of two.
+The picker's other capability — binding a client-pane to an *existing*
+server-pane, e.g. to display one shell in two places — now has two paths:
+`cmd-shift-z` (detach the focused pane, then pick a replacement from a
+rebuilt attach menu) in the TUI, or `dimux client bind <workspace>/<pane>
+<server-name-or-id>` directly from the CLI without detaching first.
+
+### Divider resizing
+
+Each `SplitTree::Split` node carries a stable `id: SplitId`, independent
+of its `a`/`b` children's contents, so a specific divider can be
+addressed for resizing without needing to name a pane on either side
+(which may itself be a nested split with no single pane id of its own).
+`Request::ResizeSplit { workspace, split, new_ratio }` sets that divider's
+ratio directly; the daemon clamps `new_ratio` to `[0.05, 0.95]` so a drag
+can shrink a pane small but never collapse it to zero or push it past the
+opposite pane's minimum.
+
+The TUI hand-parses the SGR mouse escape-sequence protocol
+(`ESC [ < Cb ; Cx ; Cy M/m`) directly off stdin, the same way it
+hand-parses Kitty's Cmd-chord sequences rather than using crossterm's
+event abstraction (see "Requests are sent through an `Event`-tolerant
+helper" design note in `tui/mod.rs` for why raw bytes are read at all).
+On mouse-down, it hit-tests the click position against every divider's
+current on-screen grab zone; while held, every mouse-move sends a live
+`Request::ResizeSplit` (not just the final position on release), so other
+frontends viewing the same workspace see the resize happen in real time
+too.
 
 ## Error handling
 

@@ -408,6 +408,21 @@ async fn dispatch(
             Response::Ack
         }
 
+        Request::ResizeSplit { workspace, split, new_ratio } => {
+            let mut state = state.lock().await;
+            let ws_id = match state.resolve_workspace(&workspace) {
+                Ok(id) => id,
+                Err(err) => return Response::Error { message: err.to_string() },
+            };
+            match state.resize_split(ws_id, split, new_ratio) {
+                Ok(()) => {
+                    broadcast_layout(&state, registry, ws_id).await;
+                    Response::Ack
+                }
+                Err(err) => Response::Error { message: err.to_string() },
+            }
+        }
+
         Request::Input { pane, bytes } => {
             let state = state.lock().await;
             let Some(server_pane_id) = state.bound_server_pane(pane) else {
@@ -845,6 +860,90 @@ mod tests {
                 );
             }
             other => panic!("expected ServerPaneList, got {other:?}"),
+        }
+    }
+
+    /// `ResizeSplit` updates a divider's ratio (mouse-drag resizing,
+    /// design doc addendum), and the change is visible to a fresh
+    /// `Subscribe` on the same workspace.
+    #[tokio::test]
+    async fn resize_split_updates_ratio_visible_to_subscribers() {
+        let guard = start_daemon().await;
+        let mut conn = TestConn::connect(&guard.0).await;
+
+        let first = match conn
+            .request(Request::ClientSpawn {
+                workspace: "1".to_string(),
+                split_of: None,
+                dir: None,
+                bind: None,
+            })
+            .await
+        {
+            Response::ClientPaneCreated { workspace, pane } => (workspace, pane),
+            other => panic!("expected ClientPaneCreated, got {other:?}"),
+        };
+        let (workspace, first_pane) = first;
+
+        match conn
+            .request(Request::ClientSpawn {
+                workspace: workspace.to_string(),
+                split_of: Some(first_pane),
+                dir: Some(protocol::SplitDir::Vertical),
+                bind: None,
+            })
+            .await
+        {
+            Response::ClientPaneCreated { .. } => {}
+            other => panic!("expected ClientPaneCreated, got {other:?}"),
+        }
+
+        let split_id = match conn.request(Request::Subscribe { workspace: workspace.to_string() }).await {
+            Response::Snapshot { workspace: info, .. } => match info.tree.unwrap() {
+                protocol::SplitTree::Split { id, .. } => id,
+                other => panic!("expected a split, got {other:?}"),
+            },
+            other => panic!("expected Snapshot, got {other:?}"),
+        };
+
+        match conn
+            .request(Request::ResizeSplit { workspace: workspace.to_string(), split: split_id, new_ratio: 0.25 })
+            .await
+        {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+
+        match conn.request(Request::Subscribe { workspace: workspace.to_string() }).await {
+            Response::Snapshot { workspace: info, .. } => match info.tree.unwrap() {
+                protocol::SplitTree::Split { ratio, .. } => assert_eq!(ratio, 0.25),
+                other => panic!("expected a split, got {other:?}"),
+            },
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+
+        // Unknown workspace/split both error cleanly.
+        match conn
+            .request(Request::ResizeSplit {
+                workspace: Uuid::new_v4().to_string(),
+                split: split_id,
+                new_ratio: 0.5,
+            })
+            .await
+        {
+            Response::Error { .. } => {}
+            other => panic!("expected Error, got {other:?}"),
+        }
+        match conn
+            .request(Request::ResizeSplit {
+                workspace: workspace.to_string(),
+                split: Uuid::new_v4(),
+                new_ratio: 0.5,
+            })
+            .await
+        {
+            Response::Error { .. } => {}
+            other => panic!("expected Error, got {other:?}"),
         }
     }
 }

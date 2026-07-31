@@ -13,6 +13,7 @@ use uuid::Uuid;
 pub type ServerPaneId = Uuid;
 pub type WorkspaceId = Uuid;
 pub type ClientPaneId = Uuid;
+pub type SplitId = Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Size {
@@ -39,6 +40,12 @@ pub struct ClientPane {
 pub enum SplitTree {
     Leaf(ClientPane),
     Split {
+        /// Stable identity for this divider, independent of `a`/`b`'s
+        /// contents — what `Request::ResizeSplit` addresses to change
+        /// *this* divider's ratio without needing to name either child
+        /// pane (which may itself be a nested split with no single pane
+        /// id of its own).
+        id: SplitId,
         dir: SplitDir,
         /// Fraction of space given to `a`; `b` gets the remainder.
         ratio: f32,
@@ -84,6 +91,7 @@ impl SplitTree {
             SplitTree::Leaf(p) if p.id == target => {
                 let existing = p.clone();
                 *self = SplitTree::Split {
+                    id: SplitId::new_v4(),
                     dir,
                     ratio: 0.5,
                     a: Box::new(SplitTree::Leaf(existing)),
@@ -111,12 +119,13 @@ impl SplitTree {
         match self {
             SplitTree::Leaf(p) if p.id == target => Ok(None),
             SplitTree::Leaf(_) => anyhow::bail!("client-pane {target} not found"),
-            SplitTree::Split { dir, ratio, a, b } => {
+            SplitTree::Split { id, dir, ratio, a, b } => {
                 let a_has = a.find(target).is_some();
                 let b_has = b.find(target).is_some();
                 if a_has {
                     match a.remove_leaf(target)? {
                         Some(new_a) => Ok(Some(SplitTree::Split {
+                            id,
                             dir,
                             ratio,
                             a: Box::new(new_a),
@@ -127,6 +136,7 @@ impl SplitTree {
                 } else if b_has {
                     match b.remove_leaf(target)? {
                         Some(new_b) => Ok(Some(SplitTree::Split {
+                            id,
                             dir,
                             ratio,
                             a,
@@ -149,6 +159,28 @@ impl SplitTree {
                 let mut v = a.leaves();
                 v.extend(b.leaves());
                 v
+            }
+        }
+    }
+
+    /// Set the ratio of the split identified by `target`, clamped to a
+    /// sane range so a drag can never collapse a pane to zero width/height
+    /// (design intent for mouse-drag resizing: dragging can push a pane
+    /// small, not make it vanish). Returns an error if `target` does not
+    /// name a split in this tree.
+    pub fn resize_split(&mut self, target: SplitId, new_ratio: f32) -> anyhow::Result<()> {
+        match self {
+            SplitTree::Leaf(_) => anyhow::bail!("split {target} not found"),
+            SplitTree::Split { id, ratio, a, b, .. } if *id == target => {
+                *ratio = new_ratio.clamp(0.05, 0.95);
+                Ok(())
+            }
+            SplitTree::Split { a, b, .. } => {
+                if a.resize_split(target, new_ratio).is_ok() {
+                    Ok(())
+                } else {
+                    b.resize_split(target, new_ratio)
+                }
             }
         }
     }
@@ -275,6 +307,15 @@ pub enum Request {
     ResizeClientPane {
         pane: ClientPaneId,
         size: Size,
+    },
+    /// Set a split's ratio directly (mouse-drag resizing). `new_ratio` is
+    /// the fraction of space given to the split's `a` side; the daemon
+    /// clamps it (see `SplitTree::resize_split`) so a drag can shrink a
+    /// pane but never collapse it to zero.
+    ResizeSplit {
+        workspace: String,
+        split: SplitId,
+        new_ratio: f32,
     },
     /// Route raw input bytes (keystrokes) to the server-pane bound to
     /// `pane`.
@@ -408,6 +449,46 @@ mod tests {
         let a = Uuid::new_v4();
         let tree = SplitTree::Leaf(pane(a));
         assert!(tree.remove_leaf(a).unwrap().is_none());
+    }
+
+    #[test]
+    fn resize_split_updates_ratio_and_clamps() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let mut tree = SplitTree::Leaf(pane(a));
+        tree.split_leaf(a, SplitDir::Vertical, pane(b)).unwrap();
+        let split_id = match &tree {
+            SplitTree::Split { id, .. } => *id,
+            _ => unreachable!(),
+        };
+
+        tree.resize_split(split_id, 0.3).unwrap();
+        match &tree {
+            SplitTree::Split { ratio, .. } => assert_eq!(*ratio, 0.3),
+            _ => unreachable!(),
+        }
+
+        // Clamped, not rejected: a drag pushing past the limit shrinks
+        // the pane to the minimum rather than erroring or vanishing it.
+        tree.resize_split(split_id, 0.0).unwrap();
+        match &tree {
+            SplitTree::Split { ratio, .. } => assert_eq!(*ratio, 0.05),
+            _ => unreachable!(),
+        }
+        tree.resize_split(split_id, 1.0).unwrap();
+        match &tree {
+            SplitTree::Split { ratio, .. } => assert_eq!(*ratio, 0.95),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn resize_split_unknown_id_errors() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let mut tree = SplitTree::Leaf(pane(a));
+        tree.split_leaf(a, SplitDir::Vertical, pane(b)).unwrap();
+        assert!(tree.resize_split(Uuid::new_v4(), 0.3).is_err());
     }
 
     #[tokio::test]

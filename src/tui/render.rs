@@ -46,7 +46,7 @@
 
 use crate::protocol::{
     Cell, ClientPane, GridSnapshot, ServerPaneId, ServerPaneInfo, ServerPaneStatus, SplitDir,
-    SplitTree, WorkspaceInfo,
+    SplitId, SplitTree, WorkspaceInfo,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -94,7 +94,7 @@ fn draw_tree(
 ) {
     match tree {
         SplitTree::Leaf(pane) => draw_leaf(frame, pane, area, grids, focused),
-        SplitTree::Split { dir, ratio, a, b } => {
+        SplitTree::Split { dir, ratio, a, b, .. } => {
             let direction = ratatui_direction(*dir);
             let percent_a = (ratio.clamp(0.0, 1.0) * 100.0).round() as u16;
             let percent_b = 100u16.saturating_sub(percent_a);
@@ -139,6 +139,94 @@ fn draw_vertical_divider(frame: &mut Frame, area: Rect) {
     let line = Line::from("│").style(Style::new());
     let text = Text::from(vec![line; area.height as usize]);
     frame.render_widget(Paragraph::new(text), area);
+}
+
+/// One divider's on-screen position: `grab_zone` is the thin rect a mouse
+/// click must land in to grab it; `parent_area` is the full rect the
+/// split divides (both children plus the divider), needed to convert a
+/// later drag position into a new ratio along the split's axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DividerHit {
+    pub split: SplitId,
+    pub dir: SplitDir,
+    pub grab_zone: Rect,
+    pub parent_area: Rect,
+}
+
+/// Mirror of `draw_tree`'s layout math, but computing where every
+/// divider's grab zone landed on screen instead of drawing anything —
+/// pure and networking/frame-free so the TUI's mouse-drag hit-testing can
+/// call it on every `MouseDown` without touching `ratatui::Frame` at all.
+///
+/// For a side-by-side split, the grab zone is the reserved 1-column
+/// divider rect itself. For a stacked split, there is no reserved row
+/// (module doc "Bezels") — the grab zone is instead the lower child's
+/// title-bar row, which is exactly the boundary the drag visually moves.
+pub fn divider_rects(tree: &SplitTree, area: Rect) -> Vec<DividerHit> {
+    let mut out = Vec::new();
+    collect_divider_rects(tree, area, &mut out);
+    out
+}
+
+fn collect_divider_rects(tree: &SplitTree, area: Rect, out: &mut Vec<DividerHit>) {
+    if let SplitTree::Split { id, dir, ratio, a, b } = tree {
+        let direction = ratatui_direction(*dir);
+        let percent_a = (ratio.clamp(0.0, 1.0) * 100.0).round() as u16;
+        let percent_b = 100u16.saturating_sub(percent_a);
+
+        let (rect_a, rect_b, divider) = match direction {
+            Direction::Horizontal => {
+                let rects = Layout::new(
+                    direction,
+                    [
+                        Constraint::Percentage(percent_a),
+                        Constraint::Length(1),
+                        Constraint::Percentage(percent_b),
+                    ],
+                )
+                .split(area);
+                (rects[0], rects[2], rects[1])
+            }
+            Direction::Vertical => {
+                let rects = Layout::new(
+                    direction,
+                    [Constraint::Percentage(percent_a), Constraint::Percentage(percent_b)],
+                )
+                .split(area);
+                // The lower child's title-bar row (its topmost row) is
+                // the grab zone -- no reserved row exists to point at
+                // directly (module doc "Bezels").
+                let title_row = Rect { height: 1, ..rects[1] };
+                (rects[0], rects[1], title_row)
+            }
+        };
+        out.push(DividerHit { split: *id, dir: *dir, grab_zone: divider, parent_area: area });
+        collect_divider_rects(a, rect_a, out);
+        collect_divider_rects(b, rect_b, out);
+    }
+}
+
+/// Given a divider's `hit` (from [`divider_rects`]) and the current mouse
+/// position, compute the new ratio a drag to that position implies —
+/// the fraction of `hit.parent_area`'s span (along the split's axis)
+/// that falls before the mouse position. Pure arithmetic; clamping to a
+/// sane range happens server-side in `SplitTree::resize_split`, not here,
+/// so the TUI can send the raw intended ratio and let the daemon be the
+/// single source of truth for the clamp.
+pub fn ratio_at(hit: &DividerHit, col: u16, row: u16) -> f32 {
+    let direction = ratatui_direction(hit.dir);
+    match direction {
+        Direction::Horizontal => {
+            let span = hit.parent_area.width.max(1) as f32;
+            let offset = col.saturating_sub(hit.parent_area.x) as f32;
+            offset / span
+        }
+        Direction::Vertical => {
+            let span = hit.parent_area.height.max(1) as f32;
+            let offset = row.saturating_sub(hit.parent_area.y) as f32;
+            offset / span
+        }
+    }
 }
 
 /// Short id prefix used as a fallback title/label when a pane/server-pane
@@ -423,6 +511,7 @@ mod tests {
         let left = ClientPane { id: Uuid::new_v4(), name: Some("left".into()), bound: Some(left_id) };
         let right = ClientPane { id: Uuid::new_v4(), name: Some("right".into()), bound: Some(right_id) };
         let tree = SplitTree::Split {
+            id: Uuid::new_v4(),
             dir: SplitDir::Vertical,
             ratio: 0.5,
             a: Box::new(SplitTree::Leaf(left)),
@@ -494,6 +583,7 @@ mod tests {
         let left = ClientPane { id: Uuid::new_v4(), name: None, bound: None };
         let right = ClientPane { id: Uuid::new_v4(), name: None, bound: None };
         let tree = SplitTree::Split {
+            id: Uuid::new_v4(),
             dir: SplitDir::Vertical,
             ratio: 0.5,
             a: Box::new(SplitTree::Leaf(left)),
@@ -534,6 +624,77 @@ mod tests {
             assert_ne!(symbol, "┘", "bottom border should not be drawn");
             assert_ne!(symbol, "─", "bottom border should not be drawn");
         }
+    }
+
+    #[test]
+    fn divider_rects_finds_vertical_split_at_reserved_column() {
+        let left = ClientPane { id: Uuid::new_v4(), name: None, bound: None };
+        let right = ClientPane { id: Uuid::new_v4(), name: None, bound: None };
+        let split_id = Uuid::new_v4();
+        let tree = SplitTree::Split {
+            id: split_id,
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            a: Box::new(SplitTree::Leaf(left)),
+            b: Box::new(SplitTree::Leaf(right)),
+        };
+        let area = Rect { x: 0, y: 0, width: 41, height: 10 };
+        let hits = divider_rects(&tree, area);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].split, split_id);
+        assert_eq!(hits[0].dir, SplitDir::Vertical);
+        // 41 wide, 50/50 split -> percent_a=50% of 41 rounds to 20 or 21,
+        // then a 1-column divider; the exact column depends on ratatui's
+        // rounding, but it must land inside the area and be 1 column wide.
+        assert_eq!(hits[0].grab_zone.width, 1);
+        assert_eq!(hits[0].grab_zone.height, 10);
+        assert_eq!(hits[0].parent_area, area);
+    }
+
+    #[test]
+    fn divider_rects_finds_horizontal_split_at_lower_titlebar_row() {
+        let top = ClientPane { id: Uuid::new_v4(), name: None, bound: None };
+        let bottom = ClientPane { id: Uuid::new_v4(), name: None, bound: None };
+        let split_id = Uuid::new_v4();
+        let tree = SplitTree::Split {
+            id: split_id,
+            dir: SplitDir::Horizontal,
+            ratio: 0.5,
+            a: Box::new(SplitTree::Leaf(top)),
+            b: Box::new(SplitTree::Leaf(bottom)),
+        };
+        let area = Rect { x: 0, y: 0, width: 20, height: 11 };
+        let hits = divider_rects(&tree, area);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].dir, SplitDir::Horizontal);
+        // No reserved row for a stacked split -- the grab zone is exactly
+        // one row tall (the lower pane's title bar).
+        assert_eq!(hits[0].grab_zone.height, 1);
+        assert_eq!(hits[0].grab_zone.width, 20);
+    }
+
+    #[test]
+    fn ratio_at_maps_position_across_the_parent_area() {
+        let hit = DividerHit {
+            split: Uuid::new_v4(),
+            dir: SplitDir::Vertical,
+            grab_zone: Rect { x: 50, y: 0, width: 1, height: 10 },
+            parent_area: Rect { x: 0, y: 0, width: 100, height: 10 },
+        };
+        assert!((ratio_at(&hit, 0, 0) - 0.0).abs() < 0.01);
+        assert!((ratio_at(&hit, 50, 0) - 0.5).abs() < 0.01);
+        assert!((ratio_at(&hit, 99, 0) - 0.99).abs() < 0.02);
+    }
+
+    #[test]
+    fn ratio_at_uses_row_for_horizontal_split_dir() {
+        let hit = DividerHit {
+            split: Uuid::new_v4(),
+            dir: SplitDir::Horizontal,
+            grab_zone: Rect { x: 0, y: 5, width: 10, height: 1 },
+            parent_area: Rect { x: 0, y: 0, width: 10, height: 10 },
+        };
+        assert!((ratio_at(&hit, 0, 5) - 0.5).abs() < 0.01);
     }
 
     #[test]

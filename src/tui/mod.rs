@@ -74,8 +74,23 @@
 //!   before Response" bail-out. `App::request` instead loops: read one
 //!   `ServerMessage`, apply it via `App::apply_event` if it's an `Event`,
 //!   keep going until a `Response` arrives.
+//! - **Mouse-drag divider resizing is drag-only, no keybind exists for
+//!   it** (per user direction — dragging is the intended interaction,
+//!   not a chord). Mouse input arrives on the same stdin stream as
+//!   everything else, as an SGR escape sequence
+//!   (`ESC [ < Cb ; Cx ; Cy M/m`); `mouse::parse` hand-parses just that
+//!   format rather than using crossterm's mouse events, for the same
+//!   reason raw bytes are read directly at all (see above) — crossterm's
+//!   `parse_event` is `pub(crate)`, not callable from here regardless.
+//!   `App::handle_mouse` hit-tests `Down` against
+//!   `render::divider_rects` (recomputed fresh every call — the tree can
+//!   change between mouse events) and, once a divider is grabbed, sends a
+//!   live `Request::ResizeSplit` on *every* `Drag` event (not just on
+//!   release), so other frontends viewing the same workspace see the
+//!   resize happen in real time too.
 
 pub mod keys;
+pub mod mouse;
 pub mod render;
 
 use crate::cli::Client;
@@ -140,6 +155,17 @@ struct App {
     /// `Some` while the `cmd-shift-z` attach menu is open; input routes to
     /// `handle_attach_menu_input` instead of the normal keymap while set.
     attach_menu: Option<AttachMenu>,
+    /// The full terminal area as of the most recent `terminal.draw` call
+    /// -- refreshed every frame in `run`'s loop, since it's what
+    /// `render::divider_rects` needs to recompute hit zones against the
+    /// current layout on every mouse event (dividers move every frame the
+    /// tree does, so this can't be cached across ticks).
+    frame_area: ratatui::layout::Rect,
+    /// `Some(split)` while a mouse-down on a divider's grab zone is
+    /// currently held (a drag in progress); cleared on mouse-up. Reset to
+    /// `None` on any workspace switch too, since the split it names may
+    /// no longer exist in whatever workspace is now active.
+    dragging_split: Option<crate::protocol::SplitId>,
 }
 
 impl App {
@@ -167,6 +193,8 @@ impl App {
                         grids: grids.into_iter().map(|g| (g.server_pane, g)).collect(),
                         focused,
                         attach_menu: None,
+                        frame_area: ratatui::layout::Rect::default(),
+                        dragging_split: None,
                     });
                 }
                 ServerMessage::Response(other) => {
@@ -257,6 +285,7 @@ impl App {
             self.workspace = workspace;
             self.grids = grids.into_iter().map(|g| (g.server_pane, g)).collect();
             self.attach_menu = None;
+            self.dragging_split = None;
         }
         Ok(())
     }
@@ -412,6 +441,58 @@ impl App {
         }
     }
 
+    /// Route one parsed [`mouse::MouseEvent`] — divider drag-resizing, per
+    /// user direction: no keybind, drag only. `Down` hit-tests against the
+    /// current layout's divider grab zones (recomputed fresh every call
+    /// via `render::divider_rects`, since the layout can change between
+    /// mouse events); `Drag` sends a live `Request::ResizeSplit` for
+    /// whichever split is currently held (this is *every* mouse-move
+    /// while a button is held, per the "live while dragging" decision —
+    /// other attached frontends viewing the same workspace see the resize
+    /// happen in real time too, not just the final ratio on release);
+    /// `Up` ends the drag. A `Drag`/`Up` with no split currently held is
+    /// a plain mouse move with no button pressed on this pane (or a drag
+    /// that started outside any divider) and is ignored.
+    async fn handle_mouse(
+        &mut self,
+        event: mouse::MouseEvent,
+        write_half: &mut OwnedWriteHalf,
+        read_half: &mut OwnedReadHalf,
+    ) -> anyhow::Result<()> {
+        match event {
+            mouse::MouseEvent::Down { col, row } => {
+                let Some(tree) = &self.workspace.tree else { return Ok(()) };
+                let hits = render::divider_rects(tree, self.frame_area);
+                self.dragging_split = hit_test_dividers(&hits, col, row);
+            }
+            mouse::MouseEvent::Drag { col, row } => {
+                let Some(split) = self.dragging_split else { return Ok(()) };
+                let Some(tree) = &self.workspace.tree else { return Ok(()) };
+                let Some(hit) = render::divider_rects(tree, self.frame_area)
+                    .into_iter()
+                    .find(|hit| hit.split == split)
+                else {
+                    // The split disappeared from under the drag (e.g.
+                    // closed by another frontend mid-drag) -- nothing
+                    // left to resize.
+                    self.dragging_split = None;
+                    return Ok(());
+                };
+                let new_ratio = render::ratio_at(&hit, col, row);
+                let req = Request::ResizeSplit {
+                    workspace: self.workspace.id.to_string(),
+                    split,
+                    new_ratio,
+                };
+                let _ = self.request(write_half, read_half, req).await?;
+            }
+            mouse::MouseEvent::Up { .. } => {
+                self.dragging_split = None;
+            }
+        }
+        Ok(())
+    }
+
     /// Route one resolved `Action` to its effect.
     async fn handle_action(
         &mut self,
@@ -476,6 +557,20 @@ fn cycle_focus(tree: &SplitTree, current: Option<ClientPaneId>, forward: bool) -
     Some(leaves[next_idx].id)
 }
 
+/// Find whichever divider's grab zone contains `(col, row)`, if any. Pure
+/// hit-testing logic factored out of `App::handle_mouse` so it's directly
+/// unit-testable without a live connection.
+fn hit_test_dividers(hits: &[render::DividerHit], col: u16, row: u16) -> Option<crate::protocol::SplitId> {
+    hits.iter()
+        .find(|hit| {
+            col >= hit.grab_zone.x
+                && col < hit.grab_zone.x + hit.grab_zone.width
+                && row >= hit.grab_zone.y
+                && row < hit.grab_zone.y + hit.grab_zone.height
+        })
+        .map(|hit| hit.split)
+}
+
 /// Attach-menu input, decoupled from the raw bytes that produced it (same
 /// approach the removed pane-picker used: a distinct, simpler modal
 /// grammar rather than reusing `keys::parse`'s chords).
@@ -505,16 +600,23 @@ fn parse_attach_menu_input(bytes: &[u8]) -> AttachMenuAction {
 }
 
 /// RAII guard ensuring the terminal is restored (raw mode disabled,
-/// alternate screen left) on every exit path out of `run` — normal
-/// return, `?`-propagated error, or panic (via the panic hook
-/// `ratatui::try_init` installs). Leaving the user's real terminal in
-/// raw/alternate-screen mode on a crash is a real usability bug, not a
-/// nitpick (task brief) — this is what closes that gap unconditionally,
-/// since `Drop` runs on every one of those paths.
+/// alternate screen left, mouse capture disabled) on every exit path out
+/// of `run` — normal return, `?`-propagated error, or panic (via the
+/// panic hook `ratatui::try_init` installs). Leaving the user's real
+/// terminal in raw/alternate-screen/mouse-capture mode on a crash is a
+/// real usability bug, not a nitpick (task brief) — this is what closes
+/// that gap unconditionally, since `Drop` runs on every one of those
+/// paths. Mouse capture is disabled best-effort (a failed write here
+/// shouldn't panic mid-unwind); raw mode/alt screen restoration via
+/// `ratatui::restore()` already handles its own errors the same way.
 struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::event::DisableMouseCapture
+        );
         ratatui::restore();
     }
 }
@@ -533,8 +635,10 @@ pub async fn run() -> anyhow::Result<()> {
     // only changes how a failure *during setup itself* is reported.
     let mut terminal = ratatui::try_init()?;
     // From here on, every exit path (including the `?`s below) restores
-    // the terminal via `TerminalGuard::drop`.
+    // the terminal via `TerminalGuard::drop` (including disabling mouse
+    // capture, enabled next).
     let _guard = TerminalGuard;
+    ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::event::EnableMouseCapture)?;
 
     let mut app = App::bootstrap(&mut write_half, &mut read_half, "1").await?;
 
@@ -543,6 +647,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     loop {
         terminal.draw(|frame| {
+            app.frame_area = frame.area();
             render::draw(frame, &app.workspace, &app.grids, app.focused);
             if let Some(menu) = &app.attach_menu {
                 render::draw_attach_menu(frame, &menu.servers, menu.selected);
@@ -562,7 +667,9 @@ pub async fn run() -> anyhow::Result<()> {
                 if is_quit(bytes) {
                     break;
                 }
-                if app.attach_menu.is_some() {
+                if let Some(mouse_event) = mouse::parse(bytes) {
+                    app.handle_mouse(mouse_event, &mut write_half, &mut read_half).await?;
+                } else if app.attach_menu.is_some() {
                     app.handle_attach_menu_input(bytes, &mut write_half, &mut read_half).await?;
                 } else {
                     let action = keys::parse(bytes);
@@ -602,7 +709,7 @@ mod tests {
     }
 
     fn split(dir: SplitDir, a: SplitTree, b: SplitTree) -> SplitTree {
-        SplitTree::Split { dir, ratio: 0.5, a: Box::new(a), b: Box::new(b) }
+        SplitTree::Split { id: Uuid::new_v4(), dir, ratio: 0.5, a: Box::new(a), b: Box::new(b) }
     }
 
     #[test]
@@ -653,6 +760,44 @@ mod tests {
         let stale = Uuid::new_v4();
         assert_eq!(cycle_focus(&tree, Some(stale), true), Some(a));
         assert_eq!(cycle_focus(&tree, Some(stale), false), Some(a));
+    }
+
+    fn divider_hit(split: crate::protocol::SplitId, zone: ratatui::layout::Rect) -> render::DividerHit {
+        render::DividerHit {
+            split,
+            dir: SplitDir::Vertical,
+            grab_zone: zone,
+            parent_area: ratatui::layout::Rect { x: 0, y: 0, width: 40, height: 10 },
+        }
+    }
+
+    #[test]
+    fn hit_test_dividers_finds_the_containing_zone() {
+        let split_id = Uuid::new_v4();
+        let hits = vec![divider_hit(split_id, ratatui::layout::Rect { x: 20, y: 0, width: 1, height: 10 })];
+        assert_eq!(hit_test_dividers(&hits, 20, 5), Some(split_id));
+    }
+
+    #[test]
+    fn hit_test_dividers_misses_outside_the_zone() {
+        let split_id = Uuid::new_v4();
+        let hits = vec![divider_hit(split_id, ratatui::layout::Rect { x: 20, y: 0, width: 1, height: 10 })];
+        assert_eq!(hit_test_dividers(&hits, 19, 5), None);
+        assert_eq!(hit_test_dividers(&hits, 21, 5), None);
+        assert_eq!(hit_test_dividers(&hits, 20, 10), None); // one past the bottom edge
+    }
+
+    #[test]
+    fn hit_test_dividers_picks_the_first_match_among_several() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let hits = vec![
+            divider_hit(a, ratatui::layout::Rect { x: 10, y: 0, width: 1, height: 10 }),
+            divider_hit(b, ratatui::layout::Rect { x: 30, y: 0, width: 1, height: 10 }),
+        ];
+        assert_eq!(hit_test_dividers(&hits, 10, 0), Some(a));
+        assert_eq!(hit_test_dividers(&hits, 30, 0), Some(b));
+        assert_eq!(hit_test_dividers(&hits, 20, 0), None);
     }
 
     #[test]
