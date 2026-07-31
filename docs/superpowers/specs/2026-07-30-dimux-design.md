@@ -192,6 +192,29 @@ server-pane, e.g. to display one shell in two places — now has two paths:
 rebuilt attach menu) in the TUI, or `dimux client bind <workspace>/<pane>
 <server-name-or-id>` directly from the CLI without detaching first.
 
+### Attach menu identification columns
+
+The attach menu (and `dimux server ls`) list every server-pane with five
+columns: `name | cwd | process | id | status`. `name` is the user-given
+name (via `dimux server rename`), falling back to an 8-character id
+prefix if unset — the same fallback `render::short_id` uses elsewhere.
+`cwd` and `process` come from `ServerPaneInfo.foreground: Option<
+ForegroundProcessInfo>`, a live OS-level snapshot of the PTY's
+*foreground* process (e.g. `vim` if you ran it inside the pane's shell,
+not the shell itself) — queried fresh every time a `ServerPaneInfo` is
+built, not tracked or cached, since callers already re-fetch on their
+own cadence (the attach menu re-lists on every open).
+
+Getting the foreground process is two steps: `portable_pty::MasterPty::
+process_group_leader()` (already provided by the crate, no unsafe code
+needed) gives the PID of whichever process is currently in the PTY's
+foreground process group; that PID is then looked up via the `sysinfo`
+crate for its command name and working directory. `cwd` is start-truncated
+(`.../project/src`) and `process`/`name` are end-truncated
+(`a-very-long-...`) to fit the menu's fixed column widths — the tail of a
+path is usually the more informative end, while the head of a name/process
+usually is.
+
 ### Divider resizing
 
 Each `SplitTree::Split` node carries a stable `id: SplitId`, independent

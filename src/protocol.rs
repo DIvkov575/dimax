@@ -208,6 +208,26 @@ pub struct ServerPaneInfo {
     pub name: Option<String>,
     pub size: Size,
     pub status: ServerPaneStatus,
+    /// A live OS-level snapshot of the PTY's foreground process, queried
+    /// fresh at the moment this `ServerPaneInfo` was built (design doc
+    /// "Attach menu identification columns" — not tracked/cached
+    /// continuously, since the attach menu already re-fetches on every
+    /// open). `None` if the process couldn't be queried (e.g. a `Dead`
+    /// pane has no foreground process to look up) or on a platform where
+    /// this isn't supported.
+    pub foreground: Option<ForegroundProcessInfo>,
+}
+
+/// See [`ServerPaneInfo::foreground`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForegroundProcessInfo {
+    /// The foreground process's own name (e.g. `vim`, `bash`) — what's
+    /// actually running right now, not necessarily what the pane was
+    /// spawned with.
+    pub process_name: String,
+    /// The foreground process's current working directory, if it could
+    /// be determined.
+    pub cwd: Option<String>,
 }
 
 /// One screen cell. Kept intentionally simple for v1 — enough styling to

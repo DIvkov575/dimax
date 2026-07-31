@@ -322,7 +322,12 @@ fn cell_to_span(cell: &Cell) -> Span<'static> {
 /// trailing "spawn new" entry, opened after the focused client-pane has
 /// already been detached from whatever it was previously bound to.
 pub fn draw_attach_menu(frame: &mut Frame, servers: &[ServerPaneInfo], selected: usize) {
-    let area = centered_rect(60, 60, frame.area());
+    // Wider than the previous 60% -- each row now packs five columns
+    // (name/cwd/process/id/status, see `attach_menu_line`) rather than
+    // the original two, and needs more horizontal room to avoid every
+    // field being clipped down to near-nothing on an ordinary terminal
+    // width.
+    let area = centered_rect(85, 60, frame.area());
     frame.render_widget(Clear, area);
 
     let mut lines: Vec<Line<'static>> = servers
@@ -338,22 +343,69 @@ pub fn draw_attach_menu(frame: &mut Frame, servers: &[ServerPaneInfo], selected:
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// Column widths for the attach menu's server-pane rows: `name | cwd |
+/// process | id | status`. `cwd` gets the most space since full paths
+/// are usually the longest field; `id` is fixed at 8 (the same
+/// `short_id` prefix used elsewhere) since a full UUID would dominate
+/// the row for no benefit — the attach menu is for picking a pane by
+/// eye, not by exact id.
+const NAME_COL_WIDTH: usize = 12;
+const CWD_COL_WIDTH: usize = 24;
+const PROCESS_COL_WIDTH: usize = 10;
+
 fn attach_menu_line(server: &ServerPaneInfo, selected: bool) -> Line<'static> {
-    let label = server.name.clone().unwrap_or_else(|| short_id(server.id));
+    let name = server.name.clone().unwrap_or_else(|| short_id(server.id));
     let status = match server.status {
         ServerPaneStatus::Running => "Running",
         ServerPaneStatus::Dead => "Dead",
     };
+    let process = server.foreground.as_ref().map_or("-", |f| f.process_name.as_str());
+    let cwd = server.foreground.as_ref().and_then(|f| f.cwd.as_deref()).unwrap_or("-");
     let text = format!(
-        "{} {} [{}] {}x{}",
+        "{} {:<name_w$} {:<cwd_w$} {:<process_w$} {} {}",
         if selected { ">" } else { " " },
-        label,
+        truncate_end(&name, NAME_COL_WIDTH),
+        truncate_start(cwd, CWD_COL_WIDTH),
+        truncate_end(process, PROCESS_COL_WIDTH),
+        short_id(server.id),
         status,
-        server.size.cols,
-        server.size.rows,
+        name_w = NAME_COL_WIDTH,
+        cwd_w = CWD_COL_WIDTH,
+        process_w = PROCESS_COL_WIDTH,
     );
     let style = if selected { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
     Line::styled(text, style)
+}
+
+/// Truncate `s` to at most `width` characters, keeping the *end* (an
+/// ellipsis prefix, e.g. `...project/src`) — used for `cwd`, where the
+/// tail of a path (closer to the leaf directory) is usually more
+/// informative than the root when the whole thing doesn't fit.
+fn truncate_start(s: &str, width: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= width {
+        return s.to_string();
+    }
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+    let tail: String = chars[chars.len() - (width - 3)..].iter().collect();
+    format!("...{tail}")
+}
+
+/// Truncate `s` to at most `width` characters, keeping the *start* (a
+/// trailing ellipsis, e.g. `some-long-n...`) — used for `name`/`process`,
+/// where the beginning is usually the more identifying part.
+fn truncate_end(s: &str, width: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= width {
+        return s.to_string();
+    }
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+    let head: String = chars[..width - 3].iter().collect();
+    format!("{head}...")
 }
 
 fn spawn_new_line(selected: bool) -> Line<'static> {
@@ -393,7 +445,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::Size;
+    use crate::protocol::{ForegroundProcessInfo, Size};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use uuid::Uuid;
@@ -704,14 +756,55 @@ mod tests {
             name: Some("editor".to_string()),
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
+            foreground: Some(ForegroundProcessInfo {
+                process_name: "vim".to_string(),
+                cwd: Some("/home/dev/project".to_string()),
+            }),
         };
         let servers = vec![server];
-        let backend = TestBackend::new(60, 20);
+        // Wide enough that the popup (85% of frame width, see
+        // draw_attach_menu) comfortably fits every column's full width
+        // rather than clipping mid-row -- a narrower backend was exactly
+        // what caused this test to flake when the columns were added.
+        let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw_attach_menu(frame, &servers, 0)).unwrap();
         assert!(buffer_contains(&terminal, "editor"));
+        assert!(buffer_contains(&terminal, "vim"));
+        assert!(buffer_contains(&terminal, "project"));
         assert!(buffer_contains(&terminal, "spawn new"));
         assert!(buffer_contains(&terminal, "Attach server-pane"));
+    }
+
+    #[test]
+    fn draw_attach_menu_shows_dash_for_unknown_foreground() {
+        let server = ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: Some("editor".to_string()),
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Dead,
+            foreground: None,
+        };
+        let servers = vec![server];
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &servers, 0)).unwrap();
+        assert!(buffer_contains(&terminal, "editor"));
+        assert!(buffer_contains(&terminal, "-"));
+    }
+
+    #[test]
+    fn truncate_start_keeps_the_tail_with_a_leading_ellipsis() {
+        assert_eq!(truncate_start("/home/dev/some/long/project/path", 15), "...project/path");
+        assert_eq!(truncate_start("short", 15), "short");
+        assert_eq!(truncate_start("exact-width!!", 13), "exact-width!!");
+    }
+
+    #[test]
+    fn truncate_end_keeps_the_head_with_a_trailing_ellipsis() {
+        assert_eq!(truncate_end("a-very-long-process-name", 10), "a-very-...");
+        assert_eq!(truncate_end("vim", 10), "vim");
+        assert_eq!(truncate_end("exact-widt", 10), "exact-widt");
     }
 
     #[test]

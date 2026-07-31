@@ -151,9 +151,11 @@ fn format_server_pane_line(info: &ServerPaneInfo) -> String {
         ServerPaneStatus::Running => "running",
         ServerPaneStatus::Dead => "dead",
     };
+    let process = info.foreground.as_ref().map_or("-", |f| f.process_name.as_str());
+    let cwd = info.foreground.as_ref().and_then(|f| f.cwd.as_deref()).unwrap_or("-");
     format!(
-        "{}\t{}\t{}\t{}x{}",
-        info.id, name, status, info.size.rows, info.size.cols
+        "{}\t{}\t{}\t{}x{}\t{}\t{}",
+        info.id, name, status, info.size.rows, info.size.cols, process, cwd
     )
 }
 
@@ -311,7 +313,7 @@ async fn run_client(cmd: ClientCmd) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{ClientPane, ServerPaneStatus, Size};
+    use crate::protocol::{ClientPane, ForegroundProcessInfo, ServerPaneStatus, Size};
     use uuid::Uuid;
 
     #[test]
@@ -356,11 +358,15 @@ mod tests {
             name: Some("editor".to_string()),
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
+            foreground: Some(ForegroundProcessInfo {
+                process_name: "vim".to_string(),
+                cwd: Some("/home/dev".to_string()),
+            }),
         };
         let line = format_server_pane_line(&info);
         assert_eq!(
             line,
-            format!("{}\teditor\trunning\t24x80", Uuid::nil())
+            format!("{}\teditor\trunning\t24x80\tvim\t/home/dev", Uuid::nil())
         );
     }
 
@@ -371,9 +377,10 @@ mod tests {
             name: None,
             size: Size { rows: 10, cols: 20 },
             status: ServerPaneStatus::Dead,
+            foreground: None,
         };
         let line = format_server_pane_line(&info);
-        assert_eq!(line, format!("{}\t-\tdead\t10x20", Uuid::nil()));
+        assert_eq!(line, format!("{}\t-\tdead\t10x20\t-\t-", Uuid::nil()));
     }
 
     #[test]

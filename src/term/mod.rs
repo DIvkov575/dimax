@@ -12,7 +12,7 @@
 //!   block on I/O) except `write_input`, which does a non-blocking PTY
 //!   write.
 
-use crate::protocol::{Cell, GridSnapshot, ServerPaneId, ServerPaneStatus, Size};
+use crate::protocol::{Cell, ForegroundProcessInfo, GridSnapshot, ServerPaneId, ServerPaneStatus, Size};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtyPair, PtySize};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -205,6 +205,45 @@ impl ServerPane {
 
     pub fn size(&self) -> Size {
         self.inner.lock().unwrap().size
+    }
+
+    /// A live OS-level snapshot of this PTY's foreground process — see
+    /// design doc "Attach menu identification columns": queried fresh on
+    /// every call rather than tracked/cached, since callers (the attach
+    /// menu, `dimux server ls`) already re-fetch on their own cadence.
+    ///
+    /// `MasterPty::process_group_leader` (already provided by
+    /// `portable-pty`, no unsafe code needed here) gives the PID of
+    /// whichever process is currently in the foreground of this PTY —
+    /// e.g. `vim` if you ran it inside the pane's shell, not the shell
+    /// itself. That PID is then looked up via `sysinfo` for its command
+    /// name and working directory.
+    ///
+    /// Returns `None` if there's no foreground process to query (a
+    /// `Dead` pane, or the OS call itself failing) or the PID can no
+    /// longer be found in the process table (a race between the lookup
+    /// and the process exiting — treated the same as "nothing to show"
+    /// rather than an error, since this is best-effort diagnostic info).
+    pub fn foreground_info(&self) -> Option<ForegroundProcessInfo> {
+        let guard = self.inner.lock().unwrap();
+        let pid = guard.master.process_group_leader()?;
+        drop(guard); // release before the (comparatively slow) OS query below
+
+        let mut system = sysinfo::System::new();
+        let sysinfo_pid = sysinfo::Pid::from_u32(pid as u32);
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[sysinfo_pid]),
+            true,
+            sysinfo::ProcessRefreshKind::nothing()
+                .with_cwd(sysinfo::UpdateKind::Always)
+                .with_cmd(sysinfo::UpdateKind::Always),
+        );
+        let process = system.process(sysinfo_pid)?;
+
+        Some(ForegroundProcessInfo {
+            process_name: process.name().to_string_lossy().into_owned(),
+            cwd: process.cwd().map(|p| p.display().to_string()),
+        })
     }
 
     /// Full current grid contents, suitable for sending to a newly
@@ -457,5 +496,50 @@ mod tests {
         assert_eq!(pane.size(), Size { rows: 24, cols: 80 });
         pane.resize(Size { rows: 10, cols: 40 }).unwrap();
         assert_eq!(pane.size(), Size { rows: 10, cols: 40 });
+    }
+
+    #[test]
+    fn foreground_info_reports_the_running_shell_command() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let id = Uuid::new_v4();
+        let pane = ServerPane::spawn(id, None, Some("cat".to_string()), Size { rows: 24, cols: 80 }, tx)
+            .unwrap();
+
+        // Wait for the shell to actually exec `cat` (there's a brief
+        // window right after spawn where the foreground process is still
+        // /bin/sh, before it execs into cat) by polling until the name
+        // resolves to something other than the launching shell, or until
+        // a generous timeout. wait_until only fires on Changed/Died
+        // events, which cat produces none of while idle, so poll
+        // directly with a short sleep instead.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut info = pane.foreground_info();
+        while info.as_ref().is_none_or(|i| i.process_name != "cat") && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            info = pane.foreground_info();
+        }
+        let info = info.expect("expected a foreground process to be reported for a live pane");
+        assert_eq!(info.process_name, "cat");
+        // cwd is best-effort and platform-dependent; just confirm it's
+        // populated with *something* plausible rather than asserting an
+        // exact value this test can't portably know.
+        assert!(info.cwd.is_some(), "expected a cwd to be reported");
+
+        // Drain the (unused in this test) events channel's sender so it
+        // doesn't linger -- matches the pattern of other tests that
+        // construct `rx` even when not polling it for Changed/Died.
+        let _ = rx.try_recv();
+    }
+
+    #[test]
+    fn foreground_info_is_none_after_kill() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let id = Uuid::new_v4();
+        let mut pane =
+            ServerPane::spawn(id, None, Some("cat".to_string()), Size { rows: 24, cols: 80 }, tx).unwrap();
+        pane.kill().unwrap();
+        // The process group leader is gone once killed; there's nothing
+        // left to query.
+        assert!(pane.foreground_info().is_none());
     }
 }
