@@ -301,6 +301,21 @@ async fn dispatch(
             }
         }
 
+        Request::ClientUnbind { workspace, pane } => {
+            let mut state = state.lock().await;
+            let ws_id = match state.resolve_workspace(&workspace) {
+                Ok(id) => id,
+                Err(err) => return Response::Error { message: err.to_string() },
+            };
+            match state.client_unbind(ws_id, pane) {
+                Ok(()) => {
+                    broadcast_layout(&state, registry, ws_id).await;
+                    Response::Ack
+                }
+                Err(err) => Response::Error { message: err.to_string() },
+            }
+        }
+
         Request::ClientList { workspace } => {
             let state = state.lock().await;
             match workspace {
@@ -773,6 +788,63 @@ mod tests {
                 }
                 other => panic!("expected Snapshot, got {other:?}"),
             }
+        }
+    }
+
+    /// `ClientUnbind` detaches a client-pane while leaving its server-pane
+    /// running -- the wire-level counterpart to
+    /// `state::client_unbind_detaches_and_leaves_server_pane_running`.
+    #[tokio::test]
+    async fn client_unbind_detaches_without_killing_server_pane() {
+        let guard = start_daemon().await;
+        let mut conn = TestConn::connect(&guard.0).await;
+
+        let server_pane = match conn
+            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()) })
+            .await
+        {
+            Response::ServerPane(info) => info.id,
+            other => panic!("expected ServerPane, got {other:?}"),
+        };
+
+        let (workspace, pane) = match conn
+            .request(Request::ClientSpawn {
+                workspace: "1".to_string(),
+                split_of: None,
+                dir: None,
+                bind: Some(server_pane.to_string()),
+            })
+            .await
+        {
+            Response::ClientPaneCreated { workspace, pane } => (workspace, pane),
+            other => panic!("expected ClientPaneCreated, got {other:?}"),
+        };
+
+        match conn
+            .request(Request::ClientUnbind { workspace: workspace.to_string(), pane })
+            .await
+        {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+
+        match conn.request(Request::Subscribe { workspace: workspace.to_string() }).await {
+            Response::Snapshot { workspace: info, .. } => {
+                let tree = info.tree.expect("workspace should still have its pane");
+                let leaf = tree.find(pane).expect("client-pane should still exist");
+                assert_eq!(leaf.bound, None, "client-pane should be unbound");
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+
+        match conn.request(Request::ServerList).await {
+            Response::ServerPaneList(list) => {
+                assert!(
+                    list.iter().any(|p| p.id == server_pane),
+                    "unbind must not kill the detached server-pane"
+                );
+            }
+            other => panic!("expected ServerPaneList, got {other:?}"),
         }
     }
 }

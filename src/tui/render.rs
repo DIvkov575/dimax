@@ -29,11 +29,14 @@
 //! vertical divider requires a horizontal (left/right) layout axis. Get
 //! this backwards and every split renders transposed.
 
-use crate::protocol::{Cell, ClientPane, GridSnapshot, ServerPaneId, SplitDir, SplitTree, WorkspaceInfo};
+use crate::protocol::{
+    Cell, ClientPane, GridSnapshot, ServerPaneId, ServerPaneInfo, ServerPaneStatus, SplitDir,
+    SplitTree, WorkspaceInfo,
+};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use std::collections::HashMap;
 
@@ -175,6 +178,78 @@ fn cell_to_span(cell: &Cell) -> Span<'static> {
     }
     style = style.add_modifier(modifiers);
     Span::styled(cell.text.clone(), style)
+}
+
+/// Overlay for `cmd-shift-z`'s attach menu: lists every server-pane plus a
+/// trailing "spawn new" entry, opened after the focused client-pane has
+/// already been detached from whatever it was previously bound to.
+pub fn draw_attach_menu(frame: &mut Frame, servers: &[ServerPaneInfo], selected: usize) {
+    let area = centered_rect(60, 60, frame.area());
+    frame.render_widget(Clear, area);
+
+    let mut lines: Vec<Line<'static>> = servers
+        .iter()
+        .enumerate()
+        .map(|(i, server)| attach_menu_line(server, i == selected))
+        .collect();
+
+    let spawn_index = servers.len();
+    lines.push(spawn_new_line(selected == spawn_index));
+
+    let block = Block::bordered().title("Attach server-pane");
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn attach_menu_line(server: &ServerPaneInfo, selected: bool) -> Line<'static> {
+    let label = server.name.clone().unwrap_or_else(|| short_id(server.id));
+    let status = match server.status {
+        ServerPaneStatus::Running => "Running",
+        ServerPaneStatus::Dead => "Dead",
+    };
+    let text = format!(
+        "{} {} [{}] {}x{}",
+        if selected { ">" } else { " " },
+        label,
+        status,
+        server.size.cols,
+        server.size.rows,
+    );
+    let style = if selected { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+    Line::styled(text, style)
+}
+
+fn spawn_new_line(selected: bool) -> Line<'static> {
+    let text = format!("{} spawn new...", if selected { ">" } else { " " });
+    let style = if selected { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+    Line::styled(text, style)
+}
+
+/// A rect covering `percent_x`% width and `percent_y`% height of `area`,
+/// centered within it. Standard ratatui centering pattern: split into
+/// thirds along each axis (with the requested percentage as the middle
+/// share) and take the middle segment of each split.
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical_margin = (100u16.saturating_sub(percent_y)) / 2;
+    let rows = Layout::new(
+        Direction::Vertical,
+        [
+            Constraint::Percentage(vertical_margin),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage(vertical_margin),
+        ],
+    )
+    .split(area);
+
+    let horizontal_margin = (100u16.saturating_sub(percent_x)) / 2;
+    Layout::new(
+        Direction::Horizontal,
+        [
+            Constraint::Percentage(horizontal_margin),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage(horizontal_margin),
+        ],
+    )
+    .split(rows[1])[1]
 }
 
 #[cfg(test)]
@@ -359,5 +434,31 @@ mod tests {
         }
         assert!(left_half.contains("left"));
         assert!(right_half.contains("right"));
+    }
+
+    #[test]
+    fn draw_attach_menu_shows_selected_item() {
+        let server = ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: Some("editor".to_string()),
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+        };
+        let servers = vec![server];
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &servers, 0)).unwrap();
+        assert!(buffer_contains(&terminal, "editor"));
+        assert!(buffer_contains(&terminal, "spawn new"));
+        assert!(buffer_contains(&terminal, "Attach server-pane"));
+    }
+
+    #[test]
+    fn draw_attach_menu_spawn_new_selected_does_not_panic() {
+        let servers: Vec<ServerPaneInfo> = vec![];
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &servers, 0)).unwrap();
+        assert!(buffer_contains(&terminal, "spawn new"));
     }
 }

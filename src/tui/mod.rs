@@ -81,7 +81,7 @@ pub mod render;
 use crate::cli::Client;
 use crate::protocol::{
     self, ClientPaneId, Event, GridSnapshot, Request, Response, ServerMessage, ServerPaneId,
-    SplitDir, SplitTree, WorkspaceInfo,
+    ServerPaneInfo, SplitDir, SplitTree, WorkspaceInfo,
 };
 use std::collections::HashMap;
 use tokio::io::AsyncReadExt;
@@ -97,6 +97,10 @@ pub enum Action {
     SplitHorizontal,
     CloseFocusedPane,
     KillFocusedServerPane,
+    /// `cmd-shift-z`: detach the focused client-pane from its current
+    /// server-pane (which keeps running) and open the attach menu to pick
+    /// its replacement.
+    DetachAndAttach,
     FocusLeft,
     FocusRight,
     FocusUp,
@@ -104,6 +108,16 @@ pub enum Action {
     /// Not a dimux chord — forward these raw bytes to the focused
     /// client-pane's bound server-pane as keyboard input.
     PassThrough,
+}
+
+/// State for the `cmd-shift-z` attach menu: pick an existing server-pane,
+/// or spawn a new one, to bind into the client-pane that was just
+/// detached. `servers.len()` is always the trailing "spawn new" row's
+/// index (mirrors the removed picker's convention — see
+/// `render::draw_attach_menu`).
+struct AttachMenu {
+    servers: Vec<ServerPaneInfo>,
+    selected: usize,
 }
 
 /// Raw byte, read outside `keys::parse`'s chord grammar entirely, that
@@ -123,6 +137,9 @@ struct App {
     workspace: WorkspaceInfo,
     grids: HashMap<ServerPaneId, GridSnapshot>,
     focused: Option<ClientPaneId>,
+    /// `Some` while the `cmd-shift-z` attach menu is open; input routes to
+    /// `handle_attach_menu_input` instead of the normal keymap while set.
+    attach_menu: Option<AttachMenu>,
 }
 
 impl App {
@@ -149,6 +166,7 @@ impl App {
                         workspace,
                         grids: grids.into_iter().map(|g| (g.server_pane, g)).collect(),
                         focused,
+                        attach_menu: None,
                     });
                 }
                 ServerMessage::Response(other) => {
@@ -238,6 +256,7 @@ impl App {
             self.focused = first_leaf(&workspace);
             self.workspace = workspace;
             self.grids = grids.into_iter().map(|g| (g.server_pane, g)).collect();
+            self.attach_menu = None;
         }
         Ok(())
     }
@@ -313,6 +332,80 @@ impl App {
         Ok(())
     }
 
+    /// `cmd-shift-z`: detach the focused client-pane from its current
+    /// server-pane (which keeps running — see `state::client_unbind`) and
+    /// open the attach menu so a replacement can be picked. A no-op if
+    /// nothing is focused (empty workspace).
+    async fn detach_and_open_menu(
+        &mut self,
+        write_half: &mut OwnedWriteHalf,
+        read_half: &mut OwnedReadHalf,
+    ) -> anyhow::Result<()> {
+        let Some(pane) = self.focused else { return Ok(()) };
+        let req = Request::ClientUnbind { workspace: self.workspace.id.to_string(), pane };
+        let _ = self.request(write_half, read_half, req).await?;
+        if let Response::ServerPaneList(servers) =
+            self.request(write_half, read_half, Request::ServerList).await?
+        {
+            self.attach_menu = Some(AttachMenu { servers, selected: 0 });
+        }
+        Ok(())
+    }
+
+    /// Route one raw byte chunk while the attach menu is open. A distinct,
+    /// simpler modal grammar than the main keymap (same approach the
+    /// removed picker used) rather than reusing `keys::parse`'s chords.
+    async fn handle_attach_menu_input(
+        &mut self,
+        bytes: &[u8],
+        write_half: &mut OwnedWriteHalf,
+        read_half: &mut OwnedReadHalf,
+    ) -> anyhow::Result<()> {
+        match parse_attach_menu_input(bytes) {
+            AttachMenuAction::Up => self.move_attach_menu_selection(false),
+            AttachMenuAction::Down => self.move_attach_menu_selection(true),
+            AttachMenuAction::Cancel => self.attach_menu = None,
+            AttachMenuAction::Confirm => self.confirm_attach_menu(write_half, read_half).await?,
+            AttachMenuAction::Ignore => {}
+        }
+        Ok(())
+    }
+
+    fn move_attach_menu_selection(&mut self, forward: bool) {
+        let Some(menu) = &mut self.attach_menu else { return };
+        // +1 for the trailing "spawn new" row, same convention the
+        // removed picker used (see `render::draw_attach_menu`).
+        let len = menu.servers.len() + 1;
+        menu.selected = if forward { (menu.selected + 1) % len } else { (menu.selected + len - 1) % len };
+    }
+
+    /// Confirm the attach menu's current selection: bind the just-detached
+    /// client-pane to the selected server-pane, spawning a fresh one first
+    /// if the trailing "spawn new" row is selected.
+    async fn confirm_attach_menu(
+        &mut self,
+        write_half: &mut OwnedWriteHalf,
+        read_half: &mut OwnedReadHalf,
+    ) -> anyhow::Result<()> {
+        let Some(menu) = self.attach_menu.take() else { return Ok(()) };
+        let Some(pane) = self.focused else { return Ok(()) };
+        let spawn_new_index = menu.servers.len();
+        let target = if menu.selected == spawn_new_index {
+            match self
+                .request(write_half, read_half, Request::ServerSpawn { name: None, cmd: None })
+                .await?
+            {
+                Response::ServerPane(info) => info.id.to_string(),
+                _ => return Ok(()),
+            }
+        } else {
+            menu.servers[menu.selected].id.to_string()
+        };
+        let req = Request::ClientBind { workspace: self.workspace.id.to_string(), pane, target };
+        let _ = self.request(write_half, read_half, req).await?;
+        Ok(())
+    }
+
     fn move_focus(&mut self, forward: bool) {
         if let Some(tree) = &self.workspace.tree {
             self.focused = cycle_focus(tree, self.focused, forward);
@@ -335,6 +428,7 @@ impl App {
             Action::KillFocusedServerPane => {
                 self.kill_focused_server_pane(write_half, read_half).await?
             }
+            Action::DetachAndAttach => self.detach_and_open_menu(write_half, read_half).await?,
             Action::FocusLeft | Action::FocusUp => self.move_focus(false),
             Action::FocusRight | Action::FocusDown => self.move_focus(true),
             Action::PassThrough => {
@@ -382,6 +476,34 @@ fn cycle_focus(tree: &SplitTree, current: Option<ClientPaneId>, forward: bool) -
     Some(leaves[next_idx].id)
 }
 
+/// Attach-menu input, decoupled from the raw bytes that produced it (same
+/// approach the removed pane-picker used: a distinct, simpler modal
+/// grammar rather than reusing `keys::parse`'s chords).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachMenuAction {
+    Up,
+    Down,
+    Confirm,
+    Cancel,
+    Ignore,
+}
+
+/// Map one raw input chunk to an `AttachMenuAction`. Direct byte matching:
+/// arrow-key escape sequences and vi-style `j`/`k` move the selection,
+/// Enter (`\r` or `\n`) confirms, a bare `Esc` cancels (leaving the pane
+/// unbound — it was already detached by `detach_and_open_menu` before the
+/// menu opened). Anything else is ignored rather than passed through — the
+/// menu is modal and has no server-pane to forward keystrokes to yet.
+fn parse_attach_menu_input(bytes: &[u8]) -> AttachMenuAction {
+    match bytes {
+        b"\r" | b"\n" => AttachMenuAction::Confirm,
+        b"\x1b" => AttachMenuAction::Cancel,
+        b"\x1b[A" | b"k" => AttachMenuAction::Up,
+        b"\x1b[B" | b"j" => AttachMenuAction::Down,
+        _ => AttachMenuAction::Ignore,
+    }
+}
+
 /// RAII guard ensuring the terminal is restored (raw mode disabled,
 /// alternate screen left) on every exit path out of `run` — normal
 /// return, `?`-propagated error, or panic (via the panic hook
@@ -422,6 +544,9 @@ pub async fn run() -> anyhow::Result<()> {
     loop {
         terminal.draw(|frame| {
             render::draw(frame, &app.workspace, &app.grids, app.focused);
+            if let Some(menu) = &app.attach_menu {
+                render::draw_attach_menu(frame, &menu.servers, menu.selected);
+            }
         })?;
 
         tokio::select! {
@@ -437,8 +562,12 @@ pub async fn run() -> anyhow::Result<()> {
                 if is_quit(bytes) {
                     break;
                 }
-                let action = keys::parse(bytes);
-                app.handle_action(action, bytes, &mut write_half, &mut read_half).await?;
+                if app.attach_menu.is_some() {
+                    app.handle_attach_menu_input(bytes, &mut write_half, &mut read_half).await?;
+                } else {
+                    let action = keys::parse(bytes);
+                    app.handle_action(action, bytes, &mut write_half, &mut read_half).await?;
+                }
             }
             frame = protocol::framing::read_frame::<_, ServerMessage>(&mut read_half) => {
                 match frame {
@@ -524,6 +653,31 @@ mod tests {
         let stale = Uuid::new_v4();
         assert_eq!(cycle_focus(&tree, Some(stale), true), Some(a));
         assert_eq!(cycle_focus(&tree, Some(stale), false), Some(a));
+    }
+
+    #[test]
+    fn attach_menu_input_enter_and_newline_confirm() {
+        assert_eq!(parse_attach_menu_input(b"\r"), AttachMenuAction::Confirm);
+        assert_eq!(parse_attach_menu_input(b"\n"), AttachMenuAction::Confirm);
+    }
+
+    #[test]
+    fn attach_menu_input_bare_escape_cancels() {
+        assert_eq!(parse_attach_menu_input(b"\x1b"), AttachMenuAction::Cancel);
+    }
+
+    #[test]
+    fn attach_menu_input_arrow_and_vi_keys_move_selection() {
+        assert_eq!(parse_attach_menu_input(b"\x1b[A"), AttachMenuAction::Up);
+        assert_eq!(parse_attach_menu_input(b"k"), AttachMenuAction::Up);
+        assert_eq!(parse_attach_menu_input(b"\x1b[B"), AttachMenuAction::Down);
+        assert_eq!(parse_attach_menu_input(b"j"), AttachMenuAction::Down);
+    }
+
+    #[test]
+    fn attach_menu_input_unrecognized_bytes_are_ignored() {
+        assert_eq!(parse_attach_menu_input(b"q"), AttachMenuAction::Ignore);
+        assert_eq!(parse_attach_menu_input(b""), AttachMenuAction::Ignore);
     }
 
     #[test]

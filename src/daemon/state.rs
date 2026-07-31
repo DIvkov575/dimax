@@ -361,6 +361,20 @@ impl State {
         Ok(())
     }
 
+    /// Detach `pane` from its current server-pane, if any (`cmd-shift-z`'s
+    /// "detach" half — the server-pane keeps running, matching
+    /// `client_bind`'s already-established "changing a binding recomputes
+    /// the old target's PTY size" behavior rather than tearing it down).
+    /// A no-op if `pane` was already unbound.
+    pub fn client_unbind(&mut self, workspace: WorkspaceId, pane: ClientPaneId) -> anyhow::Result<()> {
+        let leaf = self.client_pane_mut(workspace, pane)?;
+        let Some(previous) = leaf.bound.take() else {
+            return Ok(());
+        };
+        self.apply_pty_size(previous);
+        Ok(())
+    }
+
     pub fn client_list(&self, workspace: Option<WorkspaceId>) -> Vec<(WorkspaceId, ClientPane)> {
         let mut selected: Vec<(&WorkspaceId, &Workspace)> = self
             .workspaces
@@ -1000,6 +1014,25 @@ mod tests {
         assert!(state.client_bind(ws, Uuid::new_v4(), second).is_err());
         let tree = state.workspace_info(ws).unwrap().tree.unwrap();
         assert_eq!(tree.find(pane).unwrap().bound, Some(second));
+    }
+
+    #[test]
+    fn client_unbind_detaches_and_leaves_server_pane_running() {
+        let mut state = State::new();
+        let server = spawn_pane(&mut state, "a");
+        let (ws, pane) = workspace_with_bound_pane(&mut state, "1", server);
+
+        state.client_unbind(ws, pane).unwrap();
+        let tree = state.workspace_info(ws).unwrap().tree.unwrap();
+        assert_eq!(tree.find(pane).unwrap().bound, None);
+        // Detaching isn't killing: the server-pane is still in the pool.
+        assert!(state.server_list().iter().any(|p| p.id == server));
+
+        // Unbinding an already-unbound pane is a no-op, not an error.
+        state.client_unbind(ws, pane).unwrap();
+
+        assert!(state.client_unbind(ws, Uuid::new_v4()).is_err());
+        assert!(state.client_unbind(Uuid::new_v4(), pane).is_err());
     }
 
     #[test]

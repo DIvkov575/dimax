@@ -48,6 +48,7 @@
 //! | `cmd-shift-d` | `D`  | `\x1b_DD\x1b\\`               |
 //! | `cmd-w`       | `w`  | `\x1b_Dw\x1b\\`               |
 //! | `cmd-shift-w` | `W`  | `\x1b_DW\x1b\\`               |
+//! | `cmd-shift-z` | `Z`  | `\x1b_DZ\x1b\\`               |
 //! | `cmd-h`       | `h`  | `\x1b_Dh\x1b\\`               |
 //! | `cmd-j`       | `j`  | `\x1b_Dj\x1b\\`               |
 //! | `cmd-k`       | `k`  | `\x1b_Dk\x1b\\`               |
@@ -78,6 +79,7 @@ enum Chord {
     SplitHorizontal,
     CloseFocusedPane,
     KillFocusedServerPane,
+    DetachAndAttach,
     FocusLeft,
     FocusDown,
     FocusUp,
@@ -92,6 +94,7 @@ impl Chord {
             b'D' => Some(Chord::SplitHorizontal),
             b'w' => Some(Chord::CloseFocusedPane),
             b'W' => Some(Chord::KillFocusedServerPane),
+            b'Z' => Some(Chord::DetachAndAttach),
             b'h' => Some(Chord::FocusLeft),
             b'j' => Some(Chord::FocusDown),
             b'k' => Some(Chord::FocusUp),
@@ -107,6 +110,7 @@ impl Chord {
             Chord::SplitHorizontal => Action::SplitHorizontal,
             Chord::CloseFocusedPane => Action::CloseFocusedPane,
             Chord::KillFocusedServerPane => Action::KillFocusedServerPane,
+            Chord::DetachAndAttach => Action::DetachAndAttach,
             Chord::FocusLeft => Action::FocusLeft,
             Chord::FocusDown => Action::FocusDown,
             Chord::FocusUp => Action::FocusUp,
@@ -184,6 +188,11 @@ mod tests {
     #[test]
     fn kill_focused_server_pane() {
         assert_eq!(parse(&chord_bytes(b'W')), Action::KillFocusedServerPane);
+    }
+
+    #[test]
+    fn detach_and_attach() {
+        assert_eq!(parse(&chord_bytes(b'Z')), Action::DetachAndAttach);
     }
 
     #[test]

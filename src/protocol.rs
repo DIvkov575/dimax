@@ -247,6 +247,15 @@ pub enum Request {
         pane: ClientPaneId,
         target: String,
     },
+    /// Detach `pane` from whatever server-pane it's currently bound to,
+    /// leaving it unbound. The detached server-pane keeps running (design
+    /// doc "Error handling"'s "unbound placeholder" semantics, triggered
+    /// here deliberately rather than as a side effect of a kill). A no-op
+    /// (still `Ack`) if `pane` was already unbound.
+    ClientUnbind {
+        workspace: String,
+        pane: ClientPaneId,
+    },
     ClientList {
         workspace: Option<String>,
     },
