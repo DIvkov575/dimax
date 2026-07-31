@@ -46,7 +46,6 @@
 //! | `cmd-9`       | `9`  | `\x1b_D9\x1b\\`               |
 //! | `cmd-d`       | `d`  | `\x1b_Dd\x1b\\`               |
 //! | `cmd-shift-d` | `D`  | `\x1b_DD\x1b\\`               |
-//! | `cmd-p`       | `p`  | `\x1b_Dp\x1b\\`               |
 //! | `cmd-w`       | `w`  | `\x1b_Dw\x1b\\`               |
 //! | `cmd-shift-w` | `W`  | `\x1b_DW\x1b\\`               |
 //! | `cmd-h`       | `h`  | `\x1b_Dh\x1b\\`               |
@@ -77,7 +76,6 @@ enum Chord {
     Workspace(u8),
     SplitVertical,
     SplitHorizontal,
-    OpenPicker,
     CloseFocusedPane,
     KillFocusedServerPane,
     FocusLeft,
@@ -92,7 +90,6 @@ impl Chord {
             b'1'..=b'9' => Some(Chord::Workspace(tag - b'0')),
             b'd' => Some(Chord::SplitVertical),
             b'D' => Some(Chord::SplitHorizontal),
-            b'p' => Some(Chord::OpenPicker),
             b'w' => Some(Chord::CloseFocusedPane),
             b'W' => Some(Chord::KillFocusedServerPane),
             b'h' => Some(Chord::FocusLeft),
@@ -108,7 +105,6 @@ impl Chord {
             Chord::Workspace(n) => Action::SwitchWorkspace(n),
             Chord::SplitVertical => Action::SplitVertical,
             Chord::SplitHorizontal => Action::SplitHorizontal,
-            Chord::OpenPicker => Action::OpenPicker,
             Chord::CloseFocusedPane => Action::CloseFocusedPane,
             Chord::KillFocusedServerPane => Action::KillFocusedServerPane,
             Chord::FocusLeft => Action::FocusLeft,
@@ -181,11 +177,6 @@ mod tests {
     }
 
     #[test]
-    fn open_picker() {
-        assert_eq!(parse(&chord_bytes(b'p')), Action::OpenPicker);
-    }
-
-    #[test]
     fn close_focused_pane() {
         assert_eq!(parse(&chord_bytes(b'w')), Action::CloseFocusedPane);
     }
@@ -228,6 +219,14 @@ mod tests {
     #[test]
     fn unrecognized_tag_passes_through() {
         assert_eq!(parse(&chord_bytes(b'z')), Action::PassThrough);
+    }
+
+    #[test]
+    fn removed_picker_tag_now_passes_through() {
+        // `p` was `cmd-p`/`OpenPicker` before the picker was removed;
+        // confirms the tag is genuinely gone from the grammar, not just
+        // unreachable from `Action`.
+        assert_eq!(parse(&chord_bytes(b'p')), Action::PassThrough);
     }
 
     #[test]
