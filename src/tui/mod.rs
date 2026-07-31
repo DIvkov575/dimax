@@ -636,12 +636,45 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = ratatui::crossterm::execute!(
-            std::io::stdout(),
-            ratatui::crossterm::event::DisableMouseCapture
-        );
+        let _ = disable_button_event_mouse_tracking();
         ratatui::restore();
     }
+}
+
+/// Enable exactly the xterm mouse modes dimux's drag-resize needs: normal
+/// tracking (`?1000h`, click/release) + button-event tracking (`?1002h`,
+/// motion reported only *while a button is held* — i.e. drags) + SGR
+/// extended-coordinate encoding (`?1006h`, what `mouse::parse` expects).
+///
+/// Deliberately NOT `ratatui::crossterm::event::EnableMouseCapture`: that
+/// command additionally enables any-event tracking (`?1003h`), which
+/// reports *every* mouse movement — including with no button held at
+/// all, e.g. just passing the cursor over the window while typing
+/// elsewhere in it. `mouse::parse` only understands the left button
+/// (dimux has no use for right/middle/movement-only events) and returns
+/// `None` for anything else, which then falls through to `keys::parse`,
+/// which also doesn't recognize it, resolves to `Action::PassThrough`,
+/// and writes the raw unparsed escape sequence into the focused pane as
+/// literal keystrokes. Under `?1003h` this happens on every pixel of
+/// mouse motion, which is both the garbage-character symptom (a mouse
+/// move's SGR encoding — button number 3, i.e. `Cb=35` — landing in the
+/// shell as text) and the "random hangup" (each stray byte round-trips a
+/// `Request::Input` through the daemon; enough volume visibly stalls the
+/// event loop). `?1002h` alone never asks the terminal to report motion
+/// without a button down, so this class of event never arrives.
+fn enable_button_event_mouse_tracking() -> std::io::Result<()> {
+    use std::io::Write;
+    write!(std::io::stdout(), "\x1b[?1000h\x1b[?1002h\x1b[?1006h")?;
+    std::io::stdout().flush()
+}
+
+/// Inverse of [`enable_button_event_mouse_tracking`], in reverse order —
+/// same convention `crossterm::event::DisableMouseCapture` follows for
+/// its own mode list.
+fn disable_button_event_mouse_tracking() -> std::io::Result<()> {
+    use std::io::Write;
+    write!(std::io::stdout(), "\x1b[?1006l\x1b[?1002l\x1b[?1000l")?;
+    std::io::stdout().flush()
 }
 
 /// Drives one attached frontend: connect, subscribe to the initial
@@ -661,7 +694,7 @@ pub async fn run() -> anyhow::Result<()> {
     // the terminal via `TerminalGuard::drop` (including disabling mouse
     // capture, enabled next).
     let _guard = TerminalGuard;
-    ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::event::EnableMouseCapture)?;
+    enable_button_event_mouse_tracking()?;
 
     let mut app = App::bootstrap(&mut write_half, &mut read_half, "1").await?;
 
@@ -704,13 +737,24 @@ pub async fn run() -> anyhow::Result<()> {
                 if is_quit(bytes) {
                     break;
                 }
-                if let Some(mouse_event) = mouse::parse(bytes) {
-                    app.handle_mouse(mouse_event, &mut write_half, &mut read_half).await?;
-                } else if app.attach_menu.is_some() {
-                    app.handle_attach_menu_input(bytes, &mut write_half, &mut read_half).await?;
-                } else {
-                    let action = keys::parse(bytes);
-                    app.handle_action(action, bytes, &mut write_half, &mut read_half).await?;
+                match mouse::parse(bytes) {
+                    mouse::ParsedInput::Mouse(event) => {
+                        app.handle_mouse(event, &mut write_half, &mut read_half).await?;
+                    }
+                    // A recognized SGR mouse sequence dimux has no use
+                    // for (see mouse.rs module doc "Defense in depth") --
+                    // definitely mouse input, definitely not keyboard
+                    // input, so discard it rather than falling through to
+                    // the chord/pass-through paths below.
+                    mouse::ParsedInput::Ignored => {}
+                    mouse::ParsedInput::NotMouse => {
+                        if app.attach_menu.is_some() {
+                            app.handle_attach_menu_input(bytes, &mut write_half, &mut read_half).await?;
+                        } else {
+                            let action = keys::parse(bytes);
+                            app.handle_action(action, bytes, &mut write_half, &mut read_half).await?;
+                        }
+                    }
                 }
             }
             frame = protocol::framing::read_frame::<_, ServerMessage>(&mut read_half) => {
