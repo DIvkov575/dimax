@@ -109,6 +109,7 @@ impl State {
             name,
             size: pane.size(),
             status: pane.status(),
+            foreground: pane.foreground_info(),
         };
         self.server_panes.insert(id, pane);
         Ok(info)
@@ -169,6 +170,7 @@ impl State {
                 name: p.name().map(str::to_string),
                 size: p.size(),
                 status: p.status(),
+                foreground: p.foreground_info(),
             })
             .collect();
         // HashMap order is unspecified; sort so `dimux server ls` output
