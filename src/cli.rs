@@ -7,7 +7,7 @@
 //! frontend callers" is implemented by both `cli` and `tui` going through
 //! this same type.
 
-use crate::protocol::{self, Request, Response, ServerMessage};
+use crate::protocol::{self, ClientPane, Request, Response, ServerMessage, ServerPaneInfo, ServerPaneStatus};
 use tokio::net::UnixStream;
 
 pub struct Client {
@@ -115,12 +115,266 @@ pub fn parse_pane_addr(addr: &str) -> anyhow::Result<(String, uuid::Uuid)> {
     Ok((workspace.to_string(), pane))
 }
 
+/// Handle a `Response::Error` (or any other unexpected `Response` that
+/// doesn't match what `context` should have produced): print the
+/// message to stderr and turn it into an `Err` so `main`'s top-level
+/// `anyhow::Result` propagation exits non-zero (design doc "Error
+/// handling" — "CLI prints to stderr and exits non-zero"). Never panics,
+/// even on a variant mismatch that "shouldn't happen".
+fn unexpected_response(context: &str, resp: Response) -> anyhow::Error {
+    match resp {
+        Response::Error { message } => {
+            eprintln!("{message}");
+            anyhow::anyhow!(message)
+        }
+        other => {
+            let message = format!("unexpected response to {context}: {other:?}");
+            eprintln!("{message}");
+            anyhow::anyhow!(message)
+        }
+    }
+}
+
+/// Format one `ServerPaneInfo` as a single scriptable line: `id  name  status  rows x cols`.
+fn format_server_pane_line(info: &ServerPaneInfo) -> String {
+    let name = info.name.as_deref().unwrap_or("-");
+    let status = match info.status {
+        ServerPaneStatus::Running => "running",
+        ServerPaneStatus::Dead => "dead",
+    };
+    format!(
+        "{}\t{}\t{}\t{}x{}",
+        info.id, name, status, info.size.rows, info.size.cols
+    )
+}
+
+/// Format one `ClientPane` as a single scriptable line: `id  name  bound-server-pane-or-dash`.
+fn format_client_pane_line(pane: &ClientPane) -> String {
+    let name = pane.name.as_deref().unwrap_or("-");
+    let bound = pane
+        .bound
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    format!("{}\t{}\t{}", pane.id, name, bound)
+}
+
 /// Execute a parsed `Cli` command against a real daemon connection and
 /// print human-readable output, mirroring what `dimux server ls` /
 /// `dimux client ls` etc. should show at the terminal. Split out from
 /// `main` so it's the one place both the real binary and any CLI-level
 /// tests invoke.
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
-    let _ = cli;
-    todo!("dispatch each Cli variant to a Client::request call, format Response for stdout/stderr")
+    match cli {
+        Cli::Server { cmd } => run_server(cmd).await,
+        Cli::Client { cmd } => run_client(cmd).await,
+        // `main.rs` handles `Attach`/`Daemon` itself and never calls
+        // `run` with them; a caller doing so anyway is a `main.rs` bug,
+        // not something to service here.
+        Cli::Attach | Cli::Daemon => {
+            anyhow::bail!("cli::run called with Attach/Daemon, which main.rs should handle directly")
+        }
+    }
+}
+
+async fn run_server(cmd: ServerCmd) -> anyhow::Result<()> {
+    let mut client = Client::connect().await?;
+    match cmd {
+        ServerCmd::Spawn { name, cmd } => {
+            let req = Request::ServerSpawn { name: Some(name), cmd };
+            match client.request(req).await? {
+                Response::ServerPane(info) => {
+                    let label = info.name.as_deref().unwrap_or("-");
+                    println!("spawned server-pane {label} ({})", info.id);
+                    Ok(())
+                }
+                other => Err(unexpected_response("server spawn", other)),
+            }
+        }
+        ServerCmd::Kill { target } => {
+            let req = Request::ServerKill { target: target.clone() };
+            match client.request(req).await? {
+                Response::Ack => {
+                    println!("killed server-pane {target}");
+                    Ok(())
+                }
+                other => Err(unexpected_response("server kill", other)),
+            }
+        }
+        ServerCmd::Rename { target, new_name } => {
+            let req = Request::ServerRename { target: target.clone(), new_name: new_name.clone() };
+            match client.request(req).await? {
+                Response::Ack => {
+                    println!("renamed server-pane {target} to {new_name}");
+                    Ok(())
+                }
+                other => Err(unexpected_response("server rename", other)),
+            }
+        }
+        ServerCmd::Ls => match client.request(Request::ServerList).await? {
+            Response::ServerPaneList(panes) => {
+                for info in &panes {
+                    println!("{}", format_server_pane_line(info));
+                }
+                Ok(())
+            }
+            other => Err(unexpected_response("server ls", other)),
+        },
+    }
+}
+
+async fn run_client(cmd: ClientCmd) -> anyhow::Result<()> {
+    let mut client = Client::connect().await?;
+    match cmd {
+        ClientCmd::Spawn { workspace, split, dir, bind } => {
+            let req = Request::ClientSpawn {
+                workspace,
+                split_of: split,
+                dir: dir.map(Into::into),
+                bind,
+            };
+            match client.request(req).await? {
+                Response::ClientPaneCreated { workspace, pane } => {
+                    println!("{workspace}/{pane}");
+                    Ok(())
+                }
+                other => Err(unexpected_response("client spawn", other)),
+            }
+        }
+        ClientCmd::Close { addr } => {
+            let (workspace, pane) = parse_pane_addr(&addr)?;
+            let req = Request::ClientClose { workspace, pane };
+            match client.request(req).await? {
+                Response::Ack => {
+                    println!("closed {addr}");
+                    Ok(())
+                }
+                other => Err(unexpected_response("client close", other)),
+            }
+        }
+        ClientCmd::Rename { addr, new_name } => {
+            let (workspace, pane) = parse_pane_addr(&addr)?;
+            let req = Request::ClientRename { workspace, pane, new_name: new_name.clone() };
+            match client.request(req).await? {
+                Response::Ack => {
+                    println!("renamed {addr} to {new_name}");
+                    Ok(())
+                }
+                other => Err(unexpected_response("client rename", other)),
+            }
+        }
+        ClientCmd::Bind { addr, target } => {
+            let (workspace, pane) = parse_pane_addr(&addr)?;
+            let req = Request::ClientBind { workspace, pane, target: target.clone() };
+            match client.request(req).await? {
+                Response::Ack => {
+                    println!("bound {addr} to {target}");
+                    Ok(())
+                }
+                other => Err(unexpected_response("client bind", other)),
+            }
+        }
+        ClientCmd::Ls { workspace } => {
+            let req = Request::ClientList { workspace };
+            match client.request(req).await? {
+                Response::ClientPaneList { workspace, panes } => {
+                    for pane in &panes {
+                        println!("{workspace}\t{}", format_client_pane_line(pane));
+                    }
+                    Ok(())
+                }
+                other => Err(unexpected_response("client ls", other)),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{ClientPane, ServerPaneStatus, Size};
+    use uuid::Uuid;
+
+    #[test]
+    fn parse_pane_addr_valid() {
+        let id = Uuid::new_v4();
+        let addr = format!("dev/{id}");
+        let (workspace, pane) = parse_pane_addr(&addr).unwrap();
+        assert_eq!(workspace, "dev");
+        assert_eq!(pane, id);
+    }
+
+    #[test]
+    fn parse_pane_addr_missing_slash() {
+        assert!(parse_pane_addr("not-an-address").is_err());
+    }
+
+    #[test]
+    fn parse_pane_addr_empty_string() {
+        assert!(parse_pane_addr("").is_err());
+    }
+
+    #[test]
+    fn parse_pane_addr_invalid_uuid() {
+        assert!(parse_pane_addr("dev/not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn parse_pane_addr_workspace_with_slash_in_name() {
+        // rsplit_once takes the *last* `/`, so a workspace name containing
+        // `/` is preserved as part of the workspace segment.
+        let id = Uuid::new_v4();
+        let addr = format!("team/dev/{id}");
+        let (workspace, pane) = parse_pane_addr(&addr).unwrap();
+        assert_eq!(workspace, "team/dev");
+        assert_eq!(pane, id);
+    }
+
+    #[test]
+    fn format_server_pane_line_with_name() {
+        let info = ServerPaneInfo {
+            id: Uuid::nil(),
+            name: Some("editor".to_string()),
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+        };
+        let line = format_server_pane_line(&info);
+        assert_eq!(
+            line,
+            format!("{}\teditor\trunning\t24x80", Uuid::nil())
+        );
+    }
+
+    #[test]
+    fn format_server_pane_line_without_name_and_dead() {
+        let info = ServerPaneInfo {
+            id: Uuid::nil(),
+            name: None,
+            size: Size { rows: 10, cols: 20 },
+            status: ServerPaneStatus::Dead,
+        };
+        let line = format_server_pane_line(&info);
+        assert_eq!(line, format!("{}\t-\tdead\t10x20", Uuid::nil()));
+    }
+
+    #[test]
+    fn format_client_pane_line_bound() {
+        let server_pane = Uuid::new_v4();
+        let pane = ClientPane {
+            id: Uuid::nil(),
+            name: Some("shell".to_string()),
+            bound: Some(server_pane),
+        };
+        let line = format_client_pane_line(&pane);
+        assert_eq!(
+            line,
+            format!("{}\tshell\t{server_pane}", Uuid::nil())
+        );
+    }
+
+    #[test]
+    fn format_client_pane_line_unbound_unnamed() {
+        let pane = ClientPane { id: Uuid::nil(), name: None, bound: None };
+        let line = format_client_pane_line(&pane);
+        assert_eq!(line, format!("{}\t-\t-", Uuid::nil()));
+    }
 }
