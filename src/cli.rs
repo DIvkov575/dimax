@@ -38,6 +38,14 @@ impl Client {
             }
         }
     }
+
+    /// Split into an owned read half and write half for callers (the TUI)
+    /// that need to send requests and receive pushed `Event`s concurrently
+    /// on the same connection, rather than the strict request/then-response
+    /// cycle `request()` assumes.
+    pub fn into_split(self) -> (tokio::net::unix::OwnedReadHalf, tokio::net::unix::OwnedWriteHalf) {
+        self.stream.into_split()
+    }
 }
 
 /// Top-level CLI argument tree. `main.rs` parses into this with `clap`
