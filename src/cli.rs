@@ -96,6 +96,7 @@ pub enum ClientCmd {
     Close { addr: String },
     Rename { addr: String, new_name: String },
     Bind { addr: String, target: String },
+    Unbind { addr: String },
     Ls { workspace: Option<String> },
 }
 
@@ -279,6 +280,17 @@ async fn run_client(cmd: ClientCmd) -> anyhow::Result<()> {
                     Ok(())
                 }
                 other => Err(unexpected_response("client bind", other)),
+            }
+        }
+        ClientCmd::Unbind { addr } => {
+            let (workspace, pane) = parse_pane_addr(&addr)?;
+            let req = Request::ClientUnbind { workspace, pane };
+            match client.request(req).await? {
+                Response::Ack => {
+                    println!("unbound {addr}");
+                    Ok(())
+                }
+                other => Err(unexpected_response("client unbind", other)),
             }
         }
         ClientCmd::Ls { workspace } => {
