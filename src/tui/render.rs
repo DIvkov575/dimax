@@ -28,6 +28,21 @@
 //! divider's orientation, `Direction` names the layout axis, and a
 //! vertical divider requires a horizontal (left/right) layout axis. Get
 //! this backwards and every split renders transposed.
+//!
+//! # Bezels: shared dividers instead of per-pane boxes
+//!
+//! Every leaf draws only a top border (a 1-row title bar), not a full box
+//! — the previous `Borders::ALL` meant two side-by-side panes each drew
+//! their own left/right border, doubling into a 2-character-wide dead
+//! seam at every split. Two cases now:
+//! - `Direction::Horizontal` (side-by-side panes, vertical divider line):
+//!   there is no natural shared edge to reuse, so `draw_tree` explicitly
+//!   reserves a single column between the two children and paints a `│`
+//!   divider into it.
+//! - `Direction::Vertical` (stacked panes, horizontal divider line): the
+//!   *lower* child's own top-border title bar already sits exactly on the
+//!   boundary, so no extra row is reserved — one fewer thing to draw, one
+//!   less row of dead space.
 
 use crate::protocol::{
     Cell, ClientPane, GridSnapshot, ServerPaneId, ServerPaneInfo, ServerPaneStatus, SplitDir,
@@ -80,17 +95,50 @@ fn draw_tree(
     match tree {
         SplitTree::Leaf(pane) => draw_leaf(frame, pane, area, grids, focused),
         SplitTree::Split { dir, ratio, a, b } => {
+            let direction = ratatui_direction(*dir);
             let percent_a = (ratio.clamp(0.0, 1.0) * 100.0).round() as u16;
             let percent_b = 100u16.saturating_sub(percent_a);
-            let rects = Layout::new(
-                ratatui_direction(*dir),
-                [Constraint::Percentage(percent_a), Constraint::Percentage(percent_b)],
-            )
-            .split(area);
-            draw_tree(frame, a, rects[0], grids, focused);
-            draw_tree(frame, b, rects[1], grids, focused);
+
+            // See module doc "Bezels: shared dividers instead of per-pane
+            // boxes" — side-by-side panes need an explicit reserved
+            // column for the divider; stacked panes don't (the lower
+            // child's own title-bar row sits on the boundary for free).
+            let (rect_a, rect_b) = match direction {
+                Direction::Horizontal => {
+                    let rects = Layout::new(
+                        direction,
+                        [
+                            Constraint::Percentage(percent_a),
+                            Constraint::Length(1),
+                            Constraint::Percentage(percent_b),
+                        ],
+                    )
+                    .split(area);
+                    draw_vertical_divider(frame, rects[1]);
+                    (rects[0], rects[2])
+                }
+                Direction::Vertical => {
+                    let rects = Layout::new(
+                        direction,
+                        [Constraint::Percentage(percent_a), Constraint::Percentage(percent_b)],
+                    )
+                    .split(area);
+                    (rects[0], rects[1])
+                }
+            };
+            draw_tree(frame, a, rect_a, grids, focused);
+            draw_tree(frame, b, rect_b, grids, focused);
         }
     }
+}
+
+/// Paint a single-column `│` divider (the shared edge between two
+/// side-by-side panes) into `area`, which `draw_tree` has already
+/// reserved as exactly one column wide.
+fn draw_vertical_divider(frame: &mut Frame, area: Rect) {
+    let line = Line::from("│").style(Style::new());
+    let text = Text::from(vec![line; area.height as usize]);
+    frame.render_widget(Paragraph::new(text), area);
 }
 
 /// Short id prefix used as a fallback title/label when a pane/server-pane
@@ -116,8 +164,10 @@ fn draw_leaf(
     } else {
         Style::new()
     };
+    // Top-only border (a title bar), not a full box -- see module doc
+    // "Bezels: shared dividers instead of per-pane boxes".
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(Borders::TOP)
         .title(title)
         .border_style(border_style);
 
@@ -434,6 +484,56 @@ mod tests {
         }
         assert!(left_half.contains("left"));
         assert!(right_half.contains("right"));
+    }
+
+    #[test]
+    fn vertical_split_draws_single_shared_divider_column() {
+        // A vertical split (side-by-side panes) reserves exactly one
+        // divider column between the two children -- not two (one from
+        // each pane's own border), per module doc "Bezels".
+        let left = ClientPane { id: Uuid::new_v4(), name: None, bound: None };
+        let right = ClientPane { id: Uuid::new_v4(), name: None, bound: None };
+        let tree = SplitTree::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            a: Box::new(SplitTree::Leaf(left)),
+            b: Box::new(SplitTree::Leaf(right)),
+        };
+        let workspace = workspace_with_tree(tree);
+        let grids = HashMap::new();
+        let backend = TestBackend::new(41, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &workspace, &grids, None)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        // Row 1 (below the title-bar row) is pure pane body on both sides
+        // of the divider -- count how many columns in that row are the
+        // divider glyph. Exactly one column should be "│".
+        let divider_columns = (0..buffer.area().width)
+            .filter(|&x| buffer.cell((x, 1)).unwrap().symbol() == "│")
+            .count();
+        assert_eq!(divider_columns, 1, "expected exactly one shared divider column, not a doubled seam");
+    }
+
+    #[test]
+    fn leaf_uses_top_only_border_not_a_full_box() {
+        // A single leaf should not draw side/bottom border glyphs -- only
+        // the top title-bar row, per module doc "Bezels".
+        let pane = ClientPane { id: Uuid::new_v4(), name: Some("solo".into()), bound: None };
+        let workspace = workspace_with_tree(SplitTree::Leaf(pane));
+        let grids = HashMap::new();
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &workspace, &grids, None)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let last_row = buffer.area().height - 1;
+        for x in 0..buffer.area().width {
+            let symbol = buffer.cell((x, last_row)).unwrap().symbol();
+            assert_ne!(symbol, "└", "bottom border should not be drawn");
+            assert_ne!(symbol, "┘", "bottom border should not be drawn");
+            assert_ne!(symbol, "─", "bottom border should not be drawn");
+        }
     }
 
     #[test]
