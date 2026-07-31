@@ -17,7 +17,7 @@
 //! that never claims it will render nothing.
 
 use crate::protocol::{
-    ClientPane, ClientPaneId, ServerPaneId, ServerPaneInfo, Size, SplitDir, SplitTree,
+    ClientPane, ClientPaneId, ServerPaneId, ServerPaneInfo, Size, SplitDir, SplitId, SplitTree,
     WorkspaceId, WorkspaceInfo,
 };
 use crate::term::{ServerPane, ServerPaneEvent};
@@ -373,6 +373,26 @@ impl State {
         };
         self.apply_pty_size(previous);
         Ok(())
+    }
+
+    /// Set a split's ratio directly (mouse-drag resizing, design doc
+    /// addendum). Does not touch PTY sizing on its own -- the caller
+    /// (`daemon::dispatch`) is expected to also call `resize_client_pane`
+    /// for whichever client-panes' on-screen size changed as a result,
+    /// the same way a frontend reports any other resize.
+    pub fn resize_split(
+        &mut self,
+        workspace: WorkspaceId,
+        split: SplitId,
+        new_ratio: f32,
+    ) -> anyhow::Result<()> {
+        self.workspaces
+            .get_mut(&workspace)
+            .ok_or_else(|| anyhow::anyhow!("unknown workspace {workspace}"))?
+            .tree
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("workspace {workspace} has no panes"))?
+            .resize_split(split, new_ratio)
     }
 
     pub fn client_list(&self, workspace: Option<WorkspaceId>) -> Vec<(WorkspaceId, ClientPane)> {
@@ -887,6 +907,27 @@ mod tests {
             SplitTree::Split { dir, .. } => assert_eq!(dir, SplitDir::Horizontal),
             other => panic!("expected a split, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resize_split_updates_ratio_and_rejects_unknown_workspace_or_split() {
+        let mut state = State::new();
+        let ws = state.resolve_or_create_workspace("1").unwrap();
+        let first = state.client_spawn(ws, None, None, None).unwrap();
+        state.client_spawn(ws, Some(first), Some(SplitDir::Vertical), None).unwrap();
+        let split_id = match state.workspace_info(ws).unwrap().tree.unwrap() {
+            SplitTree::Split { id, .. } => id,
+            other => panic!("expected a split, got {other:?}"),
+        };
+
+        state.resize_split(ws, split_id, 0.3).unwrap();
+        match state.workspace_info(ws).unwrap().tree.unwrap() {
+            SplitTree::Split { ratio, .. } => assert_eq!(ratio, 0.3),
+            other => panic!("expected a split, got {other:?}"),
+        }
+
+        assert!(state.resize_split(Uuid::new_v4(), split_id, 0.5).is_err());
+        assert!(state.resize_split(ws, Uuid::new_v4(), 0.5).is_err());
     }
 
     #[test]
