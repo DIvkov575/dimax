@@ -278,11 +278,33 @@ impl App {
     }
 
     /// `cmd-p`: open the picker to rebind the focused pane, no split.
+    ///
+    /// If the workspace is empty, there is no focused pane to rebind —
+    /// `self.focused` is `None` (see `first_leaf`/`reconcile_focus`, which
+    /// only ever point at an existing leaf). In that case this creates the
+    /// workspace's sole leaf first (the same `ClientSpawn` `split` uses
+    /// when starting from empty), then opens the picker on it, so `cmd-p`
+    /// is a working entry point on an empty workspace rather than a
+    /// no-op — mirrors the placeholder text `render::draw` shows for an
+    /// empty workspace: "press cmd-p to spawn a pane".
     async fn open_picker(
         &mut self,
         write_half: &mut OwnedWriteHalf,
         read_half: &mut OwnedReadHalf,
     ) -> anyhow::Result<()> {
+        if self.focused.is_none() {
+            let req = Request::ClientSpawn {
+                workspace: self.workspace.id.to_string(),
+                split_of: None,
+                dir: None,
+                bind: None,
+            };
+            if let Response::ClientPaneCreated { pane, .. } =
+                self.request(write_half, read_half, req).await?
+            {
+                self.focused = Some(pane);
+            }
+        }
         if let Response::ServerPaneList(list) =
             self.request(write_half, read_half, Request::ServerList).await?
         {
