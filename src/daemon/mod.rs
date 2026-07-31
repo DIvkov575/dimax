@@ -19,8 +19,9 @@ use crate::protocol::{self, ClientPane, Event, Request, Response, ServerMessage,
 use crate::term::ServerPaneEvent;
 use state::{State, SubscriberId};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -42,11 +43,17 @@ pub struct Daemon {
     pub socket_path: std::path::PathBuf,
 }
 
-/// Bind `socket_path` and serve forever (or until the process is killed).
-/// Used both by `dimux attach`'s auto-spawn path and directly by
-/// integration tests with a temp path.
+/// Bind `socket_path`, cleaning up a stale socket file left behind by a
+/// crashed or killed previous daemon first (see [`bind_socket`]), then
+/// installs a `SIGTERM`/`SIGINT` handler that unlinks `socket_path` before
+/// letting the process actually exit, so a *graceful* shutdown leaves no
+/// file behind at all -- [`bind_socket`]'s stale-detection is the
+/// fallback for the crash case this handler can't catch. Used both by
+/// `dimux attach`'s auto-spawn path and directly by integration tests
+/// with a temp path.
 pub async fn run(socket_path: std::path::PathBuf) -> anyhow::Result<Daemon> {
-    let listener = UnixListener::bind(&socket_path)?;
+    let listener = bind_socket(&socket_path).await?;
+    spawn_cleanup_on_signal(socket_path.clone())?;
     let mut inner_state = State::new();
     // Claim the pane-event stream exactly once, right here at start-up
     // (module doc / `state::State::take_pane_events` doc comment) — this
@@ -96,6 +103,51 @@ pub async fn run(socket_path: std::path::PathBuf) -> anyhow::Result<Daemon> {
     });
 
     Ok(Daemon { socket_path })
+}
+
+/// Bind `socket_path`, first clearing out a stale leftover socket file if
+/// one exists and nothing is actually listening on it.
+///
+/// A Unix socket file on disk outlives the process that created it if
+/// that process dies without unlinking it (killed, crashed, `Ctrl-C`'d) —
+/// `UnixListener::bind` then fails with `AddrInUse` on the *next* daemon
+/// start even though no daemon is actually running, which is exactly the
+/// stuck state `ensure_running`'s callers hit (spawn a new daemon, it
+/// fails to bind and exits, the 2s reachability poll times out with no
+/// indication why). Distinguishing "stale file" from "a real daemon is
+/// already listening" matters — unconditionally unlinking on every start
+/// would let two daemons started back-to-back race each other's sockets
+/// out from under already-connected clients. So: try connecting first.
+/// A successful connect means a real listener answered — leave the file
+/// alone and let `bind` fail naturally (a second daemon has no business
+/// running). A failed connect (`ECONNREFUSED` or similar — nothing
+/// listening) means the file is stale; remove it and bind fresh.
+async fn bind_socket(socket_path: &Path) -> anyhow::Result<UnixListener> {
+    if socket_path.exists() && UnixStream::connect(socket_path).await.is_err() {
+        std::fs::remove_file(socket_path)?;
+    }
+    Ok(UnixListener::bind(socket_path)?)
+}
+
+/// Install a `SIGTERM`/`SIGINT` handler that unlinks `socket_path` before
+/// the process exits, so a graceful shutdown (a normal `kill`, or
+/// `Ctrl-C` to a foreground `dimux daemon`) leaves no stale file for
+/// `bind_socket`'s fallback to need to clean up next time. Spawns a
+/// background task that waits for either signal once, removes the file
+/// (best-effort — nothing further to do if that fails), and exits the
+/// process.
+fn spawn_cleanup_on_signal(socket_path: PathBuf) -> anyhow::Result<()> {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = sigterm.recv() => {}
+            _ = sigint.recv() => {}
+        }
+        let _ = std::fs::remove_file(&socket_path);
+        std::process::exit(0);
+    });
+    Ok(())
 }
 
 /// Auto-spawn the daemon as a detached background process if
@@ -534,6 +586,55 @@ mod tests {
         let path = std::env::temp_dir().join(format!("dimux-test-{}.sock", Uuid::new_v4()));
         run(path.clone()).await.expect("daemon should bind and start");
         SocketGuard(path)
+    }
+
+    /// A stale socket file (nothing listening on it) does not block a new
+    /// daemon from starting -- `bind_socket` must detect that connecting
+    /// to it fails and remove it before binding, rather than propagating
+    /// `AddrInUse` (the bug this test guards against: a crashed daemon's
+    /// leftover socket file permanently blocking every subsequent start).
+    #[tokio::test]
+    async fn stale_socket_file_is_cleaned_up_before_binding() {
+        let path = std::env::temp_dir().join(format!("dimux-test-{}.sock", Uuid::new_v4()));
+        let _guard = SocketGuard(path.clone());
+
+        // Create a listener and immediately drop it without unlinking --
+        // exactly what a crashed/killed daemon leaves behind: a socket
+        // file on disk with nothing listening on it.
+        {
+            let listener = UnixListener::bind(&path).unwrap();
+            drop(listener);
+        }
+        assert!(path.exists(), "the stale file should still be on disk after the listener drops");
+
+        // A real daemon must still be able to start at this path.
+        run(path.clone()).await.expect("daemon should clean up the stale file and bind");
+
+        // And a client must be able to connect to it.
+        let mut conn = TestConn::connect(&path).await;
+        match conn.request(Request::ServerList).await {
+            Response::ServerPaneList(list) => assert!(list.is_empty()),
+            other => panic!("expected ServerPaneList, got {other:?}"),
+        }
+    }
+
+    /// A socket with a real daemon already listening on it is left
+    /// alone -- `bind_socket` must not unlink a live daemon's socket out
+    /// from under it.
+    #[tokio::test]
+    async fn live_socket_is_not_removed_and_second_bind_fails() {
+        let guard = start_daemon().await;
+
+        // A second `run` at the same path must fail (real daemon already
+        // listening) rather than silently stealing the socket file.
+        assert!(bind_socket(&guard.0).await.is_err());
+
+        // The original daemon must still be reachable afterward.
+        let mut conn = TestConn::connect(&guard.0).await;
+        match conn.request(Request::ServerList).await {
+            Response::ServerPaneList(list) => assert!(list.is_empty()),
+            other => panic!("expected ServerPaneList, got {other:?}"),
+        }
     }
 
     /// A minimal test-local stand-in for `cli::Client`: connects, and lets
