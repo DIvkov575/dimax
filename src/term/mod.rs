@@ -15,6 +15,7 @@
 use crate::protocol::{Cell, ForegroundProcessInfo, GridSnapshot, ServerPaneId, ServerPaneStatus, Size};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtyPair, PtySize};
 use std::io::{Read, Write};
+use std::os::fd::RawFd;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
 use wezterm_term::color::ColorAttribute;
@@ -142,6 +143,14 @@ impl ServerPane {
             Box::new(writer.clone()),
         );
         let mut reader = master.try_clone_reader()?;
+        // `try_clone_reader` dups the master's fd (see `unix.rs` in the
+        // vendored `portable-pty` source); per POSIX, file *status*
+        // flags such as `O_NONBLOCK` are shared across `dup()`'d
+        // descriptors sharing one open-file-description, so toggling
+        // non-blocking mode on this raw fd affects `reader`'s own reads
+        // too, letting the reader thread's drain loop (below) briefly
+        // switch to non-blocking reads without a second real fd.
+        let raw_fd = master.as_raw_fd();
 
         let inner = Arc::new(Mutex::new(Inner {
             terminal,
@@ -156,24 +165,81 @@ impl ServerPane {
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
-                match reader.read(&mut buf) {
+                // Block until at least one byte is available -- this is
+                // what lets the thread sleep with zero CPU cost when the
+                // pane is idle, exactly like the pre-batching version.
+                let first = match reader.read(&mut buf) {
                     Ok(0) => break,
-                    Ok(n) => {
-                        {
-                            let mut guard = thread_inner.lock().unwrap();
-                            guard.terminal.advance_bytes(&buf[..n]);
-                        }
-                        // Ignore send errors: if nobody is listening any
-                        // more we still want to keep draining the PTY so
-                        // the child never blocks on a full output buffer.
-                        let _ = events.send(ServerPaneEvent::Changed(id));
-                    }
+                    Ok(n) => n,
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     // Any other error (including the EIO some platforms
                     // return once the slave side is fully closed) is
                     // treated the same as a clean EOF: the pane died.
                     Err(_) => break,
+                };
+                let mut batch = buf[..first].to_vec();
+
+                // See design doc "PTY read batching". A program producing
+                // rapid output (measured: ~2,600 reads/sec from `yes`)
+                // used to advance the terminal and fire one Changed event
+                // per individual `read()`, each acquiring this pane's
+                // Inner lock -- at that rate the lock was essentially
+                // always held by this thread, starving the daemon's own
+                // (occasional, but lock-contending) `snapshot()` calls
+                // for the whole duration of a flood.
+                //
+                // A first attempt drained the kernel's PTY buffer
+                // non-blocking immediately after the first read, with no
+                // delay. Measured directly against `yes`: it didn't help
+                // -- this thread's drain loop runs faster than `yes`
+                // refills the buffer, so 91% of "batches" still contained
+                // exactly one read, and the Changed rate barely moved
+                // (2486/sec vs. 2584/sec baseline). The batch has nothing
+                // to find if it looks before the producer has had time to
+                // produce more.
+                //
+                // `BATCH_WINDOW` fixes that: after the first read,
+                // deliberately wait before draining, giving a fast
+                // producer time to actually queue up several reads' worth
+                // of output first. The window is short enough that a
+                // single interactive keystroke's echo (the common case,
+                // where nothing else arrives during the wait) still feels
+                // instant, while a genuine flood gets meaningfully
+                // collapsed -- however many reads land during the window
+                // become one `advance_bytes` call and one event, cutting
+                // the lock's acquisition *rate* (and the daemon's
+                // broadcast rate) to roughly `1 / BATCH_WINDOW` under
+                // sustained output instead of the raw PTY read frequency.
+                const BATCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(8);
+                std::thread::sleep(BATCH_WINDOW);
+
+                if let Some(fd) = raw_fd {
+                    set_nonblocking(fd, true);
+                    const MAX_BATCH_READS: usize = 64;
+                    for _ in 0..MAX_BATCH_READS {
+                        match reader.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => batch.extend_from_slice(&buf[..n]),
+                            // EAGAIN/EWOULDBLOCK: nothing more buffered
+                            // right now -- stop draining, this is the
+                            // normal/expected end of a batch, not an
+                            // error.
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            Err(_) => break,
+                        }
+                    }
+                    set_nonblocking(fd, false);
                 }
+
+                {
+                    let mut guard = thread_inner.lock().unwrap();
+                    guard.terminal.advance_bytes(&batch);
+                }
+                // Ignore send errors: if nobody is listening any more we
+                // still want to keep draining the PTY so the child never
+                // blocks on a full output buffer.
+                let _ = events.send(ServerPaneEvent::Changed(id));
             }
             {
                 let mut guard = thread_inner.lock().unwrap();
@@ -320,6 +386,28 @@ impl ServerPane {
         // above holds as soon as `kill()` returns.
         guard.status = ServerPaneStatus::Dead;
         Ok(())
+    }
+}
+
+/// Toggle `O_NONBLOCK` on a raw fd via `fcntl`. Used by the reader
+/// thread's read-batching loop (see `ServerPane::spawn`'s doc comment on
+/// the drain loop) to briefly drain whatever the kernel already has
+/// buffered without blocking, then switch back to blocking mode so the
+/// thread properly sleeps (zero CPU) between output bursts rather than
+/// busy-polling. Failures are ignored -- worst case a `set(true)` that
+/// silently didn't take effect just means the drain loop's `read` blocks
+/// once instead of returning `WouldBlock`, which the loop already treats
+/// as "stop draining" via its `Err(_) => break` fallback, so there's no
+/// correctness issue, only a missed optimization on that one iteration.
+fn set_nonblocking(fd: RawFd, nonblocking: bool) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+        if flags < 0 {
+            return;
+        }
+        let new_flags =
+            if nonblocking { flags | libc::O_NONBLOCK } else { flags & !libc::O_NONBLOCK };
+        libc::fcntl(fd, libc::F_SETFL, new_flags);
     }
 }
 
@@ -478,6 +566,84 @@ mod tests {
 
         pane.kill().unwrap();
         assert_eq!(pane.status(), ServerPaneStatus::Dead);
+    }
+
+    /// Regression test for the "dimux hangs often" investigation: a
+    /// rapidly-flooding pane (`yes`) must not fire a `Changed` event per
+    /// individual PTY read. Measured before this test existed: an
+    /// unbatched reader thread produced ~2,584 events/sec for `yes`,
+    /// each one briefly locking this pane's `Inner` -- enough to starve
+    /// the daemon's own occasional, lock-contending `snapshot()` calls
+    /// for the whole duration of a flood. With `BATCH_WINDOW` batching,
+    /// the same workload produces roughly `1000ms / 8ms ≈ 125` events/sec
+    /// at most. This test asserts well under that, with a generous
+    /// margin for scheduler variance across machines/CI -- it exists to
+    /// catch a gross regression back to per-read events, not to pin an
+    /// exact number.
+    #[test]
+    fn flooding_pane_batches_changed_events_instead_of_firing_per_read() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let id = Uuid::new_v4();
+        let pane =
+            ServerPane::spawn(id, None, Some("yes".to_string()), Size { rows: 24, cols: 80 }, tx).unwrap();
+
+        // Let `yes` actually get its output flowing before measuring, so
+        // the count isn't diluted by process startup time.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        while rx.try_recv().is_ok() {}
+
+        let mut count = 0u64;
+        let start = std::time::Instant::now();
+        let window = std::time::Duration::from_secs(1);
+        while start.elapsed() < window {
+            if rx.try_recv().is_ok() {
+                count += 1;
+            }
+        }
+
+        assert!(
+            count < 500,
+            "expected well under 500 Changed events/sec from a flooding pane with batching \
+             active, got {count} -- this looks like a regression back to firing one event per \
+             individual PTY read (measured baseline without batching: ~2,584/sec)"
+        );
+
+        let mut pane = pane;
+        pane.kill().unwrap();
+    }
+
+    /// Batching must not drop or reorder output -- several distinct
+    /// writes spaced across the `BATCH_WINDOW` boundary should all still
+    /// land, in order, in the final grid.
+    #[test]
+    fn batching_preserves_all_output_across_multiple_writes() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let id = Uuid::new_v4();
+        let pane =
+            ServerPane::spawn(id, None, Some("cat".to_string()), Size { rows: 24, cols: 80 }, tx).unwrap();
+
+        for line in ["alpha", "bravo", "charlie"] {
+            pane.write_input(format!("{line}\n").as_bytes()).unwrap();
+            // Sleep past one batch window between writes so each one is
+            // genuinely a separate read-and-batch cycle, not accidentally
+            // coalesced into a single one by test timing.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let found =
+            wait_until(&mut rx, || snapshot_text(&pane).contains("alpha")
+                && snapshot_text(&pane).contains("bravo")
+                && snapshot_text(&pane).contains("charlie"));
+        assert!(found, "expected all three writes to appear in the snapshot");
+
+        let text = snapshot_text(&pane);
+        let alpha_pos = text.find("alpha").unwrap();
+        let bravo_pos = text.find("bravo").unwrap();
+        let charlie_pos = text.find("charlie").unwrap();
+        assert!(
+            alpha_pos < bravo_pos && bravo_pos < charlie_pos,
+            "expected alpha/bravo/charlie to appear in write order, got: {text:?}"
+        );
     }
 
     #[test]

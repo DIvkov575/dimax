@@ -80,8 +80,19 @@ pub async fn run(socket_path: std::path::PathBuf) -> anyhow::Result<Daemon> {
             let id = match event {
                 ServerPaneEvent::Changed(id) | ServerPaneEvent::Died(id) => id,
             };
-            let state = drain_state.lock().await;
-            broadcast_grid(&state, &drain_registry, id).await;
+            // Lock only long enough to check subscribers + snapshot (see
+            // `broadcast_grid_prepare`'s doc comment); the lock is
+            // released before the expensive serialize+push below, so a
+            // burst of PTY output on one pane no longer blocks every
+            // other request the daemon is handling for the whole
+            // duration of each broadcast.
+            let prepared = {
+                let state = drain_state.lock().await;
+                broadcast_grid_prepare(&state, id)
+            };
+            if let Some(broadcast) = prepared {
+                broadcast_grid_send(&drain_registry, broadcast).await;
+            }
         }
     });
 
@@ -451,11 +462,15 @@ async fn dispatch(
         }
 
         Request::ResizeClientPane { pane, size } => {
-            let mut state = state.lock().await;
-            let affected = state.bound_server_pane(pane);
-            state.resize_client_pane(pane, size);
-            if let Some(server_pane) = affected {
-                broadcast_grid(&state, registry, server_pane).await;
+            let mut guard = state.lock().await;
+            let affected = guard.bound_server_pane(pane);
+            guard.resize_client_pane(pane, size);
+            let prepared = affected.and_then(|server_pane| broadcast_grid_prepare(&guard, server_pane));
+            // Drop the lock before the expensive serialize+push -- see
+            // `broadcast_grid_prepare`'s doc comment.
+            drop(guard);
+            if let Some(broadcast) = prepared {
+                broadcast_grid_send(registry, broadcast).await;
             }
             Response::Ack
         }
@@ -518,17 +533,53 @@ async fn broadcast_layout(state: &State, registry: &SubscriberRegistry, workspac
     push_to_subscribers(registry, &subscribers, &event).await;
 }
 
-/// Push a `GridDelta` for `server_pane`'s current snapshot to every
-/// connection viewing it (i.e. subscribed to some workspace that binds
-/// it). Called both from `dispatch` (`ResizeClientPane`) and from the
-/// pane-event drain task in `run` (`ServerPaneEvent::Changed`/`Died`).
-async fn broadcast_grid(state: &State, registry: &SubscriberRegistry, server_pane: ServerPaneId) {
-    let Some(pane) = state.server_pane(server_pane) else {
-        return;
-    };
-    let event = ServerMessage::Event(Event::GridDelta { snapshot: pane.snapshot() });
+/// Everything needed to push a `GridDelta` for one server-pane's current
+/// snapshot to every connection viewing it (i.e. subscribed to some
+/// workspace that binds it) — computed while the global state lock is
+/// held (see [`broadcast_grid_prepare`]) so the caller can drop the lock
+/// before doing any of the actually expensive work. Used both from
+/// `dispatch` (`ResizeClientPane`) and from the pane-event drain task in
+/// `run` (`ServerPaneEvent::Changed`/`Died`).
+struct GridBroadcast {
+    event: ServerMessage,
+    subscribers: Vec<SubscriberId>,
+}
+
+/// The cheap half of a grid broadcast: check whether anyone is even
+/// subscribed to `server_pane`, and if so, copy its current grid.
+///
+/// Must be called with the state lock held (it needs `state.server_pane`/
+/// `subscribers_for_server_pane`), but is itself fast — `ServerPane::
+/// snapshot()` is a plain cell-grid walk-and-clone, measured at ~2ms for
+/// a 50x200 pane. Returns `None` immediately, without touching the grid
+/// at all, if nobody is subscribed — a pane nobody is currently viewing
+/// (e.g. producing background scroll in an unwatched workspace) should
+/// cost nothing, not even a wasted snapshot.
+///
+/// Deliberately does NOT serialize the snapshot to `ServerMessage`'s
+/// wire bytes here — that's `broadcast_grid_send`'s job, called only
+/// after the caller has released the state lock. Serializing a full grid
+/// to JSON is the actually expensive step (~22ms measured for the same
+/// 50x200 pane, roughly 10x the snapshot itself) — doing it while every
+/// other request in the daemon is blocked on the same global lock is
+/// what caused dimux to visibly freeze (stop responding to keystrokes in
+/// any other pane) whenever a watched pane produced output rapidly
+/// enough (e.g. an animated startup banner).
+fn broadcast_grid_prepare(state: &State, server_pane: ServerPaneId) -> Option<GridBroadcast> {
     let subscribers = state.subscribers_for_server_pane(server_pane);
-    push_to_subscribers(registry, &subscribers, &event).await;
+    if subscribers.is_empty() {
+        return None;
+    }
+    let pane = state.server_pane(server_pane)?;
+    let event = ServerMessage::Event(Event::GridDelta { snapshot: pane.snapshot() });
+    Some(GridBroadcast { event, subscribers })
+}
+
+/// The expensive half: serialize and push. Call this with the state lock
+/// already released — see [`broadcast_grid_prepare`]'s doc comment for
+/// why the split exists.
+async fn broadcast_grid_send(registry: &SubscriberRegistry, broadcast: GridBroadcast) {
+    push_to_subscribers(registry, &broadcast.subscribers, &broadcast.event).await;
 }
 
 async fn push_to_subscribers(
@@ -1046,5 +1097,86 @@ mod tests {
             Response::Error { .. } => {}
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    /// Regression test for the "dimux hangs often" bug: a watched
+    /// server-pane producing rapid output must not block an UNRELATED
+    /// request on a separate connection. Before the
+    /// `broadcast_grid_prepare`/`broadcast_grid_send` split, every
+    /// `Changed` event serialized the busy pane's grid to JSON (measured
+    /// at ~22ms for a modest 50x200 pane) while holding the daemon's one
+    /// global state lock -- a fast-scrolling pane could keep that lock
+    /// saturated closely enough to starve every other request, which is
+    /// what made typing in an unrelated pane appear to freeze.
+    #[tokio::test]
+    async fn busy_watched_pane_does_not_starve_unrelated_requests() {
+        let guard = start_daemon().await;
+
+        // Connection A: subscribes to a workspace containing a
+        // fast-scrolling pane (`yes`), so its output genuinely triggers
+        // the broadcast path this test is regression-testing, not the
+        // already-cheap "nobody's watching" early-out.
+        let mut busy_conn = TestConn::connect(&guard.0).await;
+        let busy_server = match busy_conn
+            .request(Request::ServerSpawn { name: None, cmd: Some("yes".to_string()) })
+            .await
+        {
+            Response::ServerPane(info) => info.id,
+            other => panic!("expected ServerPane, got {other:?}"),
+        };
+        let busy_workspace = match busy_conn
+            .request(Request::ClientSpawn {
+                workspace: "1".to_string(),
+                split_of: None,
+                dir: None,
+                bind: Some(busy_server.to_string()),
+            })
+            .await
+        {
+            Response::ClientPaneCreated { workspace, .. } => workspace,
+            other => panic!("expected ClientPaneCreated, got {other:?}"),
+        };
+        match busy_conn.request(Request::Subscribe { workspace: busy_workspace.to_string() }).await {
+            Response::Snapshot { .. } => {}
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+
+        // Give `yes` a moment to actually get its output flowing through
+        // the reader thread -> Changed events -> broadcast path before
+        // measuring, so the test isn't just racing process startup.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Connection B: a totally unrelated connection, doing totally
+        // unrelated work (spawning its own server-pane) while A's pane
+        // is actively flooding. Measure wall-clock time for a handful of
+        // B's requests; each one needing the same global lock A's
+        // broadcasts contend for.
+        let mut other_conn = TestConn::connect(&guard.0).await;
+        let start = std::time::Instant::now();
+        for i in 0..10 {
+            match other_conn
+                .request(Request::ServerSpawn { name: Some(format!("unrelated-{i}")), cmd: None })
+                .await
+            {
+                Response::ServerPane(_) => {}
+                other => panic!("expected ServerPane, got {other:?}"),
+            }
+        }
+        let elapsed = start.elapsed();
+
+        // Generous bound: each of these 10 requests should complete in
+        // well under a second combined on any reasonable machine once
+        // they're not queueing behind a busy pane's own ~22ms-per-event
+        // serialize-while-locked cost repeated many times a second. This
+        // is deliberately loose (not asserting a tight ms bound, which
+        // would be flaky across machines/CI) -- it exists to catch a
+        // gross regression back to lock-holding-during-serialize, not to
+        // pin an exact performance number.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "10 unrelated ServerSpawn requests took {elapsed:?} while a watched pane was \
+             flooding output -- expected well under 2s if broadcasts aren't holding the \
+             global lock during serialization"
+        );
     }
 }

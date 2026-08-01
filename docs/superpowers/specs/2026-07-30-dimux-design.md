@@ -262,6 +262,50 @@ well-formed SGR mouse sequence (any button, any event kind) as
 even a stray sequence from a terminal that doesn't fully honor the
 narrower mode request still can't leak into a pane as text.
 
+### PTY read batching
+
+A second "dimux hangs often" investigation, separate from the mouse
+report above, traced a real freeze to a different cause: the daemon's
+one global state lock (see "Concurrency model" at the top of this doc)
+being held not just during request handling but during PTY-output
+broadcasting too. Every `ServerPaneEvent::Changed` — one per individual
+PTY `read()` — used to trigger `broadcast_grid`: lock the global state,
+snapshot the pane's grid, serialize it to JSON, and push it to
+subscribers, all under that one lock. Measured directly against a
+fast-scrolling pane (`yes`): serializing a single, ordinary 24×80 grid
+took ~5ms on its own, and the reader thread was producing ~2,584 such
+events per second — meaning the lock was essentially always held by
+this broadcast path during a flood, starving every other request the
+daemon needed to handle (including keystrokes typed into an unrelated
+pane, which is what made the freeze visible).
+
+Two independent fixes, at two different layers:
+
+- **`daemon::mod.rs`**: `broadcast_grid` was split into
+  `broadcast_grid_prepare` (cheap — checks subscribers, and only if any
+  exist, copies the grid; called while the lock is held) and
+  `broadcast_grid_send` (the expensive serialize+push; called *after*
+  the lock is released). A pane nobody is currently viewing now costs
+  nothing at all, not even a snapshot.
+- **`term/mod.rs`**: the reader thread's read loop no longer fires one
+  `Changed` event per individual `read()`. After the first (blocking)
+  read, it sleeps for a short `BATCH_WINDOW` (8ms), then drains
+  whatever else has accumulated in the kernel's PTY buffer
+  (non-blocking, via a brief `O_NONBLOCK` toggle on the underlying fd —
+  `try_clone_reader`'s fd is `dup()`'d from the master's, and POSIX file
+  *status* flags are shared across `dup()`'d descriptors, so this needs
+  no second real fd) before applying everything as one `advance_bytes`
+  call and firing one event. An earlier attempt (drain immediately,
+  no delay) measured no improvement at all — the reader thread's own
+  loop ran faster than `yes` could refill the buffer, so there was
+  essentially never anything extra sitting there to grab. Adding the
+  fixed delay before draining is what actually gives a fast producer
+  time to queue up multiple reads' worth of output first; it cut the
+  measured event rate for the same `yes` workload from ~2,584/sec to
+  ~90/sec (matching the `1000ms / 8ms` ceiling), while adding only
+  ~10ms of latency to a single, isolated keystroke's echo — well under
+  typical human perception thresholds for input lag.
+
 ## Error handling
 
 - Any CLI/TUI command connecting to a missing socket triggers auto-spawn of
