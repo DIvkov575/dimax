@@ -74,6 +74,34 @@
 //!   before Response" bail-out. `App::request` instead loops: read one
 //!   `ServerMessage`, apply it via `App::apply_event` if it's an `Event`,
 //!   keep going until a `Response` arrives.
+//! - **Frame reads never happen directly inside `run`'s `tokio::select!`
+//!   — they go through [`FrameReader`], a background task + channel.**
+//!   Root cause of the "dimux hangs often" reports: `run`'s loop used to
+//!   race `stdin.read` against `protocol::framing::read_frame` on the
+//!   socket directly in the same `select!`. `read_frame` is built on
+//!   `AsyncReadExt::read_exact`, which tokio documents as NOT
+//!   cancellation-safe — if that branch lost the race after
+//!   `read_exact` had already pulled some (but not all) of a frame's
+//!   bytes off the socket, those bytes were gone for good (dropping a
+//!   future doesn't hand consumed bytes back to the stream). The next
+//!   `read_frame` call then read a stray fragment as a fresh length
+//!   prefix, permanently desyncing the length-prefixed protocol: every
+//!   later read either errored on garbage or — the common case — blocked
+//!   forever waiting for a bogus byte count that would never arrive,
+//!   which is exactly "frozen, no response to any key" with every thread
+//!   parked at 0% CPU (confirmed via `sample`, and reproduced directly in
+//!   a scratch harness: racing `read_frame` against a fast timer inside
+//!   `select!` while a frame's body arrived in several small writes lost
+//!   100% of frames and left the reader hung on a bogus length; the same
+//!   harness with no racing branch received every frame cleanly). Any
+//!   frame the daemon writes in more than one syscall's worth of bytes —
+//!   routine under real scheduling, not a contrived edge case — while the
+//!   user is also typing can trigger this. `FrameReader` fixes it by
+//!   giving `read_frame` a dedicated task that only ever awaits it one
+//!   call at a time, never raced against anything, so `read_exact` always
+//!   runs to completion; the main loop instead races `FrameReader::next`,
+//!   which reads from an `mpsc` channel — cancellation-safe by tokio's own
+//!   contract, so losing that race never drops a frame.
 //! - **Mouse-drag divider resizing is drag-only, no keybind exists for
 //!   it** (per user direction — dragging is the intended interaction,
 //!   not a chord). Mouse input arrives on the same stdin stream as
@@ -107,6 +135,49 @@ use crate::protocol::{
 use std::collections::HashMap;
 use tokio::io::AsyncReadExt;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::mpsc;
+
+/// Owns the socket's read half in a dedicated background task, one
+/// `read_frame` call at a time, and forwards each parsed [`ServerMessage`]
+/// over an `mpsc` channel. See module doc "Frame reads never happen
+/// directly inside `run`'s `tokio::select!`" for why this exists: the
+/// channel's `recv` is cancellation-safe, so callers (both `App::request`
+/// and `run`'s main loop) can freely race [`FrameReader::next`] inside a
+/// `select!` without risking the desync that racing `read_frame` itself
+/// caused.
+struct FrameReader {
+    rx: mpsc::Receiver<anyhow::Result<ServerMessage>>,
+}
+
+impl FrameReader {
+    /// Spawn the background task and return the receiving half. The task
+    /// runs until the channel closes (every `FrameReader` dropped) or the
+    /// socket errors/closes, at which point it sends that final `Err` and
+    /// exits — `next`'s `None` case below only fires after that Err has
+    /// already been delivered, so callers always see the error rather
+    /// than a silent channel closure.
+    fn spawn(mut read_half: OwnedReadHalf) -> Self {
+        let (tx, rx) = mpsc::channel(32);
+        tokio::spawn(async move {
+            loop {
+                let frame = protocol::framing::read_frame::<_, ServerMessage>(&mut read_half).await;
+                let is_err = frame.is_err();
+                if tx.send(frame).await.is_err() || is_err {
+                    break;
+                }
+            }
+        });
+        Self { rx }
+    }
+
+    /// Await the next frame. Safe to use as a `tokio::select!` branch:
+    /// losing the race only drops this poll, never a byte already read
+    /// off the socket, since the background task (not this call) owns the
+    /// actual `read_frame` invocation.
+    async fn next(&mut self) -> anyhow::Result<ServerMessage> {
+        self.rx.recv().await.ok_or_else(|| anyhow::anyhow!("connection closed"))?
+    }
+}
 
 /// User-facing actions a keypress can resolve to, decoupled from the
 /// specific chord that produced it so `render`/the event loop don't need
@@ -194,7 +265,7 @@ impl App {
     /// frontend sends `Subscribe(workspace_id)`."
     async fn bootstrap(
         write_half: &mut OwnedWriteHalf,
-        read_half: &mut OwnedReadHalf,
+        reader: &mut FrameReader,
         workspace: &str,
     ) -> anyhow::Result<Self> {
         protocol::framing::write_frame(
@@ -203,7 +274,7 @@ impl App {
         )
         .await?;
         loop {
-            match protocol::framing::read_frame::<_, ServerMessage>(read_half).await? {
+            match reader.next().await? {
                 ServerMessage::Response(Response::Snapshot { workspace, grids }) => {
                     let focused = first_leaf(&workspace);
                     return Ok(App {
@@ -233,12 +304,12 @@ impl App {
     async fn request(
         &mut self,
         write_half: &mut OwnedWriteHalf,
-        read_half: &mut OwnedReadHalf,
+        reader: &mut FrameReader,
         req: Request,
     ) -> anyhow::Result<Response> {
         protocol::framing::write_frame(write_half, &req).await?;
         loop {
-            match protocol::framing::read_frame::<_, ServerMessage>(read_half).await? {
+            match reader.next().await? {
                 ServerMessage::Response(r) => return Ok(r),
                 ServerMessage::Event(e) => self.apply_event(e),
             }
@@ -291,12 +362,12 @@ impl App {
         &mut self,
         n: u8,
         write_half: &mut OwnedWriteHalf,
-        read_half: &mut OwnedReadHalf,
+        reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
         let old = self.workspace.id;
-        let _ = self.request(write_half, read_half, Request::Unsubscribe { workspace: old }).await?;
+        let _ = self.request(write_half, reader, Request::Unsubscribe { workspace: old }).await?;
         let resp = self
-            .request(write_half, read_half, Request::Subscribe { workspace: n.to_string() })
+            .request(write_half, reader, Request::Subscribe { workspace: n.to_string() })
             .await?;
         if let Response::Snapshot { workspace, grids } = resp {
             self.focused = first_leaf(&workspace);
@@ -324,10 +395,10 @@ impl App {
         &mut self,
         dir: SplitDir,
         write_half: &mut OwnedWriteHalf,
-        read_half: &mut OwnedReadHalf,
+        reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
         let Response::ServerPane(server) = self
-            .request(write_half, read_half, Request::ServerSpawn { name: None, cmd: None })
+            .request(write_half, reader, Request::ServerSpawn { name: None, cmd: None })
             .await?
         else {
             return Ok(());
@@ -338,7 +409,7 @@ impl App {
             dir: Some(dir),
             bind: Some(server.id.to_string()),
         };
-        if let Response::ClientPaneCreated { pane, .. } = self.request(write_half, read_half, req).await? {
+        if let Response::ClientPaneCreated { pane, .. } = self.request(write_half, reader, req).await? {
             self.focused = Some(pane);
         }
         Ok(())
@@ -354,11 +425,11 @@ impl App {
     async fn close_focused(
         &mut self,
         write_half: &mut OwnedWriteHalf,
-        read_half: &mut OwnedReadHalf,
+        reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
         let Some(pane) = self.focused else { return Ok(()) };
         let req = Request::ClientClose { workspace: self.workspace.id.to_string(), pane };
-        let _ = self.request(write_half, read_half, req).await?;
+        let _ = self.request(write_half, reader, req).await?;
         Ok(())
     }
 
@@ -367,7 +438,7 @@ impl App {
     async fn kill_focused_server_pane(
         &mut self,
         write_half: &mut OwnedWriteHalf,
-        read_half: &mut OwnedReadHalf,
+        reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
         let Some(pane) = self.focused else { return Ok(()) };
         let Some(bound) = self.workspace.tree.as_ref().and_then(|t| t.find(pane)).and_then(|p| p.bound)
@@ -375,7 +446,7 @@ impl App {
             return Ok(());
         };
         let req = Request::ServerKill { target: bound.to_string() };
-        let _ = self.request(write_half, read_half, req).await?;
+        let _ = self.request(write_half, reader, req).await?;
         Ok(())
     }
 
@@ -386,13 +457,13 @@ impl App {
     async fn detach_and_open_menu(
         &mut self,
         write_half: &mut OwnedWriteHalf,
-        read_half: &mut OwnedReadHalf,
+        reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
         let Some(pane) = self.focused else { return Ok(()) };
         let req = Request::ClientUnbind { workspace: self.workspace.id.to_string(), pane };
-        let _ = self.request(write_half, read_half, req).await?;
+        let _ = self.request(write_half, reader, req).await?;
         if let Response::ServerPaneList(servers) =
-            self.request(write_half, read_half, Request::ServerList).await?
+            self.request(write_half, reader, Request::ServerList).await?
         {
             self.attach_menu = Some(AttachMenu { servers, selected: 0 });
         }
@@ -406,13 +477,13 @@ impl App {
         &mut self,
         bytes: &[u8],
         write_half: &mut OwnedWriteHalf,
-        read_half: &mut OwnedReadHalf,
+        reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
         match parse_attach_menu_input(bytes) {
             AttachMenuAction::Up => self.move_attach_menu_selection(false),
             AttachMenuAction::Down => self.move_attach_menu_selection(true),
             AttachMenuAction::Cancel => self.attach_menu = None,
-            AttachMenuAction::Confirm => self.confirm_attach_menu(write_half, read_half).await?,
+            AttachMenuAction::Confirm => self.confirm_attach_menu(write_half, reader).await?,
             AttachMenuAction::Ignore => {}
         }
         Ok(())
@@ -432,14 +503,14 @@ impl App {
     async fn confirm_attach_menu(
         &mut self,
         write_half: &mut OwnedWriteHalf,
-        read_half: &mut OwnedReadHalf,
+        reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
         let Some(menu) = self.attach_menu.take() else { return Ok(()) };
         let Some(pane) = self.focused else { return Ok(()) };
         let spawn_new_index = menu.servers.len();
         let target = if menu.selected == spawn_new_index {
             match self
-                .request(write_half, read_half, Request::ServerSpawn { name: None, cmd: None })
+                .request(write_half, reader, Request::ServerSpawn { name: None, cmd: None })
                 .await?
             {
                 Response::ServerPane(info) => info.id.to_string(),
@@ -449,7 +520,7 @@ impl App {
             menu.servers[menu.selected].id.to_string()
         };
         let req = Request::ClientBind { workspace: self.workspace.id.to_string(), pane, target };
-        let _ = self.request(write_half, read_half, req).await?;
+        let _ = self.request(write_half, reader, req).await?;
         Ok(())
     }
 
@@ -475,7 +546,7 @@ impl App {
         &mut self,
         event: mouse::MouseEvent,
         write_half: &mut OwnedWriteHalf,
-        read_half: &mut OwnedReadHalf,
+        reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
         match event {
             mouse::MouseEvent::Down { col, row } => {
@@ -510,7 +581,7 @@ impl App {
                     split,
                     new_ratio: ratio,
                 };
-                let _ = self.request(write_half, read_half, req).await?;
+                let _ = self.request(write_half, reader, req).await?;
             }
         }
         Ok(())
@@ -522,23 +593,23 @@ impl App {
         action: Action,
         raw: &[u8],
         write_half: &mut OwnedWriteHalf,
-        read_half: &mut OwnedReadHalf,
+        reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
         match action {
-            Action::SwitchWorkspace(n) => self.switch_workspace(n, write_half, read_half).await?,
-            Action::SplitVertical => self.split(SplitDir::Vertical, write_half, read_half).await?,
-            Action::SplitHorizontal => self.split(SplitDir::Horizontal, write_half, read_half).await?,
-            Action::CloseFocusedPane => self.close_focused(write_half, read_half).await?,
+            Action::SwitchWorkspace(n) => self.switch_workspace(n, write_half, reader).await?,
+            Action::SplitVertical => self.split(SplitDir::Vertical, write_half, reader).await?,
+            Action::SplitHorizontal => self.split(SplitDir::Horizontal, write_half, reader).await?,
+            Action::CloseFocusedPane => self.close_focused(write_half, reader).await?,
             Action::KillFocusedServerPane => {
-                self.kill_focused_server_pane(write_half, read_half).await?
+                self.kill_focused_server_pane(write_half, reader).await?
             }
-            Action::DetachAndAttach => self.detach_and_open_menu(write_half, read_half).await?,
+            Action::DetachAndAttach => self.detach_and_open_menu(write_half, reader).await?,
             Action::FocusLeft | Action::FocusUp => self.move_focus(false),
             Action::FocusRight | Action::FocusDown => self.move_focus(true),
             Action::PassThrough => {
                 if let Some(pane) = self.focused {
                     let req = Request::Input { pane, bytes: raw.to_vec() };
-                    let _ = self.request(write_half, read_half, req).await?;
+                    let _ = self.request(write_half, reader, req).await?;
                 }
             }
         }
@@ -682,7 +753,8 @@ fn disable_button_event_mouse_tracking() -> std::io::Result<()> {
 /// `Event`s until the user quits.
 pub async fn run() -> anyhow::Result<()> {
     let client = Client::connect().await?;
-    let (mut read_half, mut write_half) = client.into_split();
+    let (read_half, mut write_half) = client.into_split();
+    let mut reader = FrameReader::spawn(read_half);
 
     // `try_init` (rather than the panicking `init`) so a setup failure
     // becomes a normal `anyhow::Result` error via `?` instead of a panic
@@ -696,7 +768,7 @@ pub async fn run() -> anyhow::Result<()> {
     let _guard = TerminalGuard;
     enable_button_event_mouse_tracking()?;
 
-    let mut app = App::bootstrap(&mut write_half, &mut read_half, "1").await?;
+    let mut app = App::bootstrap(&mut write_half, &mut reader, "1").await?;
 
     let mut stdin = tokio::io::stdin();
     let mut buf = [0u8; 512];
@@ -739,7 +811,7 @@ pub async fn run() -> anyhow::Result<()> {
                 }
                 match mouse::parse(bytes) {
                     mouse::ParsedInput::Mouse(event) => {
-                        app.handle_mouse(event, &mut write_half, &mut read_half).await?;
+                        app.handle_mouse(event, &mut write_half, &mut reader).await?;
                     }
                     // A recognized SGR mouse sequence dimux has no use
                     // for (see mouse.rs module doc "Defense in depth") --
@@ -749,15 +821,15 @@ pub async fn run() -> anyhow::Result<()> {
                     mouse::ParsedInput::Ignored => {}
                     mouse::ParsedInput::NotMouse => {
                         if app.attach_menu.is_some() {
-                            app.handle_attach_menu_input(bytes, &mut write_half, &mut read_half).await?;
+                            app.handle_attach_menu_input(bytes, &mut write_half, &mut reader).await?;
                         } else {
                             let action = keys::parse(bytes);
-                            app.handle_action(action, bytes, &mut write_half, &mut read_half).await?;
+                            app.handle_action(action, bytes, &mut write_half, &mut reader).await?;
                         }
                     }
                 }
             }
-            frame = protocol::framing::read_frame::<_, ServerMessage>(&mut read_half) => {
+            frame = reader.next() => {
                 match frame {
                     Ok(ServerMessage::Event(event)) => app.apply_event(event),
                     // Every request this loop sends is awaited synchronously
@@ -929,5 +1001,73 @@ mod tests {
             tree: Some(split(SplitDir::Vertical, leaf(a), leaf(b))),
         };
         assert_eq!(first_leaf(&workspace), Some(a));
+    }
+
+    /// Regression test for the "dimux hangs often" bug: racing a frame
+    /// read against a faster competing branch inside `tokio::select!`
+    /// must never desync the connection. This is what `run`'s loop does
+    /// every iteration (racing `stdin.read` against the next server
+    /// frame) — before `FrameReader` existed, that raced
+    /// `protocol::framing::read_frame` directly, and `read_exact`
+    /// (which it's built on) is not cancellation-safe: losing the race
+    /// after partially reading a frame's bytes drops them permanently,
+    /// desyncing the length-prefixed protocol so every later read either
+    /// errors on garbage or blocks forever on a bogus length — exactly
+    /// "frozen, no response" with idle threads. `FrameReader` fixes this
+    /// by giving `read_frame` a dedicated task that's never raced;
+    /// `next()` instead races an `mpsc::Receiver`, which tokio guarantees
+    /// is cancellation-safe.
+    ///
+    /// Writes each frame's body one byte at a time with a delay between
+    /// bytes, so a `read_exact` inside the background task's `read_frame`
+    /// call would (pre-fix) very likely get cancelled mid-body if it were
+    /// raced directly, the same way `run`'s real loop could hit it under
+    /// ordinary scheduling while the user types.
+    #[tokio::test]
+    async fn frame_reader_survives_being_raced_against_a_faster_branch() {
+        let path = std::env::temp_dir().join(format!("dmx-{}.sock", std::process::id()));
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+
+        let writer_path = path.clone();
+        let writer = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let mut stream = tokio::net::UnixStream::connect(&writer_path).await.unwrap();
+            for _ in 0..8u32 {
+                let msg = ServerMessage::Response(Response::Ack);
+                let body = serde_json::to_vec(&msg).unwrap();
+                let len = (body.len() as u32).to_le_bytes();
+                stream.write_all(&len).await.unwrap();
+                for byte in &body {
+                    stream.write_all(std::slice::from_ref(byte)).await.unwrap();
+                    tokio::time::sleep(std::time::Duration::from_micros(200)).await;
+                }
+            }
+        });
+
+        let (server_stream, _addr) = listener.accept().await.unwrap();
+        let (read_half, _write_half) = server_stream.into_split();
+        let mut reader = FrameReader::spawn(read_half);
+
+        let mut received = 0;
+        for _ in 0..400 {
+            tokio::select! {
+                // Fires far more often than the 200us-per-byte dribble
+                // above, so it wins the race constantly -- exactly the
+                // adversarial timing that broke the old direct-read_frame
+                // version.
+                _ = tokio::time::sleep(std::time::Duration::from_micros(50)) => {}
+                frame = reader.next() => {
+                    assert!(matches!(frame, Ok(ServerMessage::Response(Response::Ack))), "unexpected frame: {frame:?}");
+                    received += 1;
+                    if received >= 8 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        assert_eq!(received, 8, "expected all 8 frames to survive being raced against a faster branch");
+        writer.await.unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 }
