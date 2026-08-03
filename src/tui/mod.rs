@@ -665,6 +665,37 @@ fn hit_test_dividers(hits: &[render::DividerHit], col: u16, row: u16) -> Option<
         .map(|hit| hit.split)
 }
 
+/// Sort `servers` into cwd-bucket order for the attach menu's grouped
+/// display: ascending by cwd string, with a synthetic `"Unknown"` bucket
+/// (no resolvable foreground `cwd` — a `Dead` pane, or a live one whose
+/// lookup failed) always sorted last regardless of where it would fall
+/// alphabetically. Within a bucket, panes keep their relative input
+/// order (stable sort, no secondary key) — whatever order `ServerList`/
+/// `ServerPaneList` returned. Returns `(group_key, server)` pairs rather
+/// than a nested `Vec<Vec<_>>` so callers can walk it once and detect
+/// group boundaries by comparing consecutive keys, which is exactly what
+/// `render::draw_attach_menu` needs to decide where to emit a header.
+fn group_servers_by_cwd(mut servers: Vec<ServerPaneInfo>) -> Vec<(String, ServerPaneInfo)> {
+    const UNKNOWN: &str = "Unknown";
+    servers.sort_by(|a, b| {
+        let key_a = a.foreground.as_ref().and_then(|f| f.cwd.as_deref()).unwrap_or(UNKNOWN);
+        let key_b = b.foreground.as_ref().and_then(|f| f.cwd.as_deref()).unwrap_or(UNKNOWN);
+        match (key_a == UNKNOWN, key_b == UNKNOWN) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => key_a.cmp(key_b),
+        }
+    });
+    servers
+        .into_iter()
+        .map(|s| {
+            let key = s.foreground.as_ref().and_then(|f| f.cwd.clone()).unwrap_or_else(|| UNKNOWN.to_string());
+            (key, s)
+        })
+        .collect()
+}
+
 /// Attach-menu input, decoupled from the raw bytes that produced it (same
 /// approach the removed pane-picker used: a distinct, simpler modal
 /// grammar rather than reusing `keys::parse`'s chords).
@@ -1001,6 +1032,56 @@ mod tests {
             tree: Some(split(SplitDir::Vertical, leaf(a), leaf(b))),
         };
         assert_eq!(first_leaf(&workspace), Some(a));
+    }
+
+    fn server_with_cwd(name: &str, cwd: Option<&str>) -> ServerPaneInfo {
+        ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: Some(name.to_string()),
+            size: crate::protocol::Size { rows: 24, cols: 80 },
+            status: crate::protocol::ServerPaneStatus::Running,
+            foreground: cwd.map(|c| crate::protocol::ForegroundProcessInfo {
+                process_name: "bash".to_string(),
+                cwd: Some(c.to_string()),
+            }),
+        }
+    }
+
+    #[test]
+    fn group_servers_by_cwd_groups_matching_dirs_together() {
+        let servers = vec![
+            server_with_cwd("a", Some("/home/dev/api")),
+            server_with_cwd("b", Some("/home/dev/web")),
+            server_with_cwd("c", Some("/home/dev/api")),
+        ];
+        let grouped = group_servers_by_cwd(servers);
+        let names: Vec<&str> = grouped.iter().map(|(_, s)| s.name.as_deref().unwrap()).collect();
+        // Ascending by cwd: api's two panes (in original relative order),
+        // then web's one pane.
+        assert_eq!(names, vec!["a", "c", "b"]);
+        let keys: Vec<&str> = grouped.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["/home/dev/api", "/home/dev/api", "/home/dev/web"]);
+    }
+
+    #[test]
+    fn group_servers_by_cwd_sorts_unknown_group_last() {
+        let servers = vec![
+            server_with_cwd("no-cwd", None),
+            server_with_cwd("has-cwd", Some("/zzz/last-alphabetically")),
+        ];
+        let grouped = group_servers_by_cwd(servers);
+        let names: Vec<&str> = grouped.iter().map(|(_, s)| s.name.as_deref().unwrap()).collect();
+        // "/zzz/..." sorts after "Unknown" alphabetically, but Unknown is
+        // forced last regardless.
+        assert_eq!(names, vec!["has-cwd", "no-cwd"]);
+        assert_eq!(grouped[1].0, "Unknown");
+    }
+
+    #[test]
+    fn group_servers_by_cwd_empty_list_is_empty() {
+        // `ServerPaneInfo` doesn't derive `PartialEq`, so compare lengths
+        // rather than the whole `Vec` via `assert_eq!`.
+        assert_eq!(group_servers_by_cwd(vec![]).len(), 0);
     }
 
     /// Regression test for the "dimux hangs often" bug: racing a frame
