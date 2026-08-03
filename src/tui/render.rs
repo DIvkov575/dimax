@@ -321,7 +321,7 @@ fn cell_to_span(cell: &Cell) -> Span<'static> {
 /// Overlay for `cmd-shift-z`'s attach menu: lists every server-pane plus a
 /// trailing "spawn new" entry, opened after the focused client-pane has
 /// already been detached from whatever it was previously bound to.
-pub fn draw_attach_menu(frame: &mut Frame, servers: &[(String, ServerPaneInfo)], selected: usize) {
+pub(super) fn draw_attach_menu(frame: &mut Frame, menu: &super::AttachMenu) {
     // Wider than the previous 60% -- each row now packs four columns
     // (name/process/id/status, see `attach_menu_line`) rather than the
     // original two, and needs more horizontal room to avoid every field
@@ -329,18 +329,26 @@ pub fn draw_attach_menu(frame: &mut Frame, servers: &[(String, ServerPaneInfo)],
     let area = centered_rect(85, 60, frame.area());
     frame.render_widget(Clear, area);
 
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(servers.len() * 2 + 1);
+    let servers = &menu.servers;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(servers.len() * 2 + 2);
     let mut last_group: Option<&str> = None;
     for (i, (group, server)) in servers.iter().enumerate() {
         if last_group != Some(group.as_str()) {
             lines.push(Line::styled(group.clone(), Style::new().add_modifier(Modifier::BOLD)));
             last_group = Some(group.as_str());
         }
-        lines.push(attach_menu_line(server, i == selected));
+        let armed = menu.pending_delete == Some(i);
+        let renaming = menu.rename.as_ref().filter(|r| r.index == i);
+        lines.push(attach_menu_line(server, i == menu.selected, armed, renaming));
+        if let Some(rename) = renaming
+            && let Some(error) = &rename.error
+        {
+            lines.push(Line::styled(format!("    {error}"), Style::new().fg(Color::Red)));
+        }
     }
 
     let spawn_index = servers.len();
-    lines.push(spawn_new_line(selected == spawn_index));
+    lines.push(spawn_new_line(menu.selected == spawn_index));
 
     let block = Block::bordered().title("Attach server-pane");
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -356,24 +364,47 @@ pub fn draw_attach_menu(frame: &mut Frame, servers: &[(String, ServerPaneInfo)],
 const NAME_COL_WIDTH: usize = 12;
 const PROCESS_COL_WIDTH: usize = 10;
 
-fn attach_menu_line(server: &ServerPaneInfo, selected: bool) -> Line<'static> {
-    let name = server.name.clone().unwrap_or_else(|| short_id(server.id));
+fn attach_menu_line(
+    server: &ServerPaneInfo,
+    selected: bool,
+    delete_armed: bool,
+    renaming: Option<&super::RenameState>,
+) -> Line<'static> {
     let status = match server.status {
         ServerPaneStatus::Running => "Running",
         ServerPaneStatus::Dead => "Dead",
     };
     let process = server.foreground.as_ref().map_or("-", |f| f.process_name.as_str());
+    let marker = if selected { ">" } else { " " };
+
+    if let Some(rename) = renaming {
+        let text = format!(
+            "  {marker} [{}] {:<process_w$} {} {}",
+            rename.text,
+            truncate_end(process, PROCESS_COL_WIDTH),
+            short_id(server.id),
+            status,
+            process_w = PROCESS_COL_WIDTH,
+        );
+        return Line::styled(text, Style::new().add_modifier(Modifier::REVERSED));
+    }
+
+    let name = server.name.clone().unwrap_or_else(|| short_id(server.id));
     let text = format!(
-        "  {} {:<name_w$} {:<process_w$} {} {}",
-        if selected { ">" } else { " " },
+        "  {marker} {:<name_w$} {:<process_w$} {} {}{}",
         truncate_end(&name, NAME_COL_WIDTH),
         truncate_end(process, PROCESS_COL_WIDTH),
         short_id(server.id),
         status,
+        if delete_armed { "  [x/Enter: confirm delete]" } else { "" },
         name_w = NAME_COL_WIDTH,
         process_w = PROCESS_COL_WIDTH,
     );
-    let style = if selected { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+    let style = match (selected, delete_armed) {
+        (_, true) => Style::new().add_modifier(Modifier::REVERSED).fg(Color::Red),
+        (true, false) => Style::new().add_modifier(Modifier::REVERSED),
+        (false, false) => Style::new(),
+    };
     Line::styled(text, style)
 }
 
@@ -746,16 +777,22 @@ mod tests {
             }),
         };
         let servers = vec![("/home/dev/project".to_string(), server)];
+        let menu = super::super::AttachMenu {
+            servers,
+            selected: 0,
+            pending_delete: None,
+            rename: None,
+        };
         // Wide enough that the popup (85% of frame width, see
         // draw_attach_menu) comfortably fits every column's full width
         // rather than clipping mid-row -- a narrower backend was exactly
         // what caused this test to flake when the columns were added.
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &servers, 0)).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu)).unwrap();
         assert!(buffer_contains(&terminal, "editor"));
         assert!(buffer_contains(&terminal, "vim"));
-        assert!(buffer_contains(&terminal, "project"));
+        assert!(buffer_contains(&terminal, "/home/dev/project"));
         assert!(buffer_contains(&terminal, "spawn new"));
         assert!(buffer_contains(&terminal, "Attach server-pane"));
     }
@@ -770,9 +807,15 @@ mod tests {
             foreground: None,
         };
         let servers = vec![("Unknown".to_string(), server)];
+        let menu = super::super::AttachMenu {
+            servers,
+            selected: 0,
+            pending_delete: None,
+            rename: None,
+        };
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &servers, 0)).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu)).unwrap();
         assert!(buffer_contains(&terminal, "editor"));
         assert!(buffer_contains(&terminal, "-"));
     }
@@ -786,10 +829,102 @@ mod tests {
 
     #[test]
     fn draw_attach_menu_spawn_new_selected_does_not_panic() {
-        let servers: Vec<(String, ServerPaneInfo)> = vec![];
+        let menu = super::super::AttachMenu {
+            servers: vec![],
+            selected: 0,
+            pending_delete: None,
+            rename: None,
+        };
         let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &servers, 0)).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu)).unwrap();
         assert!(buffer_contains(&terminal, "spawn new"));
+    }
+
+    #[test]
+    fn draw_attach_menu_shows_group_headers_for_each_distinct_cwd() {
+        let a = ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: Some("api-shell".to_string()),
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+            foreground: Some(ForegroundProcessInfo {
+                process_name: "bash".to_string(),
+                cwd: Some("/home/dev/api".to_string()),
+            }),
+        };
+        let b = ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: Some("web-shell".to_string()),
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+            foreground: Some(ForegroundProcessInfo {
+                process_name: "bash".to_string(),
+                cwd: Some("/home/dev/web".to_string()),
+            }),
+        };
+        let servers =
+            vec![("/home/dev/api".to_string(), a), ("/home/dev/web".to_string(), b)];
+        let menu = super::super::AttachMenu {
+            servers,
+            selected: 0,
+            pending_delete: None,
+            rename: None,
+        };
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu)).unwrap();
+        assert!(buffer_contains(&terminal, "/home/dev/api"));
+        assert!(buffer_contains(&terminal, "/home/dev/web"));
+        assert!(buffer_contains(&terminal, "api-shell"));
+        assert!(buffer_contains(&terminal, "web-shell"));
+    }
+
+    #[test]
+    fn draw_attach_menu_shows_delete_confirm_hint_on_armed_row() {
+        let server = ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: Some("editor".to_string()),
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+            foreground: None,
+        };
+        let menu = super::super::AttachMenu {
+            servers: vec![("Unknown".to_string(), server)],
+            selected: 0,
+            pending_delete: Some(0),
+            rename: None,
+        };
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu)).unwrap();
+        assert!(buffer_contains(&terminal, "confirm delete"));
+    }
+
+    #[test]
+    fn draw_attach_menu_shows_live_rename_text_and_error() {
+        let server = ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: Some("old-name".to_string()),
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+            foreground: None,
+        };
+        let menu = super::super::AttachMenu {
+            servers: vec![("Unknown".to_string(), server)],
+            selected: 0,
+            pending_delete: None,
+            rename: Some(super::super::RenameState {
+                index: 0,
+                text: "new-name".to_string(),
+                cursor: 8,
+                error: Some("name taken".to_string()),
+            }),
+        };
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu)).unwrap();
+        assert!(buffer_contains(&terminal, "new-name"));
+        assert!(buffer_contains(&terminal, "name taken"));
     }
 }

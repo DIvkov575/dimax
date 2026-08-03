@@ -1109,7 +1109,7 @@ pub async fn run() -> anyhow::Result<()> {
                 None => render::draw(frame, &app.workspace, &app.grids, app.focused),
             }
             if let Some(menu) = &app.attach_menu {
-                render::draw_attach_menu(frame, &menu.servers, menu.selected);
+                render::draw_attach_menu(frame, menu);
             }
         })?;
 
