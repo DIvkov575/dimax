@@ -513,11 +513,50 @@ impl App {
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
-        match parse_attach_menu_input(bytes) {
+        let has_pending_delete =
+            self.attach_menu.as_ref().is_some_and(|m| m.pending_delete.is_some());
+        if has_pending_delete {
+            match bytes {
+                b"x" | b"\r" | b"\n" => self.confirm_delete(write_half, reader).await?,
+                _ => {
+                    if let Some(menu) = &mut self.attach_menu {
+                        menu.pending_delete = None;
+                    }
+                    // A cancelling keystroke isn't swallowed -- e.g. `j`
+                    // both cancels the pending delete *and* moves the
+                    // selection down, in one keypress. Fall through to
+                    // normal dispatch for this same byte.
+                    self.dispatch_attach_menu_action(
+                        parse_attach_menu_input(bytes),
+                        write_half,
+                        reader,
+                    )
+                    .await?;
+                }
+            }
+            return Ok(());
+        }
+        self.dispatch_attach_menu_action(parse_attach_menu_input(bytes), write_half, reader).await
+    }
+
+    /// Browse-mode dispatch: everything `handle_attach_menu_input` routes
+    /// to once neither a pending delete nor an active rename is
+    /// intercepting input first. Split out so the pending-delete
+    /// cancel-and-fall-through path (above) can re-dispatch the same
+    /// byte's `AttachMenuAction` without duplicating this match.
+    async fn dispatch_attach_menu_action(
+        &mut self,
+        action: AttachMenuAction,
+        write_half: &mut OwnedWriteHalf,
+        reader: &mut FrameReader,
+    ) -> anyhow::Result<()> {
+        match action {
             AttachMenuAction::Up => self.move_attach_menu_selection(false),
             AttachMenuAction::Down => self.move_attach_menu_selection(true),
             AttachMenuAction::Cancel => self.attach_menu = None,
             AttachMenuAction::Confirm => self.confirm_attach_menu(write_half, reader).await?,
+            AttachMenuAction::Delete => self.arm_delete(),
+            AttachMenuAction::StartRename => self.start_rename(),
             AttachMenuAction::Ignore => {}
         }
         Ok(())
@@ -529,6 +568,49 @@ impl App {
         // removed picker used (see `render::draw_attach_menu`).
         let len = menu.servers.len() + 1;
         menu.selected = if forward { (menu.selected + 1) % len } else { (menu.selected + len - 1) % len };
+    }
+
+    /// Arm the selected row's deletion (first `x`), a no-op on the
+    /// trailing "spawn new" row (nothing to delete there).
+    fn arm_delete(&mut self) {
+        let Some(menu) = &mut self.attach_menu else { return };
+        if menu.selected < menu.servers.len() {
+            menu.pending_delete = Some(menu.selected);
+        }
+    }
+
+    /// Confirm a previously-armed deletion: kill the server-pane, then
+    /// re-fetch and re-group the server list so the menu reflects its
+    /// removal. Clamps `selected` into the shrunk list -- if the deleted
+    /// row was the last one, selection moves to the new last row;
+    /// otherwise the numeric index is left as-is (which now names
+    /// whatever slid up into that slot, an acceptable "selection moved
+    /// on" side effect of any list shrinking under the cursor).
+    async fn confirm_delete(
+        &mut self,
+        write_half: &mut OwnedWriteHalf,
+        reader: &mut FrameReader,
+    ) -> anyhow::Result<()> {
+        let Some(menu) = &mut self.attach_menu else { return Ok(()) };
+        let Some(index) = menu.pending_delete.take() else { return Ok(()) };
+        let target = menu.servers[index].1.id.to_string();
+        let _ = self.request(write_half, reader, Request::ServerKill { target }).await?;
+        if let Response::ServerPaneList(servers) =
+            self.request(write_half, reader, Request::ServerList).await?
+        {
+            let grouped = group_servers_by_cwd(servers);
+            let Some(menu) = &mut self.attach_menu else { return Ok(()) };
+            menu.servers = grouped;
+            let spawn_index = menu.servers.len();
+            if menu.selected > spawn_index {
+                menu.selected = spawn_index;
+            }
+        }
+        Ok(())
+    }
+
+    fn start_rename(&mut self) {
+        // Implemented in Task 5.
     }
 
     /// Confirm the attach menu's current selection: bind the just-detached
@@ -739,6 +821,16 @@ enum AttachMenuAction {
     Down,
     Confirm,
     Cancel,
+    /// `x` on a real server-pane row: arm (first press) or confirm
+    /// (second press) that row's deletion — see
+    /// `App::handle_attach_menu_input`'s `pending_delete` branch for the
+    /// actual arm/confirm/cancel state machine; this variant alone
+    /// doesn't distinguish arm from confirm, since that distinction
+    /// depends on `AttachMenu.pending_delete`'s current state, not on
+    /// the byte itself.
+    Delete,
+    /// `r` on a real server-pane row: open the inline rename field.
+    StartRename,
     Ignore,
 }
 
@@ -746,14 +838,22 @@ enum AttachMenuAction {
 /// arrow-key escape sequences and vi-style `j`/`k` move the selection,
 /// Enter (`\r` or `\n`) confirms, a bare `Esc` cancels (leaving the pane
 /// unbound — it was already detached by `detach_and_open_menu` before the
-/// menu opened). Anything else is ignored rather than passed through — the
-/// menu is modal and has no server-pane to forward keystrokes to yet.
+/// menu opened), `x` arms/confirms delete, `r` opens rename. Anything else
+/// is ignored rather than passed through — the menu is modal and has no
+/// server-pane to forward keystrokes to yet. Note: this table is only
+/// consulted for *browsing* mode — `App::handle_attach_menu_input` routes
+/// to entirely separate byte-handling while `pending_delete`/`rename` are
+/// active, so `x`/Enter's *confirm* behavior when a delete is already
+/// armed is handled there, not by this function returning some third
+/// "confirm delete" variant.
 fn parse_attach_menu_input(bytes: &[u8]) -> AttachMenuAction {
     match bytes {
         b"\r" | b"\n" => AttachMenuAction::Confirm,
         b"\x1b" => AttachMenuAction::Cancel,
         b"\x1b[A" | b"k" => AttachMenuAction::Up,
         b"\x1b[B" | b"j" => AttachMenuAction::Down,
+        b"x" => AttachMenuAction::Delete,
+        b"r" => AttachMenuAction::StartRename,
         _ => AttachMenuAction::Ignore,
     }
 }
@@ -1044,6 +1144,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_attach_menu_input_x_is_delete() {
+        assert_eq!(parse_attach_menu_input(b"x"), AttachMenuAction::Delete);
+    }
+
+    #[test]
+    fn parse_attach_menu_input_r_is_start_rename() {
+        assert_eq!(parse_attach_menu_input(b"r"), AttachMenuAction::StartRename);
+    }
+
+    #[test]
     fn quit_byte_is_ctrl_q_not_ctrl_c() {
         assert!(is_quit(&[0x11]));
         assert!(!is_quit(&[0x03]), "Ctrl-C must remain a pass-through byte, not the quit key");
@@ -1116,6 +1226,42 @@ mod tests {
         // `ServerPaneInfo` doesn't derive `PartialEq`, so compare lengths
         // rather than the whole `Vec` via `assert_eq!`.
         assert_eq!(group_servers_by_cwd(vec![]).len(), 0);
+    }
+
+    #[test]
+    fn arm_delete_sets_pending_delete_on_a_real_row() {
+        let servers = vec![("Unknown".to_string(), server_with_cwd("a", None))];
+        let mut app = App {
+            workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
+            grids: HashMap::new(),
+            focused: None,
+            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None }),
+            frame_area: ratatui::layout::Rect::default(),
+            dragging_split: None,
+        };
+        app.arm_delete();
+        assert_eq!(app.attach_menu.unwrap().pending_delete, Some(0));
+    }
+
+    #[test]
+    fn arm_delete_on_spawn_new_row_is_a_no_op() {
+        let servers = vec![("Unknown".to_string(), server_with_cwd("a", None))];
+        let spawn_index = servers.len();
+        let mut app = App {
+            workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
+            grids: HashMap::new(),
+            focused: None,
+            attach_menu: Some(AttachMenu {
+                servers,
+                selected: spawn_index,
+                pending_delete: None,
+                rename: None,
+            }),
+            frame_area: ratatui::layout::Rect::default(),
+            dragging_split: None,
+        };
+        app.arm_delete();
+        assert_eq!(app.attach_menu.unwrap().pending_delete, None);
     }
 
     /// Regression test for the "dimux hangs often" bug: racing a frame
