@@ -513,6 +513,26 @@ impl App {
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
+        let is_renaming = self.attach_menu.as_ref().is_some_and(|m| m.rename.is_some());
+        if is_renaming {
+            match bytes {
+                b"\r" | b"\n" => self.confirm_rename(write_half, reader).await?,
+                b"\x1b" => {
+                    if let Some(menu) = &mut self.attach_menu {
+                        menu.rename = None;
+                    }
+                }
+                _ => {
+                    if let Some(menu) = &mut self.attach_menu {
+                        if let Some(rename) = &mut menu.rename {
+                            apply_rename_edit(rename, bytes);
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         let has_pending_delete =
             self.attach_menu.as_ref().is_some_and(|m| m.pending_delete.is_some());
         if has_pending_delete {
@@ -609,8 +629,60 @@ impl App {
         Ok(())
     }
 
+    /// `r` on a real server-pane row: open the inline rename field,
+    /// pre-filled with its current custom name (empty if it's currently
+    /// falling back to the id — see `render::attach_menu_line`'s
+    /// `unwrap_or_else(|| short_id(...))`), cursor starting at the end
+    /// of the pre-filled text. A no-op on the trailing "spawn new" row.
     fn start_rename(&mut self) {
-        // Implemented in Task 5.
+        let Some(menu) = &mut self.attach_menu else { return };
+        if menu.selected >= menu.servers.len() {
+            return;
+        }
+        let text = menu.servers[menu.selected].1.name.clone().unwrap_or_default();
+        let cursor = text.len();
+        menu.rename = Some(RenameState { index: menu.selected, text, cursor, error: None });
+    }
+
+    /// Submit the active rename field's current text: a no-op if empty
+    /// (stays in rename mode rather than sending an empty name), sends
+    /// `Request::ServerRename` otherwise. On success, re-fetches and
+    /// re-groups the server list and closes rename mode. On
+    /// `Response::Error` (e.g. a name collision), records the message in
+    /// `rename.error` and stays open for another attempt.
+    async fn confirm_rename(
+        &mut self,
+        write_half: &mut OwnedWriteHalf,
+        reader: &mut FrameReader,
+    ) -> anyhow::Result<()> {
+        let Some(menu) = &self.attach_menu else { return Ok(()) };
+        let Some(rename) = &menu.rename else { return Ok(()) };
+        if rename.text.is_empty() {
+            return Ok(());
+        }
+        let target = menu.servers[rename.index].1.id.to_string();
+        let new_name = rename.text.clone();
+        let req = Request::ServerRename { target, new_name };
+        match self.request(write_half, reader, req).await? {
+            Response::Ack => {
+                if let Response::ServerPaneList(servers) =
+                    self.request(write_half, reader, Request::ServerList).await?
+                {
+                    let Some(menu) = &mut self.attach_menu else { return Ok(()) };
+                    menu.servers = group_servers_by_cwd(servers);
+                    menu.rename = None;
+                }
+            }
+            Response::Error { message } => {
+                if let Some(menu) = &mut self.attach_menu {
+                    if let Some(rename) = &mut menu.rename {
+                        rename.error = Some(message);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Confirm the attach menu's current selection: bind the just-detached
@@ -856,6 +928,86 @@ fn parse_attach_menu_input(bytes: &[u8]) -> AttachMenuAction {
         b"r" => AttachMenuAction::StartRename,
         _ => AttachMenuAction::Ignore,
     }
+}
+
+/// Apply one raw input chunk to a live rename field's edit buffer.
+/// Byte-level matching in the same minimal style as
+/// `parse_attach_menu_input`/`keys::parse` rather than pulling in a
+/// text-input crate — this field only ever needs insert/delete/cursor
+/// movement, not a general-purpose editor. Every branch that mutates
+/// `text`/`cursor` also clears `state.error`, so a fresh edit dismisses
+/// the last rejection message rather than leaving stale text stuck under
+/// the field. Enter/Esc are handled by the caller (`App::
+/// handle_attach_menu_input`'s rename branch), not here, since they
+/// trigger network requests or close rename mode entirely -- concerns
+/// outside this pure buffer-editing function.
+fn apply_rename_edit(state: &mut RenameState, bytes: &[u8]) {
+    match bytes {
+        b"\x7f" | b"\x08" => {
+            if state.cursor > 0 {
+                let mut chars: Vec<char> = state.text.chars().collect();
+                let char_idx = state.text[..state.cursor].chars().count() - 1;
+                chars.remove(char_idx);
+                state.text = chars.into_iter().collect();
+                state.cursor = state.text[..].chars().take(char_idx).map(|c| c.len_utf8()).sum();
+            } else {
+                return;
+            }
+        }
+        b"\x1b[3~" => {
+            let char_idx = state.text[..state.cursor].chars().count();
+            let mut chars: Vec<char> = state.text.chars().collect();
+            if char_idx < chars.len() {
+                chars.remove(char_idx);
+                state.text = chars.into_iter().collect();
+            } else {
+                return;
+            }
+        }
+        b"\x1b[D" => {
+            if state.cursor > 0 {
+                let char_idx = state.text[..state.cursor].chars().count() - 1;
+                state.cursor = state.text.chars().take(char_idx).map(|c| c.len_utf8()).sum();
+            } else {
+                return;
+            }
+        }
+        b"\x1b[C" => {
+            if state.cursor < state.text.len() {
+                let char_idx = state.text[..state.cursor].chars().count() + 1;
+                state.cursor = state.text.chars().take(char_idx).map(|c| c.len_utf8()).sum();
+            } else {
+                return;
+            }
+        }
+        b"\x1b[H" | b"\x1b[1~" => {
+            if state.cursor == 0 {
+                return;
+            }
+            state.cursor = 0;
+        }
+        b"\x1b[F" | b"\x1b[4~" => {
+            if state.cursor == state.text.len() {
+                return;
+            }
+            state.cursor = state.text.len();
+        }
+        _ if bytes.first() == Some(&0x1b) => {
+            // Any other escape sequence this field doesn't recognize --
+            // defense in depth, same rationale as `mouse::parse`'s
+            // "Ignored" case: don't let a stray sequence get inserted as
+            // literal garbage text.
+            return;
+        }
+        _ => match std::str::from_utf8(bytes) {
+            Ok(text) => {
+                state.text.insert_str(state.cursor, text);
+                state.cursor += text.len();
+            }
+            Err(_) => return,
+        },
+    }
+    state.error = None;
 }
 
 /// RAII guard ensuring the terminal is restored (raw mode disabled,
@@ -1262,6 +1414,125 @@ mod tests {
         };
         app.arm_delete();
         assert_eq!(app.attach_menu.unwrap().pending_delete, None);
+    }
+
+    fn rename_state(text: &str, cursor: usize) -> RenameState {
+        RenameState { index: 0, text: text.to_string(), cursor, error: None }
+    }
+
+    #[test]
+    fn rename_edit_inserts_printable_bytes_at_cursor() {
+        let mut state = rename_state("ab", 1);
+        apply_rename_edit(&mut state, b"X");
+        assert_eq!(state.text, "aXb");
+        assert_eq!(state.cursor, 2);
+    }
+
+    #[test]
+    fn rename_edit_backspace_removes_char_before_cursor() {
+        let mut state = rename_state("abc", 2);
+        apply_rename_edit(&mut state, b"\x7f");
+        assert_eq!(state.text, "ac");
+        assert_eq!(state.cursor, 1);
+    }
+
+    #[test]
+    fn rename_edit_backspace_at_start_is_a_no_op() {
+        let mut state = rename_state("abc", 0);
+        apply_rename_edit(&mut state, b"\x7f");
+        assert_eq!(state.text, "abc");
+        assert_eq!(state.cursor, 0);
+    }
+
+    #[test]
+    fn rename_edit_delete_removes_char_at_cursor() {
+        let mut state = rename_state("abc", 1);
+        apply_rename_edit(&mut state, b"\x1b[3~");
+        assert_eq!(state.text, "ac");
+        assert_eq!(state.cursor, 1);
+    }
+
+    #[test]
+    fn rename_edit_left_and_right_move_cursor() {
+        let mut state = rename_state("abc", 1);
+        apply_rename_edit(&mut state, b"\x1b[C");
+        assert_eq!(state.cursor, 2);
+        apply_rename_edit(&mut state, b"\x1b[D");
+        assert_eq!(state.cursor, 1);
+    }
+
+    #[test]
+    fn rename_edit_left_at_start_and_right_at_end_are_no_ops() {
+        let mut state = rename_state("abc", 0);
+        apply_rename_edit(&mut state, b"\x1b[D");
+        assert_eq!(state.cursor, 0);
+        let mut state = rename_state("abc", 3);
+        apply_rename_edit(&mut state, b"\x1b[C");
+        assert_eq!(state.cursor, 3);
+    }
+
+    #[test]
+    fn rename_edit_home_and_end_jump_cursor() {
+        let mut state = rename_state("abc", 1);
+        apply_rename_edit(&mut state, b"\x1b[H");
+        assert_eq!(state.cursor, 0);
+        apply_rename_edit(&mut state, b"\x1b[F");
+        assert_eq!(state.cursor, 3);
+    }
+
+    #[test]
+    fn rename_edit_clears_stale_error_on_any_edit() {
+        let mut state = rename_state("abc", 1);
+        state.error = Some("name taken".to_string());
+        apply_rename_edit(&mut state, b"X");
+        assert_eq!(state.error, None);
+    }
+
+    #[test]
+    fn rename_edit_unrecognized_escape_is_ignored() {
+        let mut state = rename_state("abc", 1);
+        apply_rename_edit(&mut state, b"\x1b[99~");
+        assert_eq!(state.text, "abc");
+        assert_eq!(state.cursor, 1);
+    }
+
+    #[test]
+    fn start_rename_prefills_current_name_with_cursor_at_end() {
+        let servers = vec![("Unknown".to_string(), server_with_cwd("my-name", None))];
+        let mut app = App {
+            workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
+            grids: HashMap::new(),
+            focused: None,
+            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None }),
+            frame_area: ratatui::layout::Rect::default(),
+            dragging_split: None,
+        };
+        app.start_rename();
+        let rename = app.attach_menu.unwrap().rename.unwrap();
+        assert_eq!(rename.text, "my-name");
+        assert_eq!(rename.cursor, "my-name".len());
+        assert_eq!(rename.index, 0);
+    }
+
+    #[test]
+    fn start_rename_on_spawn_new_row_is_a_no_op() {
+        let servers = vec![("Unknown".to_string(), server_with_cwd("a", None))];
+        let spawn_index = servers.len();
+        let mut app = App {
+            workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
+            grids: HashMap::new(),
+            focused: None,
+            attach_menu: Some(AttachMenu {
+                servers,
+                selected: spawn_index,
+                pending_delete: None,
+                rename: None,
+            }),
+            frame_area: ratatui::layout::Rect::default(),
+            dragging_split: None,
+        };
+        app.start_rename();
+        assert!(app.attach_menu.unwrap().rename.is_none());
     }
 
     /// Regression test for the "dimux hangs often" bug: racing a frame
