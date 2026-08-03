@@ -204,12 +204,41 @@ pub enum Action {
 
 /// State for the `cmd-shift-z` attach menu: pick an existing server-pane,
 /// or spawn a new one, to bind into the client-pane that was just
-/// detached. `servers.len()` is always the trailing "spawn new" row's
-/// index (mirrors the removed picker's convention — see
-/// `render::draw_attach_menu`).
+/// detached — or, since this menu doubles as a lightweight server-pane
+/// manager, delete/rename one instead. `servers.len()` is always the
+/// trailing "spawn new" row's index (mirrors the removed picker's
+/// convention — see `render::draw_attach_menu`).
 struct AttachMenu {
-    servers: Vec<ServerPaneInfo>,
+    /// `(cwd_group_key, server)` pairs, pre-sorted into cwd-bucket order
+    /// by `group_servers_by_cwd` every time this field is populated —
+    /// see that function's doc comment for the exact ordering rules.
+    /// `selected` indexes this `Vec` directly; grouping is a rendering
+    /// concern layered on top by `render::draw_attach_menu`, not a
+    /// change to how selection/nav math works.
+    servers: Vec<(String, ServerPaneInfo)>,
     selected: usize,
+    /// `Some(index into servers)` while that row's delete is armed
+    /// (first `x` pressed, awaiting a confirming `x`/Enter or a
+    /// cancelling any-other-key). Mutually exclusive with `rename` —
+    /// opening one clears the other.
+    pending_delete: Option<usize>,
+    /// `Some` while the inline rename field is focused for the row at
+    /// `.index`. See `RenameState`'s own doc comment.
+    rename: Option<RenameState>,
+}
+
+/// Live edit state for the attach menu's inline rename field (`r` on a
+/// row). `text`/`cursor` are the field's edit buffer and cursor
+/// position — a byte offset into `text`, always kept on a UTF-8 char
+/// boundary by every editing operation in `apply_rename_edit`. `error`
+/// holds the daemon's last rejection message (e.g. a name collision) to
+/// render under the field; cleared on the next edit so a stale error
+/// doesn't linger once the user starts fixing it.
+struct RenameState {
+    index: usize,
+    text: String,
+    cursor: usize,
+    error: Option<String>,
 }
 
 /// Raw byte, read outside `keys::parse`'s chord grammar entirely, that
@@ -465,7 +494,12 @@ impl App {
         if let Response::ServerPaneList(servers) =
             self.request(write_half, reader, Request::ServerList).await?
         {
-            self.attach_menu = Some(AttachMenu { servers, selected: 0 });
+            self.attach_menu = Some(AttachMenu {
+                servers: group_servers_by_cwd(servers),
+                selected: 0,
+                pending_delete: None,
+                rename: None,
+            });
         }
         Ok(())
     }

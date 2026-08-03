@@ -321,20 +321,23 @@ fn cell_to_span(cell: &Cell) -> Span<'static> {
 /// Overlay for `cmd-shift-z`'s attach menu: lists every server-pane plus a
 /// trailing "spawn new" entry, opened after the focused client-pane has
 /// already been detached from whatever it was previously bound to.
-pub fn draw_attach_menu(frame: &mut Frame, servers: &[ServerPaneInfo], selected: usize) {
-    // Wider than the previous 60% -- each row now packs five columns
-    // (name/cwd/process/id/status, see `attach_menu_line`) rather than
-    // the original two, and needs more horizontal room to avoid every
-    // field being clipped down to near-nothing on an ordinary terminal
-    // width.
+pub fn draw_attach_menu(frame: &mut Frame, servers: &[(String, ServerPaneInfo)], selected: usize) {
+    // Wider than the previous 60% -- each row now packs four columns
+    // (name/process/id/status, see `attach_menu_line`) rather than the
+    // original two, and needs more horizontal room to avoid every field
+    // being clipped down to near-nothing on an ordinary terminal width.
     let area = centered_rect(85, 60, frame.area());
     frame.render_widget(Clear, area);
 
-    let mut lines: Vec<Line<'static>> = servers
-        .iter()
-        .enumerate()
-        .map(|(i, server)| attach_menu_line(server, i == selected))
-        .collect();
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(servers.len() * 2 + 1);
+    let mut last_group: Option<&str> = None;
+    for (i, (group, server)) in servers.iter().enumerate() {
+        if last_group != Some(group.as_str()) {
+            lines.push(Line::styled(group.clone(), Style::new().add_modifier(Modifier::BOLD)));
+            last_group = Some(group.as_str());
+        }
+        lines.push(attach_menu_line(server, i == selected));
+    }
 
     let spawn_index = servers.len();
     lines.push(spawn_new_line(selected == spawn_index));
@@ -343,14 +346,14 @@ pub fn draw_attach_menu(frame: &mut Frame, servers: &[ServerPaneInfo], selected:
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// Column widths for the attach menu's server-pane rows: `name | cwd |
-/// process | id | status`. `cwd` gets the most space since full paths
-/// are usually the longest field; `id` is fixed at 8 (the same
-/// `short_id` prefix used elsewhere) since a full UUID would dominate
-/// the row for no benefit — the attach menu is for picking a pane by
-/// eye, not by exact id.
+/// Column widths for the attach menu's server-pane rows: `name | process
+/// | id | status` (a `cwd` column existed here before rows were grouped
+/// under per-cwd header lines — see `draw_attach_menu` — at which point
+/// showing it a second time per row became redundant). `id` is fixed at
+/// 8 (the same `short_id` prefix used elsewhere) since a full UUID would
+/// dominate the row for no benefit — the attach menu is for picking a
+/// pane by eye, not by exact id.
 const NAME_COL_WIDTH: usize = 12;
-const CWD_COL_WIDTH: usize = 24;
 const PROCESS_COL_WIDTH: usize = 10;
 
 fn attach_menu_line(server: &ServerPaneInfo, selected: bool) -> Line<'static> {
@@ -360,37 +363,18 @@ fn attach_menu_line(server: &ServerPaneInfo, selected: bool) -> Line<'static> {
         ServerPaneStatus::Dead => "Dead",
     };
     let process = server.foreground.as_ref().map_or("-", |f| f.process_name.as_str());
-    let cwd = server.foreground.as_ref().and_then(|f| f.cwd.as_deref()).unwrap_or("-");
     let text = format!(
-        "{} {:<name_w$} {:<cwd_w$} {:<process_w$} {} {}",
+        "  {} {:<name_w$} {:<process_w$} {} {}",
         if selected { ">" } else { " " },
         truncate_end(&name, NAME_COL_WIDTH),
-        truncate_start(cwd, CWD_COL_WIDTH),
         truncate_end(process, PROCESS_COL_WIDTH),
         short_id(server.id),
         status,
         name_w = NAME_COL_WIDTH,
-        cwd_w = CWD_COL_WIDTH,
         process_w = PROCESS_COL_WIDTH,
     );
     let style = if selected { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
     Line::styled(text, style)
-}
-
-/// Truncate `s` to at most `width` characters, keeping the *end* (an
-/// ellipsis prefix, e.g. `...project/src`) — used for `cwd`, where the
-/// tail of a path (closer to the leaf directory) is usually more
-/// informative than the root when the whole thing doesn't fit.
-fn truncate_start(s: &str, width: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= width {
-        return s.to_string();
-    }
-    if width <= 3 {
-        return ".".repeat(width);
-    }
-    let tail: String = chars[chars.len() - (width - 3)..].iter().collect();
-    format!("...{tail}")
 }
 
 /// Truncate `s` to at most `width` characters, keeping the *start* (a
@@ -761,7 +745,7 @@ mod tests {
                 cwd: Some("/home/dev/project".to_string()),
             }),
         };
-        let servers = vec![server];
+        let servers = vec![("/home/dev/project".to_string(), server)];
         // Wide enough that the popup (85% of frame width, see
         // draw_attach_menu) comfortably fits every column's full width
         // rather than clipping mid-row -- a narrower backend was exactly
@@ -785,19 +769,12 @@ mod tests {
             status: ServerPaneStatus::Dead,
             foreground: None,
         };
-        let servers = vec![server];
+        let servers = vec![("Unknown".to_string(), server)];
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw_attach_menu(frame, &servers, 0)).unwrap();
         assert!(buffer_contains(&terminal, "editor"));
         assert!(buffer_contains(&terminal, "-"));
-    }
-
-    #[test]
-    fn truncate_start_keeps_the_tail_with_a_leading_ellipsis() {
-        assert_eq!(truncate_start("/home/dev/some/long/project/path", 15), "...project/path");
-        assert_eq!(truncate_start("short", 15), "short");
-        assert_eq!(truncate_start("exact-width!!", 13), "exact-width!!");
     }
 
     #[test]
@@ -809,7 +786,7 @@ mod tests {
 
     #[test]
     fn draw_attach_menu_spawn_new_selected_does_not_panic() {
-        let servers: Vec<ServerPaneInfo> = vec![];
+        let servers: Vec<(String, ServerPaneInfo)> = vec![];
         let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw_attach_menu(frame, &servers, 0)).unwrap();
