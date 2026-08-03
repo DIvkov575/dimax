@@ -551,7 +551,7 @@ impl App {
                 _ => return Ok(()),
             }
         } else {
-            menu.servers[menu.selected].id.to_string()
+            menu.servers[menu.selected].1.id.to_string()
         };
         let req = Request::ClientBind { workspace: self.workspace.id.to_string(), pane, target };
         let _ = self.request(write_half, reader, req).await?;
