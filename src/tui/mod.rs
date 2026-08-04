@@ -204,12 +204,41 @@ pub enum Action {
 
 /// State for the `cmd-shift-z` attach menu: pick an existing server-pane,
 /// or spawn a new one, to bind into the client-pane that was just
-/// detached. `servers.len()` is always the trailing "spawn new" row's
-/// index (mirrors the removed picker's convention — see
-/// `render::draw_attach_menu`).
+/// detached — or, since this menu doubles as a lightweight server-pane
+/// manager, delete/rename one instead. `servers.len()` is always the
+/// trailing "spawn new" row's index (mirrors the removed picker's
+/// convention — see `render::draw_attach_menu`).
 struct AttachMenu {
-    servers: Vec<ServerPaneInfo>,
+    /// `(cwd_group_key, server)` pairs, pre-sorted into cwd-bucket order
+    /// by `group_servers_by_cwd` every time this field is populated —
+    /// see that function's doc comment for the exact ordering rules.
+    /// `selected` indexes this `Vec` directly; grouping is a rendering
+    /// concern layered on top by `render::draw_attach_menu`, not a
+    /// change to how selection/nav math works.
+    servers: Vec<(String, ServerPaneInfo)>,
     selected: usize,
+    /// `Some(index into servers)` while that row's delete is armed
+    /// (first `x` pressed, awaiting a confirming `x`/Enter or a
+    /// cancelling any-other-key). Mutually exclusive with `rename` —
+    /// opening one clears the other.
+    pending_delete: Option<usize>,
+    /// `Some` while the inline rename field is focused for the row at
+    /// `.index`. See `RenameState`'s own doc comment.
+    rename: Option<RenameState>,
+}
+
+/// Live edit state for the attach menu's inline rename field (`r` on a
+/// row). `text`/`cursor` are the field's edit buffer and cursor
+/// position — a byte offset into `text`, always kept on a UTF-8 char
+/// boundary by every editing operation in `apply_rename_edit`. `error`
+/// holds the daemon's last rejection message (e.g. a name collision) to
+/// render under the field; cleared on the next edit so a stale error
+/// doesn't linger once the user starts fixing it.
+struct RenameState {
+    index: usize,
+    text: String,
+    cursor: usize,
+    error: Option<String>,
 }
 
 /// Raw byte, read outside `keys::parse`'s chord grammar entirely, that
@@ -465,7 +494,12 @@ impl App {
         if let Response::ServerPaneList(servers) =
             self.request(write_half, reader, Request::ServerList).await?
         {
-            self.attach_menu = Some(AttachMenu { servers, selected: 0 });
+            self.attach_menu = Some(AttachMenu {
+                servers: group_servers_by_cwd(servers),
+                selected: 0,
+                pending_delete: None,
+                rename: None,
+            });
         }
         Ok(())
     }
@@ -479,11 +513,70 @@ impl App {
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
-        match parse_attach_menu_input(bytes) {
+        let is_renaming = self.attach_menu.as_ref().is_some_and(|m| m.rename.is_some());
+        if is_renaming {
+            match bytes {
+                b"\r" | b"\n" => self.confirm_rename(write_half, reader).await?,
+                b"\x1b" => {
+                    if let Some(menu) = &mut self.attach_menu {
+                        menu.rename = None;
+                    }
+                }
+                _ => {
+                    if let Some(menu) = &mut self.attach_menu
+                        && let Some(rename) = &mut menu.rename
+                    {
+                        apply_rename_edit(rename, bytes);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        let has_pending_delete =
+            self.attach_menu.as_ref().is_some_and(|m| m.pending_delete.is_some());
+        if has_pending_delete {
+            match bytes {
+                b"x" | b"\r" | b"\n" => self.confirm_delete(write_half, reader).await?,
+                _ => {
+                    if let Some(menu) = &mut self.attach_menu {
+                        menu.pending_delete = None;
+                    }
+                    // A cancelling keystroke isn't swallowed -- e.g. `j`
+                    // both cancels the pending delete *and* moves the
+                    // selection down, in one keypress. Fall through to
+                    // normal dispatch for this same byte.
+                    self.dispatch_attach_menu_action(
+                        parse_attach_menu_input(bytes),
+                        write_half,
+                        reader,
+                    )
+                    .await?;
+                }
+            }
+            return Ok(());
+        }
+        self.dispatch_attach_menu_action(parse_attach_menu_input(bytes), write_half, reader).await
+    }
+
+    /// Browse-mode dispatch: everything `handle_attach_menu_input` routes
+    /// to once neither a pending delete nor an active rename is
+    /// intercepting input first. Split out so the pending-delete
+    /// cancel-and-fall-through path (above) can re-dispatch the same
+    /// byte's `AttachMenuAction` without duplicating this match.
+    async fn dispatch_attach_menu_action(
+        &mut self,
+        action: AttachMenuAction,
+        write_half: &mut OwnedWriteHalf,
+        reader: &mut FrameReader,
+    ) -> anyhow::Result<()> {
+        match action {
             AttachMenuAction::Up => self.move_attach_menu_selection(false),
             AttachMenuAction::Down => self.move_attach_menu_selection(true),
             AttachMenuAction::Cancel => self.attach_menu = None,
             AttachMenuAction::Confirm => self.confirm_attach_menu(write_half, reader).await?,
+            AttachMenuAction::Delete => self.arm_delete(),
+            AttachMenuAction::StartRename => self.start_rename(),
             AttachMenuAction::Ignore => {}
         }
         Ok(())
@@ -495,6 +588,101 @@ impl App {
         // removed picker used (see `render::draw_attach_menu`).
         let len = menu.servers.len() + 1;
         menu.selected = if forward { (menu.selected + 1) % len } else { (menu.selected + len - 1) % len };
+    }
+
+    /// Arm the selected row's deletion (first `x`), a no-op on the
+    /// trailing "spawn new" row (nothing to delete there).
+    fn arm_delete(&mut self) {
+        let Some(menu) = &mut self.attach_menu else { return };
+        if menu.selected < menu.servers.len() {
+            menu.pending_delete = Some(menu.selected);
+        }
+    }
+
+    /// Confirm a previously-armed deletion: kill the server-pane, then
+    /// re-fetch and re-group the server list so the menu reflects its
+    /// removal. Clamps `selected` into the shrunk list -- if the deleted
+    /// row was the last one, selection moves to the new last row;
+    /// otherwise the numeric index is left as-is (which now names
+    /// whatever slid up into that slot, an acceptable "selection moved
+    /// on" side effect of any list shrinking under the cursor).
+    async fn confirm_delete(
+        &mut self,
+        write_half: &mut OwnedWriteHalf,
+        reader: &mut FrameReader,
+    ) -> anyhow::Result<()> {
+        let Some(menu) = &mut self.attach_menu else { return Ok(()) };
+        let Some(index) = menu.pending_delete.take() else { return Ok(()) };
+        let target = menu.servers[index].1.id.to_string();
+        let _ = self.request(write_half, reader, Request::ServerKill { target }).await?;
+        if let Response::ServerPaneList(servers) =
+            self.request(write_half, reader, Request::ServerList).await?
+        {
+            let grouped = group_servers_by_cwd(servers);
+            let Some(menu) = &mut self.attach_menu else { return Ok(()) };
+            menu.servers = grouped;
+            let spawn_index = menu.servers.len();
+            if menu.selected > spawn_index {
+                menu.selected = spawn_index;
+            }
+        }
+        Ok(())
+    }
+
+    /// `r` on a real server-pane row: open the inline rename field,
+    /// pre-filled with its current custom name (empty if it's currently
+    /// falling back to the id — see `render::attach_menu_line`'s
+    /// `unwrap_or_else(|| short_id(...))`), cursor starting at the end
+    /// of the pre-filled text. A no-op on the trailing "spawn new" row.
+    fn start_rename(&mut self) {
+        let Some(menu) = &mut self.attach_menu else { return };
+        if menu.selected >= menu.servers.len() {
+            return;
+        }
+        let text = menu.servers[menu.selected].1.name.clone().unwrap_or_default();
+        let cursor = text.len();
+        menu.rename = Some(RenameState { index: menu.selected, text, cursor, error: None });
+    }
+
+    /// Submit the active rename field's current text: a no-op if empty
+    /// (stays in rename mode rather than sending an empty name), sends
+    /// `Request::ServerRename` otherwise. On success, re-fetches and
+    /// re-groups the server list and closes rename mode. On
+    /// `Response::Error` (e.g. a name collision), records the message in
+    /// `rename.error` and stays open for another attempt.
+    async fn confirm_rename(
+        &mut self,
+        write_half: &mut OwnedWriteHalf,
+        reader: &mut FrameReader,
+    ) -> anyhow::Result<()> {
+        let Some(menu) = &self.attach_menu else { return Ok(()) };
+        let Some(rename) = &menu.rename else { return Ok(()) };
+        if rename.text.is_empty() {
+            return Ok(());
+        }
+        let target = menu.servers[rename.index].1.id.to_string();
+        let new_name = rename.text.clone();
+        let req = Request::ServerRename { target, new_name };
+        match self.request(write_half, reader, req).await? {
+            Response::Ack => {
+                if let Response::ServerPaneList(servers) =
+                    self.request(write_half, reader, Request::ServerList).await?
+                {
+                    let Some(menu) = &mut self.attach_menu else { return Ok(()) };
+                    menu.servers = group_servers_by_cwd(servers);
+                    menu.rename = None;
+                }
+            }
+            Response::Error { message } => {
+                if let Some(menu) = &mut self.attach_menu
+                    && let Some(rename) = &mut menu.rename
+                {
+                    rename.error = Some(message);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Confirm the attach menu's current selection: bind the just-detached
@@ -517,7 +705,7 @@ impl App {
                 _ => return Ok(()),
             }
         } else {
-            menu.servers[menu.selected].id.to_string()
+            menu.servers[menu.selected].1.id.to_string()
         };
         let req = Request::ClientBind { workspace: self.workspace.id.to_string(), pane, target };
         let _ = self.request(write_half, reader, req).await?;
@@ -665,6 +853,37 @@ fn hit_test_dividers(hits: &[render::DividerHit], col: u16, row: u16) -> Option<
         .map(|hit| hit.split)
 }
 
+/// Sort `servers` into cwd-bucket order for the attach menu's grouped
+/// display: ascending by cwd string, with a synthetic `"Unknown"` bucket
+/// (no resolvable foreground `cwd` — a `Dead` pane, or a live one whose
+/// lookup failed) always sorted last regardless of where it would fall
+/// alphabetically. Within a bucket, panes keep their relative input
+/// order (stable sort, no secondary key) — whatever order `ServerList`/
+/// `ServerPaneList` returned. Returns `(group_key, server)` pairs rather
+/// than a nested `Vec<Vec<_>>` so callers can walk it once and detect
+/// group boundaries by comparing consecutive keys, which is exactly what
+/// `render::draw_attach_menu` needs to decide where to emit a header.
+fn group_servers_by_cwd(mut servers: Vec<ServerPaneInfo>) -> Vec<(String, ServerPaneInfo)> {
+    const UNKNOWN: &str = "Unknown";
+    servers.sort_by(|a, b| {
+        let key_a = a.foreground.as_ref().and_then(|f| f.cwd.as_deref()).unwrap_or(UNKNOWN);
+        let key_b = b.foreground.as_ref().and_then(|f| f.cwd.as_deref()).unwrap_or(UNKNOWN);
+        match (key_a == UNKNOWN, key_b == UNKNOWN) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => key_a.cmp(key_b),
+        }
+    });
+    servers
+        .into_iter()
+        .map(|s| {
+            let key = s.foreground.as_ref().and_then(|f| f.cwd.clone()).unwrap_or_else(|| UNKNOWN.to_string());
+            (key, s)
+        })
+        .collect()
+}
+
 /// Attach-menu input, decoupled from the raw bytes that produced it (same
 /// approach the removed pane-picker used: a distinct, simpler modal
 /// grammar rather than reusing `keys::parse`'s chords).
@@ -674,6 +893,16 @@ enum AttachMenuAction {
     Down,
     Confirm,
     Cancel,
+    /// `x` on a real server-pane row: arm (first press) or confirm
+    /// (second press) that row's deletion — see
+    /// `App::handle_attach_menu_input`'s `pending_delete` branch for the
+    /// actual arm/confirm/cancel state machine; this variant alone
+    /// doesn't distinguish arm from confirm, since that distinction
+    /// depends on `AttachMenu.pending_delete`'s current state, not on
+    /// the byte itself.
+    Delete,
+    /// `r` on a real server-pane row: open the inline rename field.
+    StartRename,
     Ignore,
 }
 
@@ -681,16 +910,104 @@ enum AttachMenuAction {
 /// arrow-key escape sequences and vi-style `j`/`k` move the selection,
 /// Enter (`\r` or `\n`) confirms, a bare `Esc` cancels (leaving the pane
 /// unbound — it was already detached by `detach_and_open_menu` before the
-/// menu opened). Anything else is ignored rather than passed through — the
-/// menu is modal and has no server-pane to forward keystrokes to yet.
+/// menu opened), `x` arms/confirms delete, `r` opens rename. Anything else
+/// is ignored rather than passed through — the menu is modal and has no
+/// server-pane to forward keystrokes to yet. Note: this table is only
+/// consulted for *browsing* mode — `App::handle_attach_menu_input` routes
+/// to entirely separate byte-handling while `pending_delete`/`rename` are
+/// active, so `x`/Enter's *confirm* behavior when a delete is already
+/// armed is handled there, not by this function returning some third
+/// "confirm delete" variant.
 fn parse_attach_menu_input(bytes: &[u8]) -> AttachMenuAction {
     match bytes {
         b"\r" | b"\n" => AttachMenuAction::Confirm,
         b"\x1b" => AttachMenuAction::Cancel,
         b"\x1b[A" | b"k" => AttachMenuAction::Up,
         b"\x1b[B" | b"j" => AttachMenuAction::Down,
+        b"x" => AttachMenuAction::Delete,
+        b"r" => AttachMenuAction::StartRename,
         _ => AttachMenuAction::Ignore,
     }
+}
+
+/// Apply one raw input chunk to a live rename field's edit buffer.
+/// Byte-level matching in the same minimal style as
+/// `parse_attach_menu_input`/`keys::parse` rather than pulling in a
+/// text-input crate — this field only ever needs insert/delete/cursor
+/// movement, not a general-purpose editor. Every branch that mutates
+/// `text`/`cursor` also clears `state.error`, so a fresh edit dismisses
+/// the last rejection message rather than leaving stale text stuck under
+/// the field. Enter/Esc are handled by the caller (`App::
+/// handle_attach_menu_input`'s rename branch), not here, since they
+/// trigger network requests or close rename mode entirely -- concerns
+/// outside this pure buffer-editing function.
+fn apply_rename_edit(state: &mut RenameState, bytes: &[u8]) {
+    match bytes {
+        b"\x7f" | b"\x08" => {
+            if state.cursor > 0 {
+                let mut chars: Vec<char> = state.text.chars().collect();
+                let char_idx = state.text[..state.cursor].chars().count() - 1;
+                chars.remove(char_idx);
+                state.text = chars.into_iter().collect();
+                state.cursor = state.text[..].chars().take(char_idx).map(|c| c.len_utf8()).sum();
+            } else {
+                return;
+            }
+        }
+        b"\x1b[3~" => {
+            let char_idx = state.text[..state.cursor].chars().count();
+            let mut chars: Vec<char> = state.text.chars().collect();
+            if char_idx < chars.len() {
+                chars.remove(char_idx);
+                state.text = chars.into_iter().collect();
+            } else {
+                return;
+            }
+        }
+        b"\x1b[D" => {
+            if state.cursor > 0 {
+                let char_idx = state.text[..state.cursor].chars().count() - 1;
+                state.cursor = state.text.chars().take(char_idx).map(|c| c.len_utf8()).sum();
+            } else {
+                return;
+            }
+        }
+        b"\x1b[C" => {
+            if state.cursor < state.text.len() {
+                let char_idx = state.text[..state.cursor].chars().count() + 1;
+                state.cursor = state.text.chars().take(char_idx).map(|c| c.len_utf8()).sum();
+            } else {
+                return;
+            }
+        }
+        b"\x1b[H" | b"\x1b[1~" => {
+            if state.cursor == 0 {
+                return;
+            }
+            state.cursor = 0;
+        }
+        b"\x1b[F" | b"\x1b[4~" => {
+            if state.cursor == state.text.len() {
+                return;
+            }
+            state.cursor = state.text.len();
+        }
+        _ if bytes.first() == Some(&0x1b) => {
+            // Any other escape sequence this field doesn't recognize --
+            // defense in depth, same rationale as `mouse::parse`'s
+            // "Ignored" case: don't let a stray sequence get inserted as
+            // literal garbage text.
+            return;
+        }
+        _ => match std::str::from_utf8(bytes) {
+            Ok(text) => {
+                state.text.insert_str(state.cursor, text);
+                state.cursor += text.len();
+            }
+            Err(_) => return,
+        },
+    }
+    state.error = None;
 }
 
 /// RAII guard ensuring the terminal is restored (raw mode disabled,
@@ -792,7 +1109,7 @@ pub async fn run() -> anyhow::Result<()> {
                 None => render::draw(frame, &app.workspace, &app.grids, app.focused),
             }
             if let Some(menu) = &app.attach_menu {
-                render::draw_attach_menu(frame, &menu.servers, menu.selected);
+                render::draw_attach_menu(frame, menu);
             }
         })?;
 
@@ -979,6 +1296,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_attach_menu_input_x_is_delete() {
+        assert_eq!(parse_attach_menu_input(b"x"), AttachMenuAction::Delete);
+    }
+
+    #[test]
+    fn parse_attach_menu_input_r_is_start_rename() {
+        assert_eq!(parse_attach_menu_input(b"r"), AttachMenuAction::StartRename);
+    }
+
+    #[test]
     fn quit_byte_is_ctrl_q_not_ctrl_c() {
         assert!(is_quit(&[0x11]));
         assert!(!is_quit(&[0x03]), "Ctrl-C must remain a pass-through byte, not the quit key");
@@ -1001,6 +1328,211 @@ mod tests {
             tree: Some(split(SplitDir::Vertical, leaf(a), leaf(b))),
         };
         assert_eq!(first_leaf(&workspace), Some(a));
+    }
+
+    fn server_with_cwd(name: &str, cwd: Option<&str>) -> ServerPaneInfo {
+        ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: Some(name.to_string()),
+            size: crate::protocol::Size { rows: 24, cols: 80 },
+            status: crate::protocol::ServerPaneStatus::Running,
+            foreground: cwd.map(|c| crate::protocol::ForegroundProcessInfo {
+                process_name: "bash".to_string(),
+                cwd: Some(c.to_string()),
+            }),
+        }
+    }
+
+    #[test]
+    fn group_servers_by_cwd_groups_matching_dirs_together() {
+        let servers = vec![
+            server_with_cwd("a", Some("/home/dev/api")),
+            server_with_cwd("b", Some("/home/dev/web")),
+            server_with_cwd("c", Some("/home/dev/api")),
+        ];
+        let grouped = group_servers_by_cwd(servers);
+        let names: Vec<&str> = grouped.iter().map(|(_, s)| s.name.as_deref().unwrap()).collect();
+        // Ascending by cwd: api's two panes (in original relative order),
+        // then web's one pane.
+        assert_eq!(names, vec!["a", "c", "b"]);
+        let keys: Vec<&str> = grouped.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["/home/dev/api", "/home/dev/api", "/home/dev/web"]);
+    }
+
+    #[test]
+    fn group_servers_by_cwd_sorts_unknown_group_last() {
+        let servers = vec![
+            server_with_cwd("no-cwd", None),
+            server_with_cwd("has-cwd", Some("/zzz/last-alphabetically")),
+        ];
+        let grouped = group_servers_by_cwd(servers);
+        let names: Vec<&str> = grouped.iter().map(|(_, s)| s.name.as_deref().unwrap()).collect();
+        // "/zzz/..." sorts after "Unknown" alphabetically, but Unknown is
+        // forced last regardless.
+        assert_eq!(names, vec!["has-cwd", "no-cwd"]);
+        assert_eq!(grouped[1].0, "Unknown");
+    }
+
+    #[test]
+    fn group_servers_by_cwd_empty_list_is_empty() {
+        // `ServerPaneInfo` doesn't derive `PartialEq`, so compare lengths
+        // rather than the whole `Vec` via `assert_eq!`.
+        assert_eq!(group_servers_by_cwd(vec![]).len(), 0);
+    }
+
+    #[test]
+    fn arm_delete_sets_pending_delete_on_a_real_row() {
+        let servers = vec![("Unknown".to_string(), server_with_cwd("a", None))];
+        let mut app = App {
+            workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
+            grids: HashMap::new(),
+            focused: None,
+            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None }),
+            frame_area: ratatui::layout::Rect::default(),
+            dragging_split: None,
+        };
+        app.arm_delete();
+        assert_eq!(app.attach_menu.unwrap().pending_delete, Some(0));
+    }
+
+    #[test]
+    fn arm_delete_on_spawn_new_row_is_a_no_op() {
+        let servers = vec![("Unknown".to_string(), server_with_cwd("a", None))];
+        let spawn_index = servers.len();
+        let mut app = App {
+            workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
+            grids: HashMap::new(),
+            focused: None,
+            attach_menu: Some(AttachMenu {
+                servers,
+                selected: spawn_index,
+                pending_delete: None,
+                rename: None,
+            }),
+            frame_area: ratatui::layout::Rect::default(),
+            dragging_split: None,
+        };
+        app.arm_delete();
+        assert_eq!(app.attach_menu.unwrap().pending_delete, None);
+    }
+
+    fn rename_state(text: &str, cursor: usize) -> RenameState {
+        RenameState { index: 0, text: text.to_string(), cursor, error: None }
+    }
+
+    #[test]
+    fn rename_edit_inserts_printable_bytes_at_cursor() {
+        let mut state = rename_state("ab", 1);
+        apply_rename_edit(&mut state, b"X");
+        assert_eq!(state.text, "aXb");
+        assert_eq!(state.cursor, 2);
+    }
+
+    #[test]
+    fn rename_edit_backspace_removes_char_before_cursor() {
+        let mut state = rename_state("abc", 2);
+        apply_rename_edit(&mut state, b"\x7f");
+        assert_eq!(state.text, "ac");
+        assert_eq!(state.cursor, 1);
+    }
+
+    #[test]
+    fn rename_edit_backspace_at_start_is_a_no_op() {
+        let mut state = rename_state("abc", 0);
+        apply_rename_edit(&mut state, b"\x7f");
+        assert_eq!(state.text, "abc");
+        assert_eq!(state.cursor, 0);
+    }
+
+    #[test]
+    fn rename_edit_delete_removes_char_at_cursor() {
+        let mut state = rename_state("abc", 1);
+        apply_rename_edit(&mut state, b"\x1b[3~");
+        assert_eq!(state.text, "ac");
+        assert_eq!(state.cursor, 1);
+    }
+
+    #[test]
+    fn rename_edit_left_and_right_move_cursor() {
+        let mut state = rename_state("abc", 1);
+        apply_rename_edit(&mut state, b"\x1b[C");
+        assert_eq!(state.cursor, 2);
+        apply_rename_edit(&mut state, b"\x1b[D");
+        assert_eq!(state.cursor, 1);
+    }
+
+    #[test]
+    fn rename_edit_left_at_start_and_right_at_end_are_no_ops() {
+        let mut state = rename_state("abc", 0);
+        apply_rename_edit(&mut state, b"\x1b[D");
+        assert_eq!(state.cursor, 0);
+        let mut state = rename_state("abc", 3);
+        apply_rename_edit(&mut state, b"\x1b[C");
+        assert_eq!(state.cursor, 3);
+    }
+
+    #[test]
+    fn rename_edit_home_and_end_jump_cursor() {
+        let mut state = rename_state("abc", 1);
+        apply_rename_edit(&mut state, b"\x1b[H");
+        assert_eq!(state.cursor, 0);
+        apply_rename_edit(&mut state, b"\x1b[F");
+        assert_eq!(state.cursor, 3);
+    }
+
+    #[test]
+    fn rename_edit_clears_stale_error_on_any_edit() {
+        let mut state = rename_state("abc", 1);
+        state.error = Some("name taken".to_string());
+        apply_rename_edit(&mut state, b"X");
+        assert_eq!(state.error, None);
+    }
+
+    #[test]
+    fn rename_edit_unrecognized_escape_is_ignored() {
+        let mut state = rename_state("abc", 1);
+        apply_rename_edit(&mut state, b"\x1b[99~");
+        assert_eq!(state.text, "abc");
+        assert_eq!(state.cursor, 1);
+    }
+
+    #[test]
+    fn start_rename_prefills_current_name_with_cursor_at_end() {
+        let servers = vec![("Unknown".to_string(), server_with_cwd("my-name", None))];
+        let mut app = App {
+            workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
+            grids: HashMap::new(),
+            focused: None,
+            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None }),
+            frame_area: ratatui::layout::Rect::default(),
+            dragging_split: None,
+        };
+        app.start_rename();
+        let rename = app.attach_menu.unwrap().rename.unwrap();
+        assert_eq!(rename.text, "my-name");
+        assert_eq!(rename.cursor, "my-name".len());
+        assert_eq!(rename.index, 0);
+    }
+
+    #[test]
+    fn start_rename_on_spawn_new_row_is_a_no_op() {
+        let servers = vec![("Unknown".to_string(), server_with_cwd("a", None))];
+        let spawn_index = servers.len();
+        let mut app = App {
+            workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
+            grids: HashMap::new(),
+            focused: None,
+            attach_menu: Some(AttachMenu {
+                servers,
+                selected: spawn_index,
+                pending_delete: None,
+                rename: None,
+            }),
+            frame_area: ratatui::layout::Rect::default(),
+            dragging_split: None,
+        };
+        app.start_rename();
+        assert!(app.attach_menu.unwrap().rename.is_none());
     }
 
     /// Regression test for the "dimux hangs often" bug: racing a frame
