@@ -206,6 +206,54 @@ fn collect_divider_rects(tree: &SplitTree, area: Rect, out: &mut Vec<DividerHit>
     }
 }
 
+/// Every leaf's on-screen `Rect`, keyed by `ClientPaneId` -- mirrors
+/// `divider_rects`'s pattern exactly (same recursive walk, same
+/// `Layout`/`Constraint` math `draw_tree` uses to lay out real frames),
+/// but collects leaf rects instead of divider grab zones. Used by
+/// `App`'s render loop to know each pane's actual on-screen size (for
+/// `Request::ResizeClientPane` reporting) and by `App::handle_mouse` to
+/// hit-test which pane a mouse-wheel event landed over.
+pub fn leaf_rects(tree: &SplitTree, area: Rect) -> Vec<(crate::protocol::ClientPaneId, Rect)> {
+    let mut out = Vec::new();
+    collect_leaf_rects(tree, area, &mut out);
+    out
+}
+
+fn collect_leaf_rects(tree: &SplitTree, area: Rect, out: &mut Vec<(crate::protocol::ClientPaneId, Rect)>) {
+    match tree {
+        SplitTree::Leaf(pane) => out.push((pane.id, area)),
+        SplitTree::Split { dir, ratio, a, b, .. } => {
+            let direction = ratatui_direction(*dir);
+            let percent_a = (ratio.clamp(0.0, 1.0) * 100.0).round() as u16;
+            let percent_b = 100u16.saturating_sub(percent_a);
+            let (rect_a, rect_b) = match direction {
+                Direction::Horizontal => {
+                    let rects = Layout::new(
+                        direction,
+                        [
+                            Constraint::Percentage(percent_a),
+                            Constraint::Length(1),
+                            Constraint::Percentage(percent_b),
+                        ],
+                    )
+                    .split(area);
+                    (rects[0], rects[2])
+                }
+                Direction::Vertical => {
+                    let rects = Layout::new(
+                        direction,
+                        [Constraint::Percentage(percent_a), Constraint::Percentage(percent_b)],
+                    )
+                    .split(area);
+                    (rects[0], rects[1])
+                }
+            };
+            collect_leaf_rects(a, rect_a, out);
+            collect_leaf_rects(b, rect_b, out);
+        }
+    }
+}
+
 /// Given a divider's `hit` (from [`divider_rects`]) and the current mouse
 /// position, compute the new ratio a drag to that position implies —
 /// the fraction of `hit.parent_area`'s span (along the split's axis)
@@ -242,10 +290,14 @@ fn draw_leaf(
     grids: &HashMap<ServerPaneId, GridSnapshot>,
     focused: Option<crate::protocol::ClientPaneId>,
 ) {
-    let title = pane
+    let snapshot = pane.bound.and_then(|server_pane_id| grids.get(&server_pane_id));
+    let mut title = pane
         .name
         .clone()
         .unwrap_or_else(|| short_id(pane.id));
+    if snapshot.is_some_and(|s| s.scroll_offset > 0) {
+        title.push_str(" [scrollback]");
+    }
     let is_focused = focused == Some(pane.id);
     let border_style = if is_focused {
         Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
@@ -265,7 +317,7 @@ fn draw_leaf(
                 Paragraph::new("(unbound — bind via `dimux client bind`)").block(block);
             frame.render_widget(placeholder, area);
         }
-        Some(server_pane_id) => match grids.get(&server_pane_id) {
+        Some(_) => match snapshot {
             Some(snapshot) => {
                 let text = grid_to_text(snapshot);
                 frame.render_widget(Paragraph::new(text).block(block), area);
@@ -561,6 +613,7 @@ mod tests {
                 size: Size { rows: 1, cols: 2 },
                 cursor: (0, 0),
                 lines: vec![vec![simple_cell("h"), simple_cell("i")]],
+                scroll_offset: 0,
             },
         );
         let backend = TestBackend::new(40, 10);
@@ -569,6 +622,58 @@ mod tests {
             .draw(|frame| draw(frame, &workspace, &grids, None))
             .unwrap();
         assert!(buffer_contains(&terminal, "hi"));
+    }
+
+    #[test]
+    fn draw_leaf_shows_scrollback_indicator_when_scrolled() {
+        let pane_id = Uuid::new_v4();
+        let server_id = Uuid::new_v4();
+        let pane = ClientPane { id: pane_id, name: Some("shell".to_string()), bound: Some(server_id) };
+        let mut grids = HashMap::new();
+        grids.insert(
+            server_id,
+            GridSnapshot {
+                server_pane: server_id,
+                size: Size { rows: 5, cols: 20 },
+                cursor: (0, 0),
+                lines: vec![vec![]; 5],
+                scroll_offset: 3,
+            },
+        );
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_leaf(frame, &pane, frame.area(), &grids, None);
+            })
+            .unwrap();
+        assert!(buffer_contains(&terminal, "scrollback"));
+    }
+
+    #[test]
+    fn draw_leaf_shows_no_scrollback_indicator_when_live() {
+        let pane_id = Uuid::new_v4();
+        let server_id = Uuid::new_v4();
+        let pane = ClientPane { id: pane_id, name: Some("shell".to_string()), bound: Some(server_id) };
+        let mut grids = HashMap::new();
+        grids.insert(
+            server_id,
+            GridSnapshot {
+                server_pane: server_id,
+                size: Size { rows: 5, cols: 20 },
+                cursor: (0, 0),
+                lines: vec![vec![]; 5],
+                scroll_offset: 0,
+            },
+        );
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_leaf(frame, &pane, frame.area(), &grids, None);
+            })
+            .unwrap();
+        assert!(!buffer_contains(&terminal, "scrollback"));
     }
 
     #[test]
@@ -598,6 +703,7 @@ mod tests {
                     simple_cell("F"),
                     simple_cell("T"),
                 ]],
+                scroll_offset: 0,
             },
         );
         grids.insert(
@@ -613,6 +719,7 @@ mod tests {
                     simple_cell("H"),
                     simple_cell("T"),
                 ]],
+                scroll_offset: 0,
             },
         );
         let backend = TestBackend::new(40, 10);
@@ -926,5 +1033,60 @@ mod tests {
         terminal.draw(|frame| draw_attach_menu(frame, &menu)).unwrap();
         assert!(buffer_contains(&terminal, "new-name"));
         assert!(buffer_contains(&terminal, "name taken"));
+    }
+
+    #[test]
+    fn leaf_rects_single_leaf_returns_the_whole_area() {
+        let id = Uuid::new_v4();
+        let tree = SplitTree::Leaf(ClientPane { id, name: None, bound: None });
+        let area = Rect { x: 0, y: 0, width: 80, height: 24 };
+        let rects = leaf_rects(&tree, area);
+        assert_eq!(rects, vec![(id, area)]);
+    }
+
+    #[test]
+    fn leaf_rects_side_by_side_split_divides_width() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let tree = SplitTree::Split {
+            id: Uuid::new_v4(),
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            a: Box::new(SplitTree::Leaf(ClientPane { id: a, name: None, bound: None })),
+            b: Box::new(SplitTree::Leaf(ClientPane { id: b, name: None, bound: None })),
+        };
+        let area = Rect { x: 0, y: 0, width: 81, height: 24 };
+        let rects = leaf_rects(&tree, area);
+        assert_eq!(rects.len(), 2);
+        let rect_a = rects.iter().find(|(id, _)| *id == a).unwrap().1;
+        let rect_b = rects.iter().find(|(id, _)| *id == b).unwrap().1;
+        // 81-wide area, 50/50 split, minus the 1-column reserved divider --
+        // same math draw_tree already uses for SplitDir::Vertical.
+        assert_eq!(rect_a.width + rect_b.width + 1, 81);
+        assert_eq!(rect_a.height, 24);
+        assert_eq!(rect_b.height, 24);
+    }
+
+    #[test]
+    fn leaf_rects_stacked_split_divides_height() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let tree = SplitTree::Split {
+            id: Uuid::new_v4(),
+            dir: SplitDir::Horizontal,
+            ratio: 0.5,
+            a: Box::new(SplitTree::Leaf(ClientPane { id: a, name: None, bound: None })),
+            b: Box::new(SplitTree::Leaf(ClientPane { id: b, name: None, bound: None })),
+        };
+        let area = Rect { x: 0, y: 0, width: 80, height: 24 };
+        let rects = leaf_rects(&tree, area);
+        assert_eq!(rects.len(), 2);
+        let rect_a = rects.iter().find(|(id, _)| *id == a).unwrap().1;
+        let rect_b = rects.iter().find(|(id, _)| *id == b).unwrap().1;
+        // SplitDir::Horizontal reserves no extra row (module doc "Bezels") --
+        // heights sum exactly to the parent, unlike the vertical-split case.
+        assert_eq!(rect_a.height + rect_b.height, 24);
+        assert_eq!(rect_a.width, 80);
+        assert_eq!(rect_b.width, 80);
     }
 }

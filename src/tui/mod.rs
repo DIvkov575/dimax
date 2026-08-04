@@ -130,7 +130,7 @@ pub mod render;
 use crate::cli::Client;
 use crate::protocol::{
     self, ClientPaneId, Event, GridSnapshot, Request, Response, ServerMessage, ServerPaneId,
-    ServerPaneInfo, SplitDir, SplitTree, WorkspaceInfo,
+    ServerPaneInfo, Size, SplitDir, SplitTree, WorkspaceInfo,
 };
 use std::collections::HashMap;
 use tokio::io::AsyncReadExt;
@@ -250,6 +250,12 @@ fn is_quit(bytes: &[u8]) -> bool {
     bytes == [QUIT_BYTE]
 }
 
+/// Rows scrolled per mouse-wheel tick. Arbitrary but
+/// conventional-feeling default -- tune freely, no protocol
+/// implications either way since `Request::ScrollClientPane::delta` is
+/// already an arbitrary signed `i32`.
+const SCROLL_ROWS_PER_TICK: i32 = 3;
+
 /// All mutable state the event loop owns, per module doc "Local mutable
 /// state" in the task this module implements. Kept as one struct (rather
 /// than loose locals) so every state-mutating helper below can take
@@ -257,6 +263,14 @@ fn is_quit(bytes: &[u8]) -> bool {
 struct App {
     workspace: WorkspaceInfo,
     grids: HashMap<ServerPaneId, GridSnapshot>,
+    /// Last on-screen size this frontend told the daemon about for each
+    /// client-pane (`Request::ResizeClientPane`), so `run`'s loop only
+    /// sends a new report when something actually changed instead of
+    /// re-sending every pane's size on every single frame. Mirrors the
+    /// daemon's own `State::client_pane_sizes`, one-directionally: this
+    /// is purely this frontend's memory of what it last *told* the
+    /// daemon, not a second source of truth.
+    pane_sizes: HashMap<ClientPaneId, Size>,
     focused: Option<ClientPaneId>,
     /// `Some` while the `cmd-shift-z` attach menu is open; input routes to
     /// `handle_attach_menu_input` instead of the normal keymap while set.
@@ -309,6 +323,7 @@ impl App {
                     return Ok(App {
                         workspace,
                         grids: grids.into_iter().map(|g| (g.server_pane, g)).collect(),
+                        pane_sizes: HashMap::new(),
                         focused,
                         attach_menu: None,
                         frame_area: ratatui::layout::Rect::default(),
@@ -747,6 +762,12 @@ impl App {
                     (split, render::ratio_at(hit, col, row))
                 });
             }
+            mouse::MouseEvent::ScrollUp { col, row } => {
+                self.scroll_pane_under(col, row, SCROLL_ROWS_PER_TICK, write_half, reader).await?;
+            }
+            mouse::MouseEvent::ScrollDown { col, row } => {
+                self.scroll_pane_under(col, row, -SCROLL_ROWS_PER_TICK, write_half, reader).await?;
+            }
             mouse::MouseEvent::Drag { col, row } => {
                 let Some((split, _)) = self.dragging_split else { return Ok(()) };
                 let Some(tree) = &self.workspace.tree else { return Ok(()) };
@@ -772,6 +793,31 @@ impl App {
                 let _ = self.request(write_half, reader, req).await?;
             }
         }
+        Ok(())
+    }
+
+    /// Hit-test `(col, row)` against the current workspace's leaves and
+    /// send `Request::ScrollClientPane` for whichever one it landed
+    /// over, if any -- not necessarily the focused pane (the wheel
+    /// scrolls whatever's under the cursor). A hit over empty space is
+    /// a no-op.
+    async fn scroll_pane_under(
+        &mut self,
+        col: u16,
+        row: u16,
+        delta: i32,
+        write_half: &mut OwnedWriteHalf,
+        reader: &mut FrameReader,
+    ) -> anyhow::Result<()> {
+        let Some(tree) = &self.workspace.tree else { return Ok(()) };
+        let hit = render::leaf_rects(tree, self.frame_area)
+            .into_iter()
+            .find(|(_, rect)| {
+                col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+            });
+        let Some((pane, _)) = hit else { return Ok(()) };
+        let req = Request::ScrollClientPane { pane, delta };
+        let _ = self.request(write_half, reader, req).await?;
         Ok(())
     }
 
@@ -851,6 +897,41 @@ fn hit_test_dividers(hits: &[render::DividerHit], col: u16, row: u16) -> Option<
                 && row < hit.grab_zone.y + hit.grab_zone.height
         })
         .map(|hit| hit.split)
+}
+
+/// Diff each leaf's current on-screen `Rect` (from `leaf_rects`) against
+/// `current` (a frontend's last-reported sizes), returning only the
+/// panes whose size actually changed -- including a pane not yet
+/// present in `current` at all (its first frame). Pure and
+/// `App`-free so it's directly unit-testable; `run`'s loop calls this
+/// every frame and only sends `Request::ResizeClientPane` for whatever
+/// this returns, rather than unconditionally re-reporting every pane on
+/// every frame.
+///
+/// Subtracts 1 from each leaf's rect height before comparing/returning
+/// -- every leaf reserves its top row as a title-bar border (see
+/// `render::draw_leaf`), so the *usable* grid area the PTY should
+/// actually be sized to is one row shorter than the leaf's full
+/// on-screen rect.
+fn changed_pane_sizes(
+    current: &HashMap<ClientPaneId, crate::protocol::Size>,
+    tree: &SplitTree,
+    area: ratatui::layout::Rect,
+) -> Vec<(ClientPaneId, crate::protocol::Size)> {
+    render::leaf_rects(tree, area)
+        .into_iter()
+        .filter_map(|(pane_id, rect)| {
+            let size = crate::protocol::Size {
+                rows: rect.height.saturating_sub(1),
+                cols: rect.width,
+            };
+            if current.get(&pane_id) == Some(&size) {
+                None
+            } else {
+                Some((pane_id, size))
+            }
+        })
+        .collect()
 }
 
 /// Sort `servers` into cwd-bucket order for the attach menu's grouped
@@ -1113,6 +1194,22 @@ pub async fn run() -> anyhow::Result<()> {
             }
         })?;
 
+        // Report any leaf whose on-screen size changed since the last
+        // frame -- see `changed_pane_sizes`'s doc comment for why this
+        // piggybacks on the render loop's own cadence instead of a
+        // SIGWINCH handler. This is the fix for the "bash renders in the
+        // top half" bug: without this, `Request::ResizeClientPane` is
+        // never sent at all, and every PTY stays pinned at the daemon's
+        // 24x80 default regardless of the pane's real size.
+        if let Some(tree) = &app.workspace.tree {
+            let changed = changed_pane_sizes(&app.pane_sizes, tree, app.frame_area);
+            for (pane, size) in changed {
+                app.pane_sizes.insert(pane, size);
+                let req = Request::ResizeClientPane { pane, size };
+                let _ = app.request(&mut write_half, &mut reader, req).await?;
+            }
+        }
+
         tokio::select! {
             result = stdin.read(&mut buf) => {
                 let n = result?;
@@ -1271,6 +1368,44 @@ mod tests {
     }
 
     #[test]
+    fn changed_pane_sizes_reports_a_never_seen_pane() {
+        let id = Uuid::new_v4();
+        let tree = leaf(id);
+        let area = ratatui::layout::Rect { x: 0, y: 0, width: 80, height: 24 };
+        let current: HashMap<ClientPaneId, crate::protocol::Size> = HashMap::new();
+        let changed = changed_pane_sizes(&current, &tree, area);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].0, id);
+        // -1 row for the title-bar border every leaf reserves (see
+        // `render::draw_leaf`) -- the usable grid area is one row shorter
+        // than the leaf's full on-screen rect.
+        assert_eq!(changed[0].1, crate::protocol::Size { rows: 23, cols: 80 });
+    }
+
+    #[test]
+    fn changed_pane_sizes_reports_nothing_when_unchanged() {
+        let id = Uuid::new_v4();
+        let tree = leaf(id);
+        let area = ratatui::layout::Rect { x: 0, y: 0, width: 80, height: 24 };
+        let mut current = HashMap::new();
+        current.insert(id, crate::protocol::Size { rows: 23, cols: 80 });
+        let changed = changed_pane_sizes(&current, &tree, area);
+        assert_eq!(changed.len(), 0);
+    }
+
+    #[test]
+    fn changed_pane_sizes_reports_a_genuinely_resized_pane() {
+        let id = Uuid::new_v4();
+        let tree = leaf(id);
+        let area = ratatui::layout::Rect { x: 0, y: 0, width: 100, height: 30 };
+        let mut current = HashMap::new();
+        current.insert(id, crate::protocol::Size { rows: 23, cols: 80 });
+        let changed = changed_pane_sizes(&current, &tree, area);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0], (id, crate::protocol::Size { rows: 29, cols: 100 }));
+    }
+
+    #[test]
     fn attach_menu_input_enter_and_newline_confirm() {
         assert_eq!(parse_attach_menu_input(b"\r"), AttachMenuAction::Confirm);
         assert_eq!(parse_attach_menu_input(b"\n"), AttachMenuAction::Confirm);
@@ -1386,6 +1521,7 @@ mod tests {
         let mut app = App {
             workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
             grids: HashMap::new(),
+            pane_sizes: HashMap::new(),
             focused: None,
             attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None }),
             frame_area: ratatui::layout::Rect::default(),
@@ -1402,6 +1538,7 @@ mod tests {
         let mut app = App {
             workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
             grids: HashMap::new(),
+            pane_sizes: HashMap::new(),
             focused: None,
             attach_menu: Some(AttachMenu {
                 servers,
@@ -1502,6 +1639,7 @@ mod tests {
         let mut app = App {
             workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
             grids: HashMap::new(),
+            pane_sizes: HashMap::new(),
             focused: None,
             attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None }),
             frame_area: ratatui::layout::Rect::default(),
@@ -1521,6 +1659,7 @@ mod tests {
         let mut app = App {
             workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
             grids: HashMap::new(),
+            pane_sizes: HashMap::new(),
             focused: None,
             attach_menu: Some(AttachMenu {
                 servers,

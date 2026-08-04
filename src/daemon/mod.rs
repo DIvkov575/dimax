@@ -258,6 +258,7 @@ async fn handle_connection(
     if let Some(ws) = subscribed_workspace {
         state.lock().await.unsubscribe(subscriber_id, ws);
     }
+    state.lock().await.clear_scroll_offsets_for_subscriber(subscriber_id);
 }
 
 /// Apply one request to `state` and produce its response, pushing any
@@ -444,8 +445,11 @@ async fn dispatch(
                     tree.leaves()
                         .into_iter()
                         .filter_map(|leaf| leaf.bound)
-                        .filter_map(|bound| state.server_pane(bound))
-                        .map(|pane| pane.snapshot())
+                        .filter_map(|bound| {
+                            let pane = state.server_pane(bound)?;
+                            let offset = state.scroll_offset_for(subscriber_id, bound);
+                            Some(pane.snapshot(offset))
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
@@ -468,6 +472,20 @@ async fn dispatch(
             let prepared = affected.and_then(|server_pane| broadcast_grid_prepare(&guard, server_pane));
             // Drop the lock before the expensive serialize+push -- see
             // `broadcast_grid_prepare`'s doc comment.
+            drop(guard);
+            if let Some(broadcast) = prepared {
+                broadcast_grid_send(registry, broadcast).await;
+            }
+            Response::Ack
+        }
+
+        Request::ScrollClientPane { pane, delta } => {
+            let mut guard = state.lock().await;
+            let Some(server_pane) = guard.bound_server_pane(pane) else {
+                return Response::Ack;
+            };
+            guard.scroll_server_pane(subscriber_id, server_pane, delta);
+            let prepared = broadcast_grid_prepare(&guard, server_pane);
             drop(guard);
             if let Some(broadcast) = prepared {
                 broadcast_grid_send(registry, broadcast).await;
@@ -541,8 +559,11 @@ async fn broadcast_layout(state: &State, registry: &SubscriberRegistry, workspac
 /// `dispatch` (`ResizeClientPane`) and from the pane-event drain task in
 /// `run` (`ServerPaneEvent::Changed`/`Died`).
 struct GridBroadcast {
-    event: ServerMessage,
-    subscribers: Vec<SubscriberId>,
+    /// One entry per distinct scroll offset currently in use among
+    /// `server_pane`'s subscribers -- in the common case (nobody
+    /// scrolled back) this has exactly one entry, same cost as before
+    /// this feature existed.
+    groups: Vec<(ServerMessage, Vec<SubscriberId>)>,
 }
 
 /// The cheap half of a grid broadcast: check whether anyone is even
@@ -571,15 +592,30 @@ fn broadcast_grid_prepare(state: &State, server_pane: ServerPaneId) -> Option<Gr
         return None;
     }
     let pane = state.server_pane(server_pane)?;
-    let event = ServerMessage::Event(Event::GridDelta { snapshot: pane.snapshot() });
-    Some(GridBroadcast { event, subscribers })
+
+    let mut by_offset: HashMap<usize, Vec<SubscriberId>> = HashMap::new();
+    for sub in subscribers {
+        let offset = state.scroll_offset_for(sub, server_pane);
+        by_offset.entry(offset).or_default().push(sub);
+    }
+
+    let groups = by_offset
+        .into_iter()
+        .map(|(offset, subs)| {
+            let event = ServerMessage::Event(Event::GridDelta { snapshot: pane.snapshot(offset) });
+            (event, subs)
+        })
+        .collect();
+    Some(GridBroadcast { groups })
 }
 
 /// The expensive half: serialize and push. Call this with the state lock
 /// already released — see [`broadcast_grid_prepare`]'s doc comment for
 /// why the split exists.
 async fn broadcast_grid_send(registry: &SubscriberRegistry, broadcast: GridBroadcast) {
-    push_to_subscribers(registry, &broadcast.subscribers, &broadcast.event).await;
+    for (event, subscribers) in &broadcast.groups {
+        push_to_subscribers(registry, subscribers, event).await;
+    }
 }
 
 async fn push_to_subscribers(
@@ -614,7 +650,7 @@ fn tracing_lite_log(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::SplitDir;
+    use crate::protocol::{Size, SplitDir};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -1156,6 +1192,188 @@ mod tests {
         {
             Response::Error { .. } => {}
             other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// Regression test for the "bash renders in the top half" bug: a
+    /// client-pane's on-screen size, once reported via
+    /// `Request::ResizeClientPane`, must actually change the bound
+    /// server-pane's PTY/grid size that a subsequent `Subscribe`
+    /// snapshot returns -- this exercises the exact wire-level path the
+    /// TUI's per-frame resize reporting now drives.
+    #[tokio::test]
+    async fn resize_client_pane_changes_the_subscribed_grid_size() {
+        let guard = start_daemon().await;
+        let mut conn = TestConn::connect(&guard.0).await;
+
+        let (workspace, pane) = match conn
+            .request(Request::ClientSpawn {
+                workspace: "1".to_string(),
+                split_of: None,
+                dir: None,
+                bind: None,
+            })
+            .await
+        {
+            Response::ClientPaneCreated { workspace, pane } => (workspace, pane),
+            other => panic!("expected ClientPaneCreated, got {other:?}"),
+        };
+
+        match conn
+            .request(Request::ResizeClientPane {
+                pane,
+                size: Size { rows: 40, cols: 120 },
+            })
+            .await
+        {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+
+        match conn.request(Request::Subscribe { workspace: workspace.to_string() }).await {
+            Response::Snapshot { grids, .. } => {
+                // No server-pane is bound yet in this test, so `grids`
+                // is empty -- this test only needs to confirm the
+                // request itself is accepted and doesn't error; the
+                // actual size-application-to-a-bound-pane path is
+                // already covered by `daemon::state`'s
+                // `pty_size_is_smallest_viewer_dimension_wise` test.
+                // Bind a server-pane now and re-subscribe to see the
+                // resize actually reflected in a grid.
+                let _ = grids;
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+
+        let server_pane = match conn
+            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()) })
+            .await
+        {
+            Response::ServerPane(info) => info.id,
+            other => panic!("expected ServerPane, got {other:?}"),
+        };
+        match conn
+            .request(Request::ClientBind {
+                workspace: workspace.to_string(),
+                pane,
+                target: server_pane.to_string(),
+            })
+            .await
+        {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+
+        match conn.request(Request::Subscribe { workspace: workspace.to_string() }).await {
+            Response::Snapshot { grids, .. } => {
+                assert_eq!(grids.len(), 1, "expected exactly one grid for the bound server-pane");
+                assert_eq!(
+                    grids[0].size,
+                    Size { rows: 40, cols: 120 },
+                    "server-pane's grid size should reflect the earlier ResizeClientPane call"
+                );
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+    }
+
+    /// Two connections subscribed to the same workspace/server-pane;
+    /// one scrolls back, the other doesn't. Exercises
+    /// `broadcast_grid_prepare`'s offset-grouping logic -- each
+    /// connection's own subsequent `GridDelta`s must reflect its own
+    /// scroll position, independent of the other's.
+    #[tokio::test]
+    async fn scroll_offset_is_independent_per_subscriber() {
+        let guard = start_daemon().await;
+
+        let mut owner = TestConn::connect(&guard.0).await;
+        let server_pane = match owner
+            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()) })
+            .await
+        {
+            Response::ServerPane(info) => info.id,
+            other => panic!("expected ServerPane, got {other:?}"),
+        };
+        let (workspace, pane) = match owner
+            .request(Request::ClientSpawn {
+                workspace: "1".to_string(),
+                split_of: None,
+                dir: None,
+                bind: Some(server_pane.to_string()),
+            })
+            .await
+        {
+            Response::ClientPaneCreated { workspace, pane } => (workspace, pane),
+            other => panic!("expected ClientPaneCreated, got {other:?}"),
+        };
+        match owner
+            .request(Request::ResizeClientPane { pane, size: Size { rows: 5, cols: 80 } })
+            .await
+        {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+
+        let mut scroller = TestConn::connect(&guard.0).await;
+        let mut watcher = TestConn::connect(&guard.0).await;
+        for conn in [&mut scroller, &mut watcher] {
+            match conn.request(Request::Subscribe { workspace: workspace.to_string() }).await {
+                Response::Snapshot { .. } => {}
+                other => panic!("expected Snapshot, got {other:?}"),
+            }
+        }
+
+        for i in 0..20 {
+            match owner
+                .request(Request::Input { pane, bytes: format!("line-{i}\n").into_bytes() })
+                .await
+            {
+                Response::Ack => {}
+                other => panic!("expected Ack, got {other:?}"),
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if scroller.read_event(Duration::from_millis(50)).await.is_none() {
+                break;
+            }
+        }
+        while std::time::Instant::now() < deadline {
+            if watcher.read_event(Duration::from_millis(50)).await.is_none() {
+                break;
+            }
+        }
+
+        match scroller.request(Request::ScrollClientPane { pane, delta: 3 }).await {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+
+        match owner.request(Request::Input { pane, bytes: b"more\n".to_vec() }).await {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+
+        let scroller_event = scroller
+            .read_event(Duration::from_secs(2))
+            .await
+            .expect("expected a GridDelta for the scrolled-back connection");
+        let watcher_event = watcher
+            .read_event(Duration::from_secs(2))
+            .await
+            .expect("expected a GridDelta for the live connection");
+
+        match scroller_event {
+            Event::GridDelta { snapshot } => {
+                assert!(snapshot.scroll_offset > 0, "scroller's snapshot should reflect its scrolled offset");
+            }
+            other => panic!("expected GridDelta, got {other:?}"),
+        }
+        match watcher_event {
+            Event::GridDelta { snapshot } => {
+                assert_eq!(snapshot.scroll_offset, 0, "watcher never scrolled -- should stay live");
+            }
+            other => panic!("expected GridDelta, got {other:?}"),
         }
     }
 
