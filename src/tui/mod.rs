@@ -250,6 +250,12 @@ fn is_quit(bytes: &[u8]) -> bool {
     bytes == [QUIT_BYTE]
 }
 
+/// Rows scrolled per mouse-wheel tick. Arbitrary but
+/// conventional-feeling default -- tune freely, no protocol
+/// implications either way since `Request::ScrollClientPane::delta` is
+/// already an arbitrary signed `i32`.
+const SCROLL_ROWS_PER_TICK: i32 = 3;
+
 /// All mutable state the event loop owns, per module doc "Local mutable
 /// state" in the task this module implements. Kept as one struct (rather
 /// than loose locals) so every state-mutating helper below can take
@@ -756,6 +762,12 @@ impl App {
                     (split, render::ratio_at(hit, col, row))
                 });
             }
+            mouse::MouseEvent::ScrollUp { col, row } => {
+                self.scroll_pane_under(col, row, SCROLL_ROWS_PER_TICK, write_half, reader).await?;
+            }
+            mouse::MouseEvent::ScrollDown { col, row } => {
+                self.scroll_pane_under(col, row, -SCROLL_ROWS_PER_TICK, write_half, reader).await?;
+            }
             mouse::MouseEvent::Drag { col, row } => {
                 let Some((split, _)) = self.dragging_split else { return Ok(()) };
                 let Some(tree) = &self.workspace.tree else { return Ok(()) };
@@ -781,6 +793,31 @@ impl App {
                 let _ = self.request(write_half, reader, req).await?;
             }
         }
+        Ok(())
+    }
+
+    /// Hit-test `(col, row)` against the current workspace's leaves and
+    /// send `Request::ScrollClientPane` for whichever one it landed
+    /// over, if any -- not necessarily the focused pane (the wheel
+    /// scrolls whatever's under the cursor). A hit over empty space is
+    /// a no-op.
+    async fn scroll_pane_under(
+        &mut self,
+        col: u16,
+        row: u16,
+        delta: i32,
+        write_half: &mut OwnedWriteHalf,
+        reader: &mut FrameReader,
+    ) -> anyhow::Result<()> {
+        let Some(tree) = &self.workspace.tree else { return Ok(()) };
+        let hit = render::leaf_rects(tree, self.frame_area)
+            .into_iter()
+            .find(|(_, rect)| {
+                col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+            });
+        let Some((pane, _)) = hit else { return Ok(()) };
+        let req = Request::ScrollClientPane { pane, delta };
+        let _ = self.request(write_half, reader, req).await?;
         Ok(())
     }
 
