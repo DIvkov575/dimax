@@ -1277,6 +1277,106 @@ mod tests {
         }
     }
 
+    /// Two connections subscribed to the same workspace/server-pane;
+    /// one scrolls back, the other doesn't. Exercises
+    /// `broadcast_grid_prepare`'s offset-grouping logic -- each
+    /// connection's own subsequent `GridDelta`s must reflect its own
+    /// scroll position, independent of the other's.
+    #[tokio::test]
+    async fn scroll_offset_is_independent_per_subscriber() {
+        let guard = start_daemon().await;
+
+        let mut owner = TestConn::connect(&guard.0).await;
+        let server_pane = match owner
+            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()) })
+            .await
+        {
+            Response::ServerPane(info) => info.id,
+            other => panic!("expected ServerPane, got {other:?}"),
+        };
+        let (workspace, pane) = match owner
+            .request(Request::ClientSpawn {
+                workspace: "1".to_string(),
+                split_of: None,
+                dir: None,
+                bind: Some(server_pane.to_string()),
+            })
+            .await
+        {
+            Response::ClientPaneCreated { workspace, pane } => (workspace, pane),
+            other => panic!("expected ClientPaneCreated, got {other:?}"),
+        };
+        match owner
+            .request(Request::ResizeClientPane { pane, size: Size { rows: 5, cols: 80 } })
+            .await
+        {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+
+        let mut scroller = TestConn::connect(&guard.0).await;
+        let mut watcher = TestConn::connect(&guard.0).await;
+        for conn in [&mut scroller, &mut watcher] {
+            match conn.request(Request::Subscribe { workspace: workspace.to_string() }).await {
+                Response::Snapshot { .. } => {}
+                other => panic!("expected Snapshot, got {other:?}"),
+            }
+        }
+
+        for i in 0..20 {
+            match owner
+                .request(Request::Input { pane, bytes: format!("line-{i}\n").into_bytes() })
+                .await
+            {
+                Response::Ack => {}
+                other => panic!("expected Ack, got {other:?}"),
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if scroller.read_event(Duration::from_millis(50)).await.is_none() {
+                break;
+            }
+        }
+        while std::time::Instant::now() < deadline {
+            if watcher.read_event(Duration::from_millis(50)).await.is_none() {
+                break;
+            }
+        }
+
+        match scroller.request(Request::ScrollClientPane { pane, delta: 3 }).await {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+
+        match owner.request(Request::Input { pane, bytes: b"more\n".to_vec() }).await {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+
+        let scroller_event = scroller
+            .read_event(Duration::from_secs(2))
+            .await
+            .expect("expected a GridDelta for the scrolled-back connection");
+        let watcher_event = watcher
+            .read_event(Duration::from_secs(2))
+            .await
+            .expect("expected a GridDelta for the live connection");
+
+        match scroller_event {
+            Event::GridDelta { snapshot } => {
+                assert!(snapshot.scroll_offset > 0, "scroller's snapshot should reflect its scrolled offset");
+            }
+            other => panic!("expected GridDelta, got {other:?}"),
+        }
+        match watcher_event {
+            Event::GridDelta { snapshot } => {
+                assert_eq!(snapshot.scroll_offset, 0, "watcher never scrolled -- should stay live");
+            }
+            other => panic!("expected GridDelta, got {other:?}"),
+        }
+    }
+
     /// Regression test for the "dimux hangs often" bug: a watched
     /// server-pane producing rapid output must not block an UNRELATED
     /// request on a separate connection. Before the
