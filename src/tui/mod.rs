@@ -1170,6 +1170,16 @@ pub async fn run() -> anyhow::Result<()> {
 
     let mut stdin = tokio::io::stdin();
     let mut buf = [0u8; 512];
+    // A `\x1b[<...` mouse sequence whose terminator (`M`/`m`) hadn't
+    // arrived yet by the end of the previous read -- carried forward
+    // and prepended to the next one so `mouse::parse_all` sees the whole
+    // sequence in one piece instead of a cut-off fragment. See mouse.rs
+    // module doc "Split sequences": at real scroll speeds, `read()`'s
+    // fixed-size buffer routinely fills up mid-sequence, splitting one
+    // `ESC [ < ... M` chord across two reads -- without this carry-over,
+    // the orphaned tail used to be typed into the focused pane as
+    // literal garbage.
+    let mut pending_mouse: Vec<u8> = Vec::new();
 
     loop {
         terminal.draw(|frame| {
@@ -1219,20 +1229,45 @@ pub async fn run() -> anyhow::Result<()> {
                     // exit cleanly rather than spin.
                     break;
                 }
-                let bytes = &buf[..n];
-                if is_quit(bytes) {
+                // Prepend any mouse-sequence fragment left over from the
+                // previous read (see `pending_mouse`'s doc comment) --
+                // this is what lets a sequence split across two reads
+                // get reassembled instead of misrouted.
+                let bytes: std::borrow::Cow<[u8]> = if pending_mouse.is_empty() {
+                    std::borrow::Cow::Borrowed(&buf[..n])
+                } else {
+                    let mut combined = std::mem::take(&mut pending_mouse);
+                    combined.extend_from_slice(&buf[..n]);
+                    std::borrow::Cow::Owned(combined)
+                };
+                if is_quit(&bytes) {
                     break;
                 }
                 // `parse_all`, not `parse`: a fast scroll (trackpad, or
                 // just a quick wheel flick) routinely bundles more than
-                // one SGR sequence into a single `read()` -- see
-                // mouse.rs module doc "Bundled sequences" for the bug
-                // this fixes (bundled scroll ticks used to fail to
-                // match `parse`'s single-sequence contract at all and
-                // leak into the pane as literal garbage keystrokes).
-                let (mouse_events, leftover) = mouse::parse_all(bytes);
+                // one SGR sequence into a single `read()`, and/or a
+                // sequence can be split across two reads by the fixed
+                // read-buffer size -- see mouse.rs module doc "Bundled
+                // sequences" / "Split sequences" for the two distinct
+                // bugs this fixes (both used to leak raw escape bytes
+                // into the focused pane as literal garbage keystrokes).
+                let (mouse_events, incomplete, leftover) = mouse::parse_all(&bytes);
                 for event in mouse_events {
                     app.handle_mouse(event, &mut write_half, &mut reader).await?;
+                }
+                if !incomplete.is_empty() {
+                    // Cap how large a carried-over fragment can grow --
+                    // a genuine SGR sequence is at most a few dozen bytes
+                    // (`ESC [ < ` + up to three small integers + `;` x2 +
+                    // terminator), so anything this large is not a real
+                    // sequence patiently waiting for its terminator; it's
+                    // either a corrupted stream or something actively
+                    // hostile. Drop it rather than let `pending_mouse`
+                    // grow without bound across many reads.
+                    const MAX_PENDING_MOUSE_FRAGMENT: usize = 64;
+                    if incomplete.len() <= MAX_PENDING_MOUSE_FRAGMENT {
+                        pending_mouse = incomplete.to_vec();
+                    }
                 }
                 if !leftover.is_empty() {
                     if app.attach_menu.is_some() {
