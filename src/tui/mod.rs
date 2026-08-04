@@ -1223,23 +1223,23 @@ pub async fn run() -> anyhow::Result<()> {
                 if is_quit(bytes) {
                     break;
                 }
-                match mouse::parse(bytes) {
-                    mouse::ParsedInput::Mouse(event) => {
-                        app.handle_mouse(event, &mut write_half, &mut reader).await?;
-                    }
-                    // A recognized SGR mouse sequence dimux has no use
-                    // for (see mouse.rs module doc "Defense in depth") --
-                    // definitely mouse input, definitely not keyboard
-                    // input, so discard it rather than falling through to
-                    // the chord/pass-through paths below.
-                    mouse::ParsedInput::Ignored => {}
-                    mouse::ParsedInput::NotMouse => {
-                        if app.attach_menu.is_some() {
-                            app.handle_attach_menu_input(bytes, &mut write_half, &mut reader).await?;
-                        } else {
-                            let action = keys::parse(bytes);
-                            app.handle_action(action, bytes, &mut write_half, &mut reader).await?;
-                        }
+                // `parse_all`, not `parse`: a fast scroll (trackpad, or
+                // just a quick wheel flick) routinely bundles more than
+                // one SGR sequence into a single `read()` -- see
+                // mouse.rs module doc "Bundled sequences" for the bug
+                // this fixes (bundled scroll ticks used to fail to
+                // match `parse`'s single-sequence contract at all and
+                // leak into the pane as literal garbage keystrokes).
+                let (mouse_events, leftover) = mouse::parse_all(bytes);
+                for event in mouse_events {
+                    app.handle_mouse(event, &mut write_half, &mut reader).await?;
+                }
+                if !leftover.is_empty() {
+                    if app.attach_menu.is_some() {
+                        app.handle_attach_menu_input(leftover, &mut write_half, &mut reader).await?;
+                    } else {
+                        let action = keys::parse(leftover);
+                        app.handle_action(action, leftover, &mut write_half, &mut reader).await?;
                     }
                 }
             }
