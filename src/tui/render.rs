@@ -290,10 +290,14 @@ fn draw_leaf(
     grids: &HashMap<ServerPaneId, GridSnapshot>,
     focused: Option<crate::protocol::ClientPaneId>,
 ) {
-    let title = pane
+    let snapshot = pane.bound.and_then(|server_pane_id| grids.get(&server_pane_id));
+    let mut title = pane
         .name
         .clone()
         .unwrap_or_else(|| short_id(pane.id));
+    if snapshot.is_some_and(|s| s.scroll_offset > 0) {
+        title.push_str(" [scrollback]");
+    }
     let is_focused = focused == Some(pane.id);
     let border_style = if is_focused {
         Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
@@ -313,7 +317,7 @@ fn draw_leaf(
                 Paragraph::new("(unbound — bind via `dimux client bind`)").block(block);
             frame.render_widget(placeholder, area);
         }
-        Some(server_pane_id) => match grids.get(&server_pane_id) {
+        Some(_) => match snapshot {
             Some(snapshot) => {
                 let text = grid_to_text(snapshot);
                 frame.render_widget(Paragraph::new(text).block(block), area);
@@ -618,6 +622,58 @@ mod tests {
             .draw(|frame| draw(frame, &workspace, &grids, None))
             .unwrap();
         assert!(buffer_contains(&terminal, "hi"));
+    }
+
+    #[test]
+    fn draw_leaf_shows_scrollback_indicator_when_scrolled() {
+        let pane_id = Uuid::new_v4();
+        let server_id = Uuid::new_v4();
+        let pane = ClientPane { id: pane_id, name: Some("shell".to_string()), bound: Some(server_id) };
+        let mut grids = HashMap::new();
+        grids.insert(
+            server_id,
+            GridSnapshot {
+                server_pane: server_id,
+                size: Size { rows: 5, cols: 20 },
+                cursor: (0, 0),
+                lines: vec![vec![]; 5],
+                scroll_offset: 3,
+            },
+        );
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_leaf(frame, &pane, frame.area(), &grids, None);
+            })
+            .unwrap();
+        assert!(buffer_contains(&terminal, "scrollback"));
+    }
+
+    #[test]
+    fn draw_leaf_shows_no_scrollback_indicator_when_live() {
+        let pane_id = Uuid::new_v4();
+        let server_id = Uuid::new_v4();
+        let pane = ClientPane { id: pane_id, name: Some("shell".to_string()), bound: Some(server_id) };
+        let mut grids = HashMap::new();
+        grids.insert(
+            server_id,
+            GridSnapshot {
+                server_pane: server_id,
+                size: Size { rows: 5, cols: 20 },
+                cursor: (0, 0),
+                lines: vec![vec![]; 5],
+                scroll_offset: 0,
+            },
+        );
+        let backend = TestBackend::new(20, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_leaf(frame, &pane, frame.area(), &grids, None);
+            })
+            .unwrap();
+        assert!(!buffer_contains(&terminal, "scrollback"));
     }
 
     #[test]
