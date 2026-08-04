@@ -523,10 +523,10 @@ impl App {
                     }
                 }
                 _ => {
-                    if let Some(menu) = &mut self.attach_menu {
-                        if let Some(rename) = &mut menu.rename {
-                            apply_rename_edit(rename, bytes);
-                        }
+                    if let Some(menu) = &mut self.attach_menu
+                        && let Some(rename) = &mut menu.rename
+                    {
+                        apply_rename_edit(rename, bytes);
                     }
                 }
             }
@@ -674,10 +674,10 @@ impl App {
                 }
             }
             Response::Error { message } => {
-                if let Some(menu) = &mut self.attach_menu {
-                    if let Some(rename) = &mut menu.rename {
-                        rename.error = Some(message);
-                    }
+                if let Some(menu) = &mut self.attach_menu
+                    && let Some(rename) = &mut menu.rename
+                {
+                    rename.error = Some(message);
                 }
             }
             _ => {}
