@@ -958,6 +958,66 @@ mod tests {
         }
     }
 
+    /// Regression coverage for the attach menu's new delete/rename
+    /// actions (see docs/superpowers/specs/2026-08-03-attach-menu-groups-
+    /// and-shortcuts-design.md): both requests the menu now issues
+    /// directly must still round-trip through the wire protocol exactly
+    /// as `dimux server kill`/`rename` already do. This is regression
+    /// coverage for the wiring, not new daemon logic -- ServerKill and
+    /// ServerRename's actual behavior is already covered by
+    /// `server_kill_unbinds_client_panes_across_workspaces` above and by
+    /// `daemon::state`'s `server_rename_*` tests.
+    #[tokio::test]
+    async fn server_rename_then_kill_round_trip_for_the_attach_menu() {
+        let guard = start_daemon().await;
+        let mut conn = TestConn::connect(&guard.0).await;
+
+        let server_pane = match conn
+            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()) })
+            .await
+        {
+            Response::ServerPane(info) => info.id,
+            other => panic!("expected ServerPane, got {other:?}"),
+        };
+
+        match conn
+            .request(Request::ServerRename {
+                target: server_pane.to_string(),
+                new_name: "renamed-from-menu".to_string(),
+            })
+            .await
+        {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+
+        match conn.request(Request::ServerList).await {
+            Response::ServerPaneList(list) => {
+                let pane = list.iter().find(|p| p.id == server_pane).expect("pane should still exist");
+                assert_eq!(pane.name.as_deref(), Some("renamed-from-menu"));
+            }
+            other => panic!("expected ServerPaneList, got {other:?}"),
+        }
+
+        match conn
+            .request(Request::ServerKill { target: server_pane.to_string() })
+            .await
+        {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+
+        match conn.request(Request::ServerList).await {
+            Response::ServerPaneList(list) => {
+                assert!(
+                    !list.iter().any(|p| p.id == server_pane),
+                    "killed server-pane should no longer be listed"
+                );
+            }
+            other => panic!("expected ServerPaneList, got {other:?}"),
+        }
+    }
+
     /// `ClientUnbind` detaches a client-pane while leaving its server-pane
     /// running -- the wire-level counterpart to
     /// `state::client_unbind_detaches_and_leaves_server_pane_running`.
