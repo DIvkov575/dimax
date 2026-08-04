@@ -158,6 +158,15 @@ pub struct GridSnapshot {
 
 ```rust
 Request::ScrollClientPane {
+    /// Addressed by client-pane, same as `Request::Input` and
+    /// `Request::ResizeClientPane` -- the frontend does hit-testing in
+    /// terms of client-panes/rects, not server-panes, so this keeps the
+    /// request shape consistent with its siblings. The daemon resolves
+    /// `pane` to its bound server-pane via `State::bound_server_pane`
+    /// (already used by the `Input` dispatch arm) before storing the
+    /// resulting offset -- see "Scroll offset ownership" below for why
+    /// the *storage* key is `(SubscriberId, ServerPaneId)`, not
+    /// `ClientPaneId`, despite the request itself naming a client-pane.
     pane: ClientPaneId,
     /// Positive scrolls back into history (more negative = further
     /// back is NOT the sign convention here -- positive delta always
@@ -173,6 +182,13 @@ Request::ScrollClientPane {
 },
 ```
 
+A pane that's currently unbound (`bound_server_pane` returns `None`) is
+a no-op — nothing to scroll, matching how `Request::Input` already
+handles an unbound target (an error response) — except here, since a
+scroll from hovering over an unbound placeholder is a very plausible
+accidental mouse event (not a deliberate action like typing), respond
+`Response::Ack` rather than `Response::Error`, silently doing nothing.
+
 Response: `Response::Ack` (same convention as `Request::Input` and every
 other fire-and-forget mutation in this protocol — the resulting
 `GridDelta` push is what actually delivers the new content, not the
@@ -180,35 +196,61 @@ response itself, matching how `ResizeClientPane` already works).
 
 ### Scroll offset ownership
 
-**Server-side, per client-pane** (not per server-pane — the same
-server-pane can be bound into multiple client-panes across workspaces,
-per the design doc's "a single server-pane can be bound into many
-client-panes at once" — each viewer scrolls independently). `State`
-gains `client_pane_scroll: HashMap<ClientPaneId, usize>`, directly
-alongside the existing `client_pane_sizes: HashMap<ClientPaneId, Size>`
-field it's modeled on. Absence in the map means offset 0 (live), same
-"absent = default" convention `client_pane_sizes` already uses.
+**Not per client-pane — per `(SubscriberId, ServerPaneId)`.** An
+earlier draft of this spec keyed scroll offset by `ClientPaneId`
+(mirroring `client_pane_sizes`), but that's incoherent with what the
+wire protocol can actually express: `GridSnapshot`/the `GridDelta`
+event both carry only a `server_pane: ServerPaneId` field — a
+connection receives *one* grid per server-pane per broadcast, not one
+per client-pane bound to it. Per the design doc, "a single server-pane
+can be bound into many client-panes at once" is an explicitly supported,
+first-class scenario — including two client-panes *in the same
+workspace* (e.g. the same shell split-displayed twice). A
+per-client-pane offset would have no way to reach the frontend
+correctly in that case: both client-panes' content comes from one
+`GridSnapshot` slot in that connection's view, so "scroll just this one
+instance" isn't representable over the wire as currently shaped.
+Keying by `(SubscriberId, ServerPaneId)` instead matches the actual
+granularity the protocol supports — one independent scroll position per
+*connection*, per server-pane it's watching, which is coherent with
+"each viewer scrolls independently" while working within (not against)
+`GridSnapshot`'s existing shape.
+
+**Known, accepted limitation from this re-scoping:** if the *same*
+server-pane is bound into two client-panes within the same workspace
+(both visible to the same subscribed frontend at once), scrolling one
+on-screen instance scrolls the other's rendered copy too — both are the
+same server-pane from that connection's point of view, so they share one
+offset. This is a narrow, pre-existing-in-spirit consequence of
+`GridSnapshot`'s per-server-pane (not per-client-pane) shape, not
+something this feature regresses — the same sharing already applies to
+today's un-scrolled live view (both instances always show identical
+content, since there's only one `GridSnapshot` for that server-pane to
+begin with). Not fixing this here; flagged as a known limitation rather
+than silently working around it.
+
+`State` gains `scroll_offsets: HashMap<(SubscriberId, ServerPaneId),
+usize>`. Absence means offset 0 (live) — same "absent = default"
+convention `client_pane_sizes` already uses, just keyed differently.
 
 **Clamping and clearing:**
-- `State::scroll_client_pane(pane, delta)`: resolves the client-pane's
-  bound server-pane, reads that server-pane's current
+- `State::scroll_server_pane(subscriber: SubscriberId, server_pane:
+  ServerPaneId, delta: i32)`: reads `server_pane`'s current
   `scrollback_rows()` (new small accessor on `ServerPane`, see below),
   computes `new_offset = (current_offset + delta).clamp(0,
   scrollback_len)`, stores it (or removes the map entry if the result is
-  0, keeping the map's "absent = 0" invariant tidy rather than
-  accumulating dead zero-entries), and returns the affected
-  `ServerPaneId` so the caller can broadcast a fresh `GridDelta` — same
-  shape as every other mutating dispatch arm in `daemon/mod.rs`.
-- **Rebinding/closing a client-pane** (`client_unbind`, `client_close`,
-  `server_kill`'s unbind-on-kill path): each of these should also remove
-  that client-pane's `client_pane_scroll` entry, the same way
-  `client_pane_sizes` conceptually goes stale for a pane that no longer
-  points at anything meaningful — verify at implementation time whether
-  `client_pane_sizes` itself is actually cleared on unbind today (if it
-  isn't, match whatever the existing convention is exactly, rather than
-  inventing a new cleanup discipline just for the new map — consistency
-  with the established pattern matters more here than which specific
-  behavior is "more correct").
+  0, keeping the "absent = 0" invariant tidy rather than accumulating
+  dead zero-entries).
+- **Cleanup**: an entry becomes stale exactly when its `SubscriberId`
+  disconnects (already handled generically — `handle_connection`'s
+  teardown path, which already calls `registry.lock().await.remove(...)`
+  and `state.lock().await.unsubscribe(...)`, additionally sweeps
+  `scroll_offsets` for that subscriber's entries) or when its
+  `ServerPaneId` is killed (`server_kill` additionally sweeps
+  `scroll_offsets` for that server-pane's entries, alongside its
+  existing `unbind_all` loop). Both are small additions to cleanup paths
+  that already exist and already run at exactly the right moments — no
+  new lifecycle hook needed beyond extending two existing ones.
 - **No explicit "jump to bottom" action** exists yet (non-goal) — the
   only way back to offset 0 is scrolling down far enough that the clamp
   reaches it.
@@ -219,7 +261,7 @@ field it's modeled on. Absence in the map means offset 0 (live), same
 
 ```rust
 /// Rows of actual history available to scroll back into (excludes the
-/// live on-screen rows) -- the upper bound `State::scroll_client_pane`
+/// live on-screen rows) -- the upper bound `State::scroll_server_pane`
 /// clamps against. NOT the same number as
 /// `wezterm_term::Screen::scrollback_rows()`, despite the matching
 /// name and this being a thin wrapper around it: that method returns
@@ -276,18 +318,42 @@ pub fn snapshot(&self, offset: usize) -> GridSnapshot {
 }
 ```
 
-Every existing caller of `ServerPane::snapshot()` (the `Subscribe`
-dispatch arm, `broadcast_grid_prepare`) needs updating to pass the
-correct offset — `broadcast_grid_prepare` in particular needs to know
-*which* offset to snapshot at when a `Changed`/`Died` event fires for a
-server-pane that has one or more scrolled-back viewers: it must
-broadcast a *per-subscriber* snapshot at each subscriber's own client-pane's
-offset, not one shared snapshot — this is the one place the existing
-"snapshot once, push to everyone" broadcast shape needs to become
-"snapshot once per distinct offset among current subscribers, push each
-group its own copy" (in practice, almost always 1-2 distinct offsets:
-the common case of everyone live, plus however many viewers are
-actively scrolled back at that moment).
+Every existing caller of `ServerPane::snapshot()` needs updating to pass
+an offset. There are exactly two call sites today:
+
+1. **The `Subscribe` dispatch arm** (`daemon/mod.rs`): looks up
+   `state.scroll_offsets.get(&(subscriber_id, bound_server_pane)).copied
+   ().unwrap_or(0)` for each bound leaf's snapshot — a freshly-subscribed
+   connection sees whatever offset it already had recorded for that
+   server-pane (0 if none, i.e. the common "just opened, nothing
+   scrolled" case), not necessarily the live tail. This matters for the
+   `switch_workspace`-then-back case: re-subscribing to a workspace you
+   previously scrolled a pane in restores that scroll position rather
+   than silently resetting it to live.
+
+2. **`broadcast_grid_prepare`**, called from the pane-event drain task
+   whenever a `Changed`/`Died` event fires for a server-pane. This is
+   the one call site that genuinely gets more complex, because the
+   existing `GridBroadcast` shape (one shared `event: ServerMessage`
+   pushed to every subscriber in `subscribers: Vec<SubscriberId>`)
+   assumes every subscriber wants the *same* grid — true before this
+   feature (there was only ever one possible view: live), false now
+   (some subscribers may be scrolled back to different offsets from
+   each other and from live).
+
+   Fix: change `GridBroadcast` to carry a `Vec<(ServerMessage,
+   Vec<SubscriberId>)>` instead of one shared pair — group
+   `subscribers_for_server_pane(server_pane)` by each subscriber's
+   current `scroll_offsets` entry for this `server_pane` (defaulting to
+   0), snapshot once per distinct offset value present in that grouping,
+   and pair each resulting snapshot with the subscriber subset that
+   wants it. In the overwhelmingly common case (nobody currently
+   scrolled back on this server-pane) this collapses to exactly one
+   group — same cost as today, no measurable regression for the
+   unscrolled path. `broadcast_grid_send`/`push_to_subscribers` then
+   iterate the `Vec` and push each group's event to its own subscriber
+   subset — a small loop added around the existing single-push call,
+   not a rewrite of the push mechanism itself.
 
 ### Frontend changes
 
@@ -348,7 +414,7 @@ added later as a follow-up, not required for the core feature to work).
   `scroll_events_are_recognized_and_ignored` test, which currently
   asserts `Ignored` for these exact byte sequences — that assertion
   necessarily changes).
-- Unit tests for `State::scroll_client_pane`'s clamping (clamps at 0,
+- Unit tests for `State::scroll_server_pane`'s clamping (clamps at 0,
   clamps at `scrollback_rows()`, absent-entry defaults to 0,
   zero-result removes the map entry rather than leaving a stale `0`).
 - Unit test for `ServerPane::snapshot(offset)` at a non-zero offset
@@ -375,3 +441,17 @@ added later as a follow-up, not required for the core feature to work).
   it out as a tunable constant with an obvious name
   (`SCROLL_ROWS_PER_TICK` or similar) so it's trivial to adjust without
   hunting for a magic number later.
+- **Known limitation, accepted not fixed**: if one server-pane is bound
+  into two client-panes in the same workspace, scrolling one on-screen
+  copy scrolls both (see "Scroll offset ownership" above for why —
+  `GridSnapshot` is keyed per server-pane per connection, not per
+  client-pane, so this is a pre-existing shape constraint the offset
+  re-keying works within rather than fixes). Rare in practice (displaying
+  the same shell twice side-by-side is an unusual thing to do), and
+  fixing it would require either a `ClientPaneId` on `GridSnapshot`
+  itself (a wire-format change touching every existing consumer) or
+  sending one `GridDelta` per bound client-pane instead of per
+  server-pane (multiplying broadcast volume for the common
+  single-binding case to fix a rare multi-binding one) — not worth
+  either cost for this feature. Revisit only if this limitation turns
+  out to actually bother someone in practice.
