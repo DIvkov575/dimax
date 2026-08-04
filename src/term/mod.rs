@@ -273,6 +273,21 @@ impl ServerPane {
         self.inner.lock().unwrap().size
     }
 
+    /// Rows of actual history available to scroll back into (excludes
+    /// the live on-screen rows) -- the upper bound
+    /// `daemon::state::State::scroll_server_pane` clamps against. NOT
+    /// the same number as `wezterm_term::Screen::scrollback_rows()`,
+    /// despite the matching name and this being a thin wrapper around
+    /// it: that method returns the *total* buffered line count (visible
+    /// rows + history -- a fresh pane with zero history still reports
+    /// `physical_rows`, not 0), so `physical_rows` must be subtracted to
+    /// get the actual scrollable depth.
+    pub fn scrollback_rows(&self) -> usize {
+        let guard = self.inner.lock().unwrap();
+        let screen = guard.terminal.screen();
+        screen.scrollback_rows().saturating_sub(screen.physical_rows)
+    }
+
     /// A live OS-level snapshot of this PTY's foreground process — see
     /// design doc "Attach menu identification columns": queried fresh on
     /// every call rather than tracked/cached, since callers (the attach
@@ -312,14 +327,21 @@ impl ServerPane {
         })
     }
 
-    /// Full current grid contents, suitable for sending to a newly
-    /// subscribed frontend or after any change.
-    pub fn snapshot(&self) -> GridSnapshot {
+    /// `offset` shifts the returned window back from the live tail by
+    /// that many rows (0 = today's exact live-view behavior, preserved
+    /// unchanged for every caller not yet updated for scrolling).
+    /// Clamping `offset` to a sane range is the *caller*'s
+    /// responsibility (`daemon::state::State::scroll_server_pane`
+    /// clamps against `scrollback_rows()` before this is ever called
+    /// with a value from user input) -- this method trusts its input.
+    pub fn snapshot(&self, offset: usize) -> GridSnapshot {
         let guard = self.inner.lock().unwrap();
         let screen = guard.terminal.screen();
         let rows = screen.physical_rows;
         let cols = screen.physical_cols;
-        let phys_range = screen.phys_range(&(0..rows as i64));
+        let start = -(offset as i32);
+        let end = start + rows as i32;
+        let phys_range = screen.scrollback_or_visible_range(&(start..end));
         let lines = screen.lines_in_phys_range(phys_range);
 
         let mut grid_lines: Vec<Vec<Cell>> = lines.iter().map(|l| line_to_cells(l, cols)).collect();
@@ -340,6 +362,7 @@ impl ServerPane {
                 cursor.y.max(0).min(u16::MAX as i64) as u16,
             ),
             lines: grid_lines,
+            scroll_offset: offset,
         }
     }
 
@@ -497,7 +520,7 @@ mod tests {
     /// Concatenate every row's cell text into one string, newline
     /// separated, for simple `contains()` assertions in tests.
     fn snapshot_text(pane: &ServerPane) -> String {
-        pane.snapshot()
+        pane.snapshot(0)
             .lines
             .iter()
             .map(|row| row.iter().map(|c| c.text.as_str()).collect::<String>())
@@ -662,6 +685,66 @@ mod tests {
         assert_eq!(pane.size(), Size { rows: 24, cols: 80 });
         pane.resize(Size { rows: 10, cols: 40 }).unwrap();
         assert_eq!(pane.size(), Size { rows: 10, cols: 40 });
+    }
+
+    #[test]
+    fn scrollback_rows_is_zero_for_a_fresh_pane() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let id = Uuid::new_v4();
+        let pane =
+            ServerPane::spawn(id, None, Some("cat".to_string()), Size { rows: 24, cols: 80 }, tx).unwrap();
+        assert_eq!(pane.scrollback_rows(), 0);
+    }
+
+    #[test]
+    fn snapshot_at_nonzero_offset_shows_scrolled_off_content() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let id = Uuid::new_v4();
+        // A small 5-row pane makes it easy to scroll content off the
+        // top with a modest number of printed lines.
+        let pane =
+            ServerPane::spawn(id, None, Some("cat".to_string()), Size { rows: 5, cols: 80 }, tx).unwrap();
+
+        // Write enough lines to scroll "first-line" off the top of a
+        // 5-row screen and into scrollback.
+        for i in 0..20 {
+            pane.write_input(format!("line-{i}\n").as_bytes()).unwrap();
+        }
+        let found = wait_until(&mut rx, || {
+            pane.snapshot(0)
+                .lines
+                .iter()
+                .map(|row| row.iter().map(|c| c.text.as_str()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+                .contains("line-19")
+        });
+        assert!(found, "expected the live view to eventually show the last written line");
+
+        assert!(pane.scrollback_rows() > 0, "expected some scrollback to have accumulated");
+
+        // At offset 0 (live), the most recent content should be
+        // visible; at a nonzero offset, it should NOT be (we've
+        // scrolled back away from it).
+        let live_text: String = pane
+            .snapshot(0)
+            .lines
+            .iter()
+            .flat_map(|row| row.iter().map(|c| c.text.as_str()))
+            .collect();
+        assert!(live_text.contains("line-19"));
+
+        let scrolled = pane.snapshot(pane.scrollback_rows());
+        assert_eq!(scrolled.scroll_offset, pane.scrollback_rows());
+        let scrolled_text: String = scrolled
+            .lines
+            .iter()
+            .flat_map(|row| row.iter().map(|c| c.text.as_str()))
+            .collect();
+        assert!(
+            !scrolled_text.contains("line-19"),
+            "scrolled all the way back should show older content, not the latest line"
+        );
     }
 
     #[test]
