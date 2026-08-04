@@ -258,6 +258,7 @@ async fn handle_connection(
     if let Some(ws) = subscribed_workspace {
         state.lock().await.unsubscribe(subscriber_id, ws);
     }
+    state.lock().await.clear_scroll_offsets_for_subscriber(subscriber_id);
 }
 
 /// Apply one request to `state` and produce its response, pushing any
@@ -444,8 +445,11 @@ async fn dispatch(
                     tree.leaves()
                         .into_iter()
                         .filter_map(|leaf| leaf.bound)
-                        .filter_map(|bound| state.server_pane(bound))
-                        .map(|pane| pane.snapshot())
+                        .filter_map(|bound| {
+                            let pane = state.server_pane(bound)?;
+                            let offset = state.scroll_offset_for(subscriber_id, bound);
+                            Some(pane.snapshot(offset))
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
@@ -468,6 +472,20 @@ async fn dispatch(
             let prepared = affected.and_then(|server_pane| broadcast_grid_prepare(&guard, server_pane));
             // Drop the lock before the expensive serialize+push -- see
             // `broadcast_grid_prepare`'s doc comment.
+            drop(guard);
+            if let Some(broadcast) = prepared {
+                broadcast_grid_send(registry, broadcast).await;
+            }
+            Response::Ack
+        }
+
+        Request::ScrollClientPane { pane, delta } => {
+            let mut guard = state.lock().await;
+            let Some(server_pane) = guard.bound_server_pane(pane) else {
+                return Response::Ack;
+            };
+            guard.scroll_server_pane(subscriber_id, server_pane, delta);
+            let prepared = broadcast_grid_prepare(&guard, server_pane);
             drop(guard);
             if let Some(broadcast) = prepared {
                 broadcast_grid_send(registry, broadcast).await;
@@ -541,8 +559,11 @@ async fn broadcast_layout(state: &State, registry: &SubscriberRegistry, workspac
 /// `dispatch` (`ResizeClientPane`) and from the pane-event drain task in
 /// `run` (`ServerPaneEvent::Changed`/`Died`).
 struct GridBroadcast {
-    event: ServerMessage,
-    subscribers: Vec<SubscriberId>,
+    /// One entry per distinct scroll offset currently in use among
+    /// `server_pane`'s subscribers -- in the common case (nobody
+    /// scrolled back) this has exactly one entry, same cost as before
+    /// this feature existed.
+    groups: Vec<(ServerMessage, Vec<SubscriberId>)>,
 }
 
 /// The cheap half of a grid broadcast: check whether anyone is even
@@ -571,15 +592,30 @@ fn broadcast_grid_prepare(state: &State, server_pane: ServerPaneId) -> Option<Gr
         return None;
     }
     let pane = state.server_pane(server_pane)?;
-    let event = ServerMessage::Event(Event::GridDelta { snapshot: pane.snapshot() });
-    Some(GridBroadcast { event, subscribers })
+
+    let mut by_offset: HashMap<usize, Vec<SubscriberId>> = HashMap::new();
+    for sub in subscribers {
+        let offset = state.scroll_offset_for(sub, server_pane);
+        by_offset.entry(offset).or_default().push(sub);
+    }
+
+    let groups = by_offset
+        .into_iter()
+        .map(|(offset, subs)| {
+            let event = ServerMessage::Event(Event::GridDelta { snapshot: pane.snapshot(offset) });
+            (event, subs)
+        })
+        .collect();
+    Some(GridBroadcast { groups })
 }
 
 /// The expensive half: serialize and push. Call this with the state lock
 /// already released — see [`broadcast_grid_prepare`]'s doc comment for
 /// why the split exists.
 async fn broadcast_grid_send(registry: &SubscriberRegistry, broadcast: GridBroadcast) {
-    push_to_subscribers(registry, &broadcast.subscribers, &broadcast.event).await;
+    for (event, subscribers) in &broadcast.groups {
+        push_to_subscribers(registry, subscribers, event).await;
+    }
 }
 
 async fn push_to_subscribers(
