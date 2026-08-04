@@ -49,6 +49,10 @@ pub enum MouseEvent {
     Down { col: u16, row: u16 },
     Drag { col: u16, row: u16 },
     Up { col: u16, row: u16 },
+    /// One wheel-tick scrolling back into a pane's history.
+    ScrollUp { col: u16, row: u16 },
+    /// One wheel-tick scrolling toward a pane's live tail.
+    ScrollDown { col: u16, row: u16 },
 }
 
 /// Result of parsing one input chunk against the SGR mouse format. See
@@ -109,6 +113,13 @@ pub fn parse(bytes: &[u8]) -> ParsedInput {
     // dimux simply doesn't act on.
     let button_number = (cb & 0b0000_0011) | ((cb & 0b1100_0000) >> 4);
     let dragging = cb & 0b0010_0000 != 0;
+
+    if button_number == 4 {
+        return ParsedInput::Mouse(MouseEvent::ScrollUp { col, row });
+    }
+    if button_number == 5 {
+        return ParsedInput::Mouse(MouseEvent::ScrollDown { col, row });
+    }
     if button_number != 0 {
         return ParsedInput::Ignored;
     }
@@ -164,9 +175,15 @@ mod tests {
     }
 
     #[test]
-    fn scroll_events_are_recognized_and_ignored() {
-        assert_eq!(parse(b"\x1b[<64;5;5M"), ParsedInput::Ignored); // scroll up
-        assert_eq!(parse(b"\x1b[<65;5;5M"), ParsedInput::Ignored); // scroll down
+    fn scroll_up_and_down_are_recognized_as_mouse_events() {
+        assert_eq!(
+            parse(b"\x1b[<64;5;5M"),
+            ParsedInput::Mouse(MouseEvent::ScrollUp { col: 4, row: 4 })
+        );
+        assert_eq!(
+            parse(b"\x1b[<65;5;5M"),
+            ParsedInput::Mouse(MouseEvent::ScrollDown { col: 4, row: 4 })
+        );
     }
 
     #[test]
