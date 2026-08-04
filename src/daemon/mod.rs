@@ -614,7 +614,7 @@ fn tracing_lite_log(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::SplitDir;
+    use crate::protocol::{Size, SplitDir};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -1156,6 +1156,88 @@ mod tests {
         {
             Response::Error { .. } => {}
             other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// Regression test for the "bash renders in the top half" bug: a
+    /// client-pane's on-screen size, once reported via
+    /// `Request::ResizeClientPane`, must actually change the bound
+    /// server-pane's PTY/grid size that a subsequent `Subscribe`
+    /// snapshot returns -- this exercises the exact wire-level path the
+    /// TUI's per-frame resize reporting now drives.
+    #[tokio::test]
+    async fn resize_client_pane_changes_the_subscribed_grid_size() {
+        let guard = start_daemon().await;
+        let mut conn = TestConn::connect(&guard.0).await;
+
+        let (workspace, pane) = match conn
+            .request(Request::ClientSpawn {
+                workspace: "1".to_string(),
+                split_of: None,
+                dir: None,
+                bind: None,
+            })
+            .await
+        {
+            Response::ClientPaneCreated { workspace, pane } => (workspace, pane),
+            other => panic!("expected ClientPaneCreated, got {other:?}"),
+        };
+
+        match conn
+            .request(Request::ResizeClientPane {
+                pane,
+                size: Size { rows: 40, cols: 120 },
+            })
+            .await
+        {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+
+        match conn.request(Request::Subscribe { workspace: workspace.to_string() }).await {
+            Response::Snapshot { grids, .. } => {
+                // No server-pane is bound yet in this test, so `grids`
+                // is empty -- this test only needs to confirm the
+                // request itself is accepted and doesn't error; the
+                // actual size-application-to-a-bound-pane path is
+                // already covered by `daemon::state`'s
+                // `pty_size_is_smallest_viewer_dimension_wise` test.
+                // Bind a server-pane now and re-subscribe to see the
+                // resize actually reflected in a grid.
+                let _ = grids;
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+
+        let server_pane = match conn
+            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()) })
+            .await
+        {
+            Response::ServerPane(info) => info.id,
+            other => panic!("expected ServerPane, got {other:?}"),
+        };
+        match conn
+            .request(Request::ClientBind {
+                workspace: workspace.to_string(),
+                pane,
+                target: server_pane.to_string(),
+            })
+            .await
+        {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+
+        match conn.request(Request::Subscribe { workspace: workspace.to_string() }).await {
+            Response::Snapshot { grids, .. } => {
+                assert_eq!(grids.len(), 1, "expected exactly one grid for the bound server-pane");
+                assert_eq!(
+                    grids[0].size,
+                    Size { rows: 40, cols: 120 },
+                    "server-pane's grid size should reflect the earlier ResizeClientPane call"
+                );
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
         }
     }
 
