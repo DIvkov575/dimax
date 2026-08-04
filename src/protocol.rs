@@ -257,6 +257,12 @@ pub struct GridSnapshot {
     pub cursor: (u16, u16),
     /// Row-major: `lines[row][col]`.
     pub lines: Vec<Vec<Cell>>,
+    /// How many rows back from the live tail this snapshot's `lines`
+    /// starts at (0 = the live/current viewport, matching every
+    /// snapshot before this field existed). Lets a frontend distinguish
+    /// "this pane is showing history" from "this pane is live" without
+    /// separately tracking offset state itself.
+    pub scroll_offset: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,6 +333,28 @@ pub enum Request {
     ResizeClientPane {
         pane: ClientPaneId,
         size: Size,
+    },
+    /// Scroll `pane`'s bound server-pane's view back into (positive
+    /// `delta`) or forward out of (negative `delta`) scrollback
+    /// history, from this connection's own point of view. Addressed by
+    /// client-pane, matching `Input`/`ResizeClientPane`'s convention,
+    /// but the daemon resolves it to the bound server-pane and stores
+    /// the resulting offset keyed by `(this connection, that
+    /// server-pane)` -- NOT by `pane` itself. See design doc "Scroll
+    /// offset ownership" for why: `GridSnapshot` carries only a
+    /// `server_pane` id, so a connection can only ever see one grid per
+    /// server-pane at a time regardless of how many client-panes it has
+    /// bound -- offset has to live at that same granularity to be
+    /// deliverable at all. The daemon clamps the resulting offset to
+    /// `0..=` that server-pane's available scrollback server-side; the
+    /// frontend never computes or owns the authoritative value. A
+    /// `pane` that's currently unbound is a silent no-op (`Ack`, not
+    /// `Error` -- an accidental mouse-wheel event over an unbound
+    /// placeholder is a very plausible occurrence, not a client bug
+    /// worth surfacing as an error).
+    ScrollClientPane {
+        pane: ClientPaneId,
+        delta: i32,
     },
     /// Set a split's ratio directly (mouse-drag resizing). `new_ratio` is
     /// the fraction of space given to the split's `a` side; the daemon

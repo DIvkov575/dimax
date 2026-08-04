@@ -609,6 +609,7 @@ mod tests {
                 size: Size { rows: 1, cols: 2 },
                 cursor: (0, 0),
                 lines: vec![vec![simple_cell("h"), simple_cell("i")]],
+                scroll_offset: 0,
             },
         );
         let backend = TestBackend::new(40, 10);
@@ -646,6 +647,7 @@ mod tests {
                     simple_cell("F"),
                     simple_cell("T"),
                 ]],
+                scroll_offset: 0,
             },
         );
         grids.insert(
@@ -661,6 +663,7 @@ mod tests {
                     simple_cell("H"),
                     simple_cell("T"),
                 ]],
+                scroll_offset: 0,
             },
         );
         let backend = TestBackend::new(40, 10);
