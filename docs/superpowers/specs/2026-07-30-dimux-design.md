@@ -194,10 +194,18 @@ rebuilt attach menu) in the TUI, or `dimux client bind <workspace>/<pane>
 
 ### Attach menu identification columns
 
-The attach menu (and `dimux server ls`) list every server-pane with five
-columns: `name | cwd | process | id | status`. `name` is the user-given
-name (via `dimux server rename`), falling back to an 8-character id
-prefix if unset — the same fallback `render::short_id` uses elsewhere.
+The attach menu groups server-panes by working directory under
+non-selectable header lines (one per distinct `cwd`, with a synthetic
+"Unknown" group sorted last for panes with no resolvable `cwd` —
+see docs/superpowers/specs/2026-08-03-attach-menu-groups-and-shortcuts-design.md).
+Each row then shows four columns: `name | process | id | status` (`cwd`
+moved to the group header, no longer repeated per row). `dimux server
+ls`'s CLI output is unaffected — it still lists all five fields per row;
+only the TUI attach menu groups/drops columns.
+
+`name` is the user-given name (via `dimux server rename`), falling back
+to an 8-character id prefix if unset — the same fallback
+`render::short_id` uses elsewhere.
 `cwd` and `process` come from `ServerPaneInfo.foreground: Option<
 ForegroundProcessInfo>`, a live OS-level snapshot of the PTY's
 *foreground* process (e.g. `vim` if you ran it inside the pane's shell,
