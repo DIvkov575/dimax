@@ -49,6 +49,15 @@ pub struct State {
     /// (`Request::ResizeClientPane`). A pane absent from this map has no
     /// known size yet and is skipped when computing smallest-viewer-wins.
     client_pane_sizes: HashMap<ClientPaneId, Size>,
+    /// Per-connection scroll position into a server-pane's history.
+    /// Keyed by `(SubscriberId, ServerPaneId)`, NOT `ClientPaneId` --
+    /// `GridSnapshot` carries only a `server_pane` id, so a connection
+    /// can only ever see one grid per server-pane per broadcast
+    /// regardless of how many client-panes it has bound to it; offset
+    /// has to live at that same granularity to be deliverable over the
+    /// wire at all. Absent means 0 (live). A zero-result store is
+    /// removed rather than kept as an explicit `0` entry.
+    scroll_offsets: HashMap<(SubscriberId, ServerPaneId), usize>,
     /// Cloned into every [`ServerPane::spawn`] so its reader thread can
     /// report output/exit.
     pane_events: UnboundedSender<ServerPaneEvent>,
@@ -75,6 +84,7 @@ impl State {
             workspaces: HashMap::new(),
             subscribers: HashMap::new(),
             client_pane_sizes: HashMap::new(),
+            scroll_offsets: HashMap::new(),
             pane_events,
             pane_events_rx: Some(pane_events_rx),
         }
@@ -144,6 +154,9 @@ impl State {
                 unbind_all(tree, id);
             }
         }
+        // No point remembering a scroll position into a server-pane
+        // that no longer exists.
+        self.scroll_offsets.retain(|(_, sp), _| *sp != id);
         Ok(())
     }
 
@@ -499,6 +512,42 @@ impl State {
         if let Some(server_pane) = self.bound_server_pane(pane) {
             self.apply_pty_size(server_pane);
         }
+    }
+
+    /// Adjust `subscriber`'s scroll position into `server_pane`'s
+    /// history by `delta` rows (positive = further back, negative =
+    /// toward live), clamped to `0..=server_pane.scrollback_rows()`.
+    /// Returns the resulting (already-clamped) offset.
+    pub fn scroll_server_pane(&mut self, subscriber: SubscriberId, server_pane: ServerPaneId, delta: i32) -> usize {
+        let Some(pane) = self.server_panes.get(&server_pane) else {
+            return 0;
+        };
+        let max = pane.scrollback_rows();
+        let current = self
+            .scroll_offsets
+            .get(&(subscriber, server_pane))
+            .copied()
+            .unwrap_or(0);
+        let new_offset = (current as i64 + delta as i64).clamp(0, max as i64) as usize;
+        if new_offset == 0 {
+            self.scroll_offsets.remove(&(subscriber, server_pane));
+        } else {
+            self.scroll_offsets.insert((subscriber, server_pane), new_offset);
+        }
+        new_offset
+    }
+
+    /// The offset a fresh `GridSnapshot` for `server_pane` should be
+    /// built at for `subscriber` -- 0 if they've never scrolled it.
+    pub fn scroll_offset_for(&self, subscriber: SubscriberId, server_pane: ServerPaneId) -> usize {
+        self.scroll_offsets.get(&(subscriber, server_pane)).copied().unwrap_or(0)
+    }
+
+    /// Remove every scroll-offset entry belonging to `subscriber` --
+    /// called from `daemon::mod`'s `handle_connection` teardown path
+    /// once a connection closes.
+    pub fn clear_scroll_offsets_for_subscriber(&mut self, subscriber: SubscriberId) {
+        self.scroll_offsets.retain(|(sub, _), _| *sub != subscriber);
     }
 
     /// Dimension-wise minimum on-screen size across every client-pane
@@ -1255,6 +1304,25 @@ mod tests {
 
         state.client_bind(ws, pane, sp).unwrap();
         assert_eq!(pane_size(&state, sp), size(8, 30));
+    }
+
+    // -- scroll offsets ---------------------------------------------------
+
+    #[test]
+    fn scroll_server_pane_clamps_at_zero() {
+        let mut state = State::new();
+        let info = state.server_spawn(None, Some("cat".to_string())).unwrap();
+        let offset = state.scroll_server_pane(1, info.id, 5);
+        assert_eq!(offset, 0);
+        assert_eq!(state.scroll_offsets.get(&(1, info.id)), None);
+    }
+
+    #[test]
+    fn scroll_server_pane_absent_entry_defaults_to_zero_before_first_call() {
+        let mut state = State::new();
+        let info = state.server_spawn(None, Some("cat".to_string())).unwrap();
+        let offset = state.scroll_server_pane(1, info.id, -5);
+        assert_eq!(offset, 0);
     }
 
     // -- pane-event plumbing --------------------------------------------
