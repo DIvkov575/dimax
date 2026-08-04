@@ -43,11 +43,11 @@
 //!
 //! # Bundled sequences: one `read()` can contain more than one event
 //!
-//! `run`'s event loop does one `stdin.read()` per iteration with no
-//! reassembly buffer. At real scroll-wheel/trackpad speeds, multiple SGR
-//! sequences routinely land in the *same* `read()` before the loop gets a
-//! chance to process any of them — three quick wheel ticks can arrive as
-//! one buffer containing three back-to-back `ESC [ < ... M` sequences.
+//! `run`'s event loop does one `stdin.read()` per iteration into a fixed
+//! buffer. At real scroll-wheel/trackpad speeds, multiple SGR sequences
+//! routinely land in the *same* `read()` before the loop gets a chance to
+//! process any of them — three quick wheel ticks can arrive as one
+//! buffer containing three back-to-back `ESC [ < ... M` sequences.
 //! [`parse`] alone can't handle this: it requires its *entire* input to
 //! be exactly one sequence, so a bundled buffer fails to match at all and
 //! falls through to keyboard parsing, typing the raw escape bytes into
@@ -59,6 +59,32 @@
 //! the (still real, still tested) single-sequence case and as the
 //! simplest entry point for anything that only ever sees one event per
 //! buffer.
+//!
+//! # Split sequences: the *fixed-size read buffer itself* can cut a
+//! sequence in half
+//!
+//! A second, distinct bug from the one above (confirmed by capturing raw
+//! stdin during a real sustained scroll): `run`'s read buffer is a fixed
+//! 512 bytes, and a full scroll gesture can queue up enough sequences
+//! that a single `read()` fills the buffer and returns mid-sequence --
+//! the read boundary lands inside one `ESC [ < ... M` chord rather than
+//! between two of them, e.g. one read ending in `...\x1b[<65;74` and the
+//! *next* read starting with `;43M...`. Neither [`parse`] nor the first
+//! version of [`parse_all`] had any way to represent "this looks like
+//! the start of a sequence but the terminator hasn't arrived yet" --
+//! they could only say "this is/isn't a complete sequence right now",
+//! so a split fragment was misclassified as `NotMouse` and, again, typed
+//! into the pane as garbage. [`parse_one`] now returns
+//! [`ParseOneResult::Incomplete`] for exactly this case (a `\x1b[<`
+//! prefix matched but no `M`/`m` terminator found in the remaining
+//! bytes), and [`parse_all`] surfaces that as its `incomplete: &[u8]`
+//! return value -- `run`'s event loop prepends that tail onto whatever
+//! it reads next, so a split sequence gets reassembled instead of
+//! misrouted. This is why `parse_all` returns three things, not two:
+//! completed events, the incomplete tail (if any) to carry forward, and
+//! the genuinely-not-mouse leftover to hand to the keyboard parser --
+//! collapsing "incomplete" and "not mouse" into one bucket is exactly
+//! what caused this bug.
 
 /// A parsed left-button mouse event: press, drag (move while held), or
 /// release, at a given terminal cell position (0-indexed, matching
@@ -90,26 +116,48 @@ pub enum ParsedInput {
     NotMouse,
 }
 
+/// Outcome of attempting to parse exactly one SGR sequence at the start
+/// of a buffer. Three-way, not two-way, because "not a complete sequence
+/// right now" has two genuinely different causes that callers must treat
+/// differently (see module doc "Split sequences"): a `\x1b[<` prefix
+/// with no terminator *yet* (`Incomplete` -- more bytes are coming in a
+/// future read, don't discard this) versus bytes that were never headed
+/// toward a mouse sequence at all (`NoMatch` -- safe to hand to the
+/// keyboard parser right now).
+enum ParseOneResult {
+    /// A full sequence was found, spanning `usize` bytes from the start
+    /// of the input. Its parsed meaning is `ParsedInput` (which may
+    /// itself be `NotMouse` if the shape matched but the content inside
+    /// didn't -- e.g. non-numeric fields; still fully consumed, just not
+    /// actionable).
+    Complete(ParsedInput, usize),
+    /// A `\x1b[<` prefix matched but no `M`/`m` terminator was found
+    /// anywhere in the remaining bytes -- this might be a real sequence
+    /// whose tail hasn't arrived yet. The caller must NOT discard these
+    /// bytes; carry them forward and prepend whatever arrives next.
+    Incomplete,
+    /// No `\x1b[<` prefix at all -- definitely not the start of an SGR
+    /// mouse sequence, safe to route elsewhere right now.
+    NoMatch,
+}
+
 /// Parse the SGR mouse sequence at the *start* of `bytes`, if its shape
-/// is recognized at all (a `ESC [ <` prefix followed somewhere by an
-/// `M`/`m` terminator) -- returning both the parsed result and exactly
-/// how many leading bytes of `bytes` that one sequence occupies. `None`
-/// means no recognizable sequence starts here at all (no prefix, or a
-/// prefix with no terminator anywhere in `bytes`); the caller can't
-/// safely skip anything in that case. A recognized shape whose content
-/// fails to parse (missing/non-numeric fields) still returns
-/// `Some((NotMouse, consumed))` -- distinct from the "not even
-/// SGR-shaped" `None` case, and needed so [`parse_all`] and [`parse`]
-/// agree on exactly how many bytes one such malformed sequence spans.
-fn parse_one(bytes: &[u8]) -> Option<(ParsedInput, usize)> {
-    let rest = bytes.strip_prefix(b"\x1b[<")?;
-    let term_idx = rest.iter().position(|&b| b == b'M' || b == b'm')?;
+/// is recognized at all. See [`ParseOneResult`] for what each outcome
+/// means and why "no complete match" is split into two cases instead of
+/// one.
+fn parse_one(bytes: &[u8]) -> ParseOneResult {
+    let Some(rest) = bytes.strip_prefix(b"\x1b[<") else { return ParseOneResult::NoMatch };
+    let Some(term_idx) = rest.iter().position(|&b| b == b'M' || b == b'm') else {
+        return ParseOneResult::Incomplete;
+    };
     let released = rest[term_idx] == b'm';
     let body = &rest[..term_idx];
     // 3 for the `ESC [ <` prefix, 1 for the M/m terminator itself.
     let consumed = 3 + term_idx + 1;
 
-    let Ok(s) = std::str::from_utf8(body) else { return Some((ParsedInput::NotMouse, consumed)) };
+    let Ok(s) = std::str::from_utf8(body) else {
+        return ParseOneResult::Complete(ParsedInput::NotMouse, consumed);
+    };
     let mut parts = s.split(';');
     let (Some(Ok(cb)), Some(Ok(col_raw)), Some(Ok(row_raw))) = (
         parts.next().map(str::parse::<u32>),
@@ -118,10 +166,14 @@ fn parse_one(bytes: &[u8]) -> Option<(ParsedInput, usize)> {
         parts.next().map(str::parse::<u16>),
         parts.next().map(str::parse::<u16>),
     ) else {
-        return Some((ParsedInput::NotMouse, consumed));
+        return ParseOneResult::Complete(ParsedInput::NotMouse, consumed);
     };
-    let Some(col) = col_raw.checked_sub(1) else { return Some((ParsedInput::NotMouse, consumed)) };
-    let Some(row) = row_raw.checked_sub(1) else { return Some((ParsedInput::NotMouse, consumed)) };
+    let Some(col) = col_raw.checked_sub(1) else {
+        return ParseOneResult::Complete(ParsedInput::NotMouse, consumed);
+    };
+    let Some(row) = row_raw.checked_sub(1) else {
+        return ParseOneResult::Complete(ParsedInput::NotMouse, consumed);
+    };
     // A trailing `;` before the final M/m is optional and carries no
     // extra field (see module doc reference's `\x1B[<0;20;10;M` test
     // vector) -- `split` turns it into one trailing empty string, which
@@ -132,7 +184,7 @@ fn parse_one(bytes: &[u8]) -> Option<(ParsedInput, usize)> {
     // literally if that's ever genuinely desired, rather than being
     // silently eaten as if it were valid mouse protocol).
     if parts.next().is_some_and(|extra| !extra.is_empty()) {
-        return Some((ParsedInput::NotMouse, consumed));
+        return ParseOneResult::Complete(ParsedInput::NotMouse, consumed);
     }
 
     // Bit layout (low to high): button lo, button hi, shift, alt,
@@ -158,68 +210,78 @@ fn parse_one(bytes: &[u8]) -> Option<(ParsedInput, usize)> {
     } else {
         ParsedInput::Mouse(MouseEvent::Down { col, row })
     };
-    Some((parsed, consumed))
+    ParseOneResult::Complete(parsed, consumed)
 }
 
 /// Parse one input chunk against the SGR mouse escape-sequence format
 /// (`ESC [ < Cb ; Cx ; Cy M` for press/drag, `...m` for release).
-/// Requires the *entire* `bytes` to be exactly one sequence -- see
-/// [`parse_all`] for the bundled-multiple-sequences case, which is what
-/// `run`'s event loop actually needs to use.
+/// Requires the *entire* `bytes` to be exactly one complete sequence --
+/// see [`parse_all`] for the bundled/split-sequence case, which is what
+/// `run`'s event loop actually needs to use. An `Incomplete` result
+/// (from `parse_one`) is treated the same as `NoMatch` here: `parse`
+/// has no way to ask for more bytes, so it can only report "not a
+/// (complete) sequence" either way.
 pub fn parse(bytes: &[u8]) -> ParsedInput {
     match parse_one(bytes) {
-        Some((parsed, consumed)) if consumed == bytes.len() => parsed,
+        ParseOneResult::Complete(parsed, consumed) if consumed == bytes.len() => parsed,
         _ => ParsedInput::NotMouse,
     }
 }
 
 /// Parse every complete, well-formed SGR mouse sequence at the front of
-/// `bytes`, returning one [`MouseEvent`] per *actionable* sequence found
-/// (a recognized-but-unhandled button, e.g. middle/right-click, is
-/// consumed and silently dropped here, same as [`ParsedInput::Ignored`]
-/// always was -- it never reaches the returned `Vec`), plus whatever raw
-/// bytes are left over once no more sequences remain at the front. That
-/// leftover tail should be handled exactly like plain [`parse`]'s
-/// `NotMouse` case always was -- passed on to the chord/keyboard parser
-/// -- since it's either genuinely not mouse input, or a malformed
-/// mouse-shaped sequence this module doesn't try to partially recover
-/// from (matches `parse`'s existing behavior for a lone malformed
-/// sequence: the whole thing falls through unconsumed, not just the bad
-/// part).
+/// `bytes`, returning:
+/// - one [`MouseEvent`] per *actionable* sequence found (a
+///   recognized-but-unhandled button, e.g. middle/right-click, is
+///   consumed and silently dropped, same as [`ParsedInput::Ignored`]
+///   always was -- it never reaches the returned `Vec`),
+/// - `incomplete`: a `\x1b[<`-prefixed fragment at the very end of
+///   `bytes` with no terminator yet found -- the caller MUST prepend
+///   this to whatever it reads next, not discard it or route it
+///   elsewhere (see module doc "Split sequences"),
+/// - `leftover`: whatever's left once no sequence (complete or
+///   incomplete) matches at the current position -- genuinely not mouse
+///   input, safe to hand to the keyboard/chord parser right now.
 ///
-/// See module doc "Bundled sequences" for why this function exists at
-/// all: at real scroll-wheel/trackpad speeds, more than one SGR
-/// sequence routinely lands in a single `stdin.read()` before the event
-/// loop gets a chance to process any of them. `parse` alone can't
-/// handle that -- it requires the whole buffer to be exactly one
-/// sequence, so a bundle of two or three ticks fails to match at all
-/// and used to fall through to keyboard parsing, typing the raw escape
-/// bytes into the focused pane as literal garbage.
-pub fn parse_all(bytes: &[u8]) -> (Vec<MouseEvent>, &[u8]) {
+/// See module doc "Bundled sequences" and "Split sequences" for the two
+/// distinct real bugs this function exists to fix: multiple complete
+/// sequences landing in one `read()` (bundling), and a fixed-size read
+/// buffer cutting a single sequence in half across two reads (splitting).
+/// `parse` alone handles neither -- it requires the whole buffer to be
+/// exactly one complete sequence, so both cases used to fall through to
+/// keyboard parsing and type raw escape bytes into the focused pane as
+/// literal garbage.
+pub fn parse_all(bytes: &[u8]) -> (Vec<MouseEvent>, &[u8], &[u8]) {
     let mut events = Vec::new();
     let mut rest = bytes;
     loop {
         match parse_one(rest) {
-            Some((ParsedInput::Mouse(event), consumed)) => {
+            ParseOneResult::Complete(ParsedInput::Mouse(event), consumed) => {
                 events.push(event);
                 rest = &rest[consumed..];
             }
-            Some((ParsedInput::Ignored, consumed)) => {
+            ParseOneResult::Complete(ParsedInput::Ignored, consumed) => {
                 // Recognized mouse input dimux has no use for (e.g.
                 // middle/right-click) -- consumed so it can't leak
                 // through as keyboard input, but not collected.
                 rest = &rest[consumed..];
             }
-            Some((ParsedInput::NotMouse, _)) | None => {
+            ParseOneResult::Complete(ParsedInput::NotMouse, _) | ParseOneResult::NoMatch => {
                 // Either not SGR-shaped at all, or a recognized shape
                 // with malformed content -- stop here and leave it
                 // (plus anything after it) for the fallback path, same
                 // as a single malformed sequence always has.
-                break;
+                return (events, &[], rest);
+            }
+            ParseOneResult::Incomplete => {
+                // A prefix matched but the terminator hasn't arrived
+                // yet -- this is (the start of) a real sequence split
+                // across reads, NOT keyboard input. Hand it back
+                // separately so the caller carries it forward instead
+                // of routing it to the keyboard parser.
+                return (events, rest, &[]);
             }
         }
     }
-    (events, rest)
 }
 
 #[cfg(test)]
@@ -307,7 +369,7 @@ mod tests {
         // ticks arriving in ONE read() used to fail `parse`'s
         // whole-buffer-is-one-sequence contract entirely and leak into
         // the pane as literal garbage. `parse_all` must peel all three.
-        let (events, leftover) = parse_all(b"\x1b[<64;5;5M\x1b[<64;5;5M\x1b[<64;5;6M");
+        let (events, incomplete, leftover) = parse_all(b"\x1b[<64;5;5M\x1b[<64;5;5M\x1b[<64;5;6M");
         assert_eq!(
             events,
             vec![
@@ -316,13 +378,15 @@ mod tests {
                 MouseEvent::ScrollUp { col: 4, row: 5 },
             ]
         );
+        assert!(incomplete.is_empty());
         assert!(leftover.is_empty());
     }
 
     #[test]
     fn parse_all_handles_a_single_sequence() {
-        let (events, leftover) = parse_all(b"\x1b[<0;20;10M");
+        let (events, incomplete, leftover) = parse_all(b"\x1b[<0;20;10M");
         assert_eq!(events, vec![MouseEvent::Down { col: 19, row: 9 }]);
+        assert!(incomplete.is_empty());
         assert!(leftover.is_empty());
     }
 
@@ -331,7 +395,7 @@ mod tests {
         // A middle-click (button 1, `Ignored`) bundled between two
         // scrolls must be consumed (not leaked as keystrokes) but not
         // surface as a MouseEvent.
-        let (events, leftover) = parse_all(b"\x1b[<64;5;5M\x1b[<1;5;5M\x1b[<65;5;5M");
+        let (events, incomplete, leftover) = parse_all(b"\x1b[<64;5;5M\x1b[<1;5;5M\x1b[<65;5;5M");
         assert_eq!(
             events,
             vec![
@@ -339,6 +403,7 @@ mod tests {
                 MouseEvent::ScrollDown { col: 4, row: 4 },
             ]
         );
+        assert!(incomplete.is_empty());
         assert!(leftover.is_empty());
     }
 
@@ -347,15 +412,55 @@ mod tests {
         // A scroll tick followed by keyboard bytes in the same read():
         // the scroll is handled, the keyboard tail is returned as
         // leftover for the chord/keyboard parser.
-        let (events, leftover) = parse_all(b"\x1b[<64;5;5Mhello");
+        let (events, incomplete, leftover) = parse_all(b"\x1b[<64;5;5Mhello");
         assert_eq!(events, vec![MouseEvent::ScrollUp { col: 4, row: 4 }]);
+        assert!(incomplete.is_empty());
         assert_eq!(leftover, b"hello");
     }
 
     #[test]
     fn parse_all_of_pure_non_mouse_input_collects_nothing_and_returns_it_all() {
-        let (events, leftover) = parse_all(b"hello");
+        let (events, incomplete, leftover) = parse_all(b"hello");
         assert!(events.is_empty());
+        assert!(incomplete.is_empty());
         assert_eq!(leftover, b"hello");
+    }
+
+    // -- parse_all: split-sequence handling (see module doc "Split
+    //    sequences") -----------------------------------------------------
+
+    #[test]
+    fn parse_all_reports_a_trailing_incomplete_sequence_separately_from_leftover() {
+        // Regression test for the second reported bug: a real capture of
+        // dimux's stdin during a sustained scroll showed a fixed-size
+        // read() boundary cutting one SGR sequence in half. `parse_all`
+        // must recognize the cut-off tail as "possibly a real sequence,
+        // needs more bytes" (`incomplete`), NOT as "definitely not mouse
+        // input" (`leftover`) -- collapsing the two is exactly what let
+        // the orphaned fragment get typed into the pane as garbage.
+        let (events, incomplete, leftover) = parse_all(b"\x1b[<65;74");
+        assert!(events.is_empty());
+        assert_eq!(incomplete, b"\x1b[<65;74");
+        assert!(leftover.is_empty());
+    }
+
+    #[test]
+    fn parse_all_handles_a_complete_sequence_followed_by_an_incomplete_one() {
+        // The exact real-world shape: one complete tick, then the start
+        // of a second tick whose terminator hasn't arrived in this read.
+        let (events, incomplete, leftover) = parse_all(b"\x1b[<64;5;5M\x1b[<65;74");
+        assert_eq!(events, vec![MouseEvent::ScrollUp { col: 4, row: 4 }]);
+        assert_eq!(incomplete, b"\x1b[<65;74");
+        assert!(leftover.is_empty());
+    }
+
+    #[test]
+    fn parse_all_incomplete_prefix_alone_is_not_leftover() {
+        // Just the ESC [ < prefix with nothing after it yet -- still
+        // "might be a real sequence", not "definitely not mouse input".
+        let (events, incomplete, leftover) = parse_all(b"\x1b[<");
+        assert!(events.is_empty());
+        assert_eq!(incomplete, b"\x1b[<");
+        assert!(leftover.is_empty());
     }
 }
