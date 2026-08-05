@@ -241,17 +241,41 @@ struct AttachMenu {
     /// server-pane vs. re-attaching the same one is an informed choice,
     /// not a guess from memory.
     previously_bound: Option<ServerPaneId>,
+    /// `Some` while a group's "+ spawn new in <dir>" row has its inline
+    /// input field open. See `SpawnInGroupState`'s own doc comment.
+    /// Mutually exclusive with `rename`/`pending_delete` — opening this
+    /// clears both, same as `rename` already does.
+    spawn_in_group: Option<SpawnInGroupState>,
 }
 
 /// Live edit state for the attach menu's inline rename field (`r` on a
 /// row). `text`/`cursor` are the field's edit buffer and cursor
 /// position — a byte offset into `text`, always kept on a UTF-8 char
-/// boundary by every editing operation in `apply_rename_edit`. `error`
+/// boundary by every editing operation in `apply_text_edit`. `error`
 /// holds the daemon's last rejection message (e.g. a name collision) to
 /// render under the field; cleared on the next edit so a stale error
 /// doesn't linger once the user starts fixing it.
 struct RenameState {
     index: usize,
+    text: String,
+    cursor: usize,
+    error: Option<String>,
+}
+
+/// Live edit state for a group's "+ spawn new in <dir>" row, opened by
+/// typing any printable character while that row is selected (see
+/// `App::handle_attach_menu_input`'s browse-mode dispatch — this is not
+/// reached via `AttachMenuAction`/`parse_attach_menu_input` like
+/// `StartRename` is, since *any* printable byte opens it, not one
+/// dedicated key). `group_server_index` is the same first-member index
+/// `AttachMenuRow::SpawnNewInGroup` carries, from which the group's cwd
+/// key (`servers[group_server_index].0`) is looked up when the field is
+/// confirmed. `text`/`cursor`/`error` mirror `RenameState` exactly and
+/// share its editing logic (`apply_text_edit`) — this field only differs
+/// in what confirming it *does* (spawn+bind+send vs. rename), not in how
+/// it's edited.
+struct SpawnInGroupState {
+    group_server_index: usize,
     text: String,
     cursor: usize,
     error: Option<String>,
@@ -546,6 +570,7 @@ impl App {
                 pending_delete: None,
                 rename: None,
                 previously_bound,
+                spawn_in_group: None,
             });
         }
         Ok(())
@@ -580,6 +605,33 @@ impl App {
             return Ok(());
         }
 
+        let is_spawning_in_group =
+            self.attach_menu.as_ref().is_some_and(|m| m.spawn_in_group.is_some());
+        if is_spawning_in_group {
+            match bytes {
+                // Plain Enter: spawn, bind into the just-detached
+                // client-pane, then send the typed text. Shift+Enter
+                // (the `\x1b_Ds\x1b\\` chord -- see `keys.rs` module
+                // doc's chord table): spawn and send, but leave it
+                // unbound so it doesn't disturb the current pane.
+                b"\r" | b"\n" => self.confirm_spawn_in_group(true, write_half, reader).await?,
+                keys::SHIFT_ENTER_CHORD => self.confirm_spawn_in_group(false, write_half, reader).await?,
+                b"\x1b" => {
+                    if let Some(menu) = &mut self.attach_menu {
+                        menu.spawn_in_group = None;
+                    }
+                }
+                _ => {
+                    if let Some(menu) = &mut self.attach_menu
+                        && let Some(spawn) = &mut menu.spawn_in_group
+                    {
+                        apply_spawn_in_group_edit(spawn, bytes);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         let has_pending_delete =
             self.attach_menu.as_ref().is_some_and(|m| m.pending_delete.is_some());
         if has_pending_delete {
@@ -603,6 +655,44 @@ impl App {
             }
             return Ok(());
         }
+
+        // A group's own "+ spawn new in <dir>" row gets its own
+        // dispatch, distinct from every other row's: only Up/Down
+        // (arrows or `j`/`k`) still navigate away from it; Enter/Esc
+        // keep their usual meaning (spawn now with no typed command /
+        // close the menu); anything else -- including `x` and `r`,
+        // which are dedicated actions on a *server* row but have
+        // nothing to act on here -- is treated as the first character
+        // of a command to type into the new pane, opening this row's
+        // inline field with it as the starting text. No separate "enter
+        // input mode" key, per this field's whole point: a text box
+        // that happens to be a menu row.
+        if let Some(AttachMenuRow::SpawnNewInGroup(server_index)) = self.selected_attach_menu_row() {
+            match bytes {
+                b"\x1b[A" | b"k" => self.move_attach_menu_selection(false),
+                b"\x1b[B" | b"j" => self.move_attach_menu_selection(true),
+                b"\r" | b"\n" => self.confirm_attach_menu(write_half, reader).await?,
+                b"\x1b" => self.attach_menu = None,
+                _ if bytes.first() == Some(&0x1b) => {
+                    // An unrecognized escape sequence -- ignore rather
+                    // than open the field with garbage bytes as content.
+                }
+                _ => {
+                    if let Ok(text) = std::str::from_utf8(bytes)
+                        && let Some(menu) = &mut self.attach_menu
+                    {
+                        menu.spawn_in_group = Some(SpawnInGroupState {
+                            group_server_index: server_index,
+                            text: text.to_string(),
+                            cursor: text.len(),
+                            error: None,
+                        });
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         self.dispatch_attach_menu_action(parse_attach_menu_input(bytes), write_half, reader).await
     }
 
@@ -822,6 +912,54 @@ impl App {
         };
         let req = Request::ClientBind { workspace: self.workspace.id.to_string(), pane, target };
         let _ = self.request(write_half, reader, req).await?;
+        Ok(())
+    }
+
+    /// Confirm a group's inline spawn field: spawn a new default-shell
+    /// server-pane in that group's directory, then (if `bind`) bind it
+    /// into the just-detached client-pane, then (if the field's text is
+    /// non-empty) send that text into the new pane followed by Enter, as
+    /// if typed live. `bind = true` is plain Enter; `bind = false` is
+    /// Shift+Enter, which spawns and sends but deliberately leaves the
+    /// pane unbound -- per the design intent that this row not force a
+    /// bind just to run a one-off command in that directory. Closes the
+    /// attach menu on success either way, same as `confirm_attach_menu`.
+    async fn confirm_spawn_in_group(
+        &mut self,
+        bind: bool,
+        write_half: &mut OwnedWriteHalf,
+        reader: &mut FrameReader,
+    ) -> anyhow::Result<()> {
+        let Some(menu) = &self.attach_menu else { return Ok(()) };
+        let Some(spawn) = &menu.spawn_in_group else { return Ok(()) };
+        let cwd = menu.servers[spawn.group_server_index].0.clone();
+        let text = spawn.text.clone();
+
+        let server_pane = match self
+            .request(write_half, reader, Request::ServerSpawn { name: None, cmd: None, cwd: Some(cwd) })
+            .await?
+        {
+            Response::ServerPane(info) => info.id,
+            _ => return Ok(()),
+        };
+
+        if bind
+            && let Some(pane) = self.focused
+        {
+            let req = Request::ClientBind {
+                workspace: self.workspace.id.to_string(),
+                pane,
+                target: server_pane.to_string(),
+            };
+            let _ = self.request(write_half, reader, req).await?;
+        }
+
+        if !text.is_empty() {
+            let req = Request::ServerSend { target: server_pane.to_string(), text, enter: true };
+            let _ = self.request(write_half, reader, req).await?;
+        }
+
+        self.attach_menu = None;
         Ok(())
     }
 
@@ -1060,30 +1198,31 @@ enum AttachMenuRow {
     Server(usize),
     /// A group's own "+ spawn new here" row, right after its `Server`
     /// rows -- carries the same first-member index as that group's
-    /// `GroupHeader`, from which its cwd key can be looked up. Never
-    /// emitted for the synthetic `"Unknown"` bucket (see
-    /// `visible_attach_menu_rows`): it aggregates panes with no
-    /// resolvable directory, so there's no real cwd to spawn a new pane
-    /// into.
+    /// `GroupHeader`, from which its cwd key can be looked up. Omitted
+    /// while that group is collapsed (see `visible_attach_menu_rows`) --
+    /// a collapsed group hides all of its detail, this row included --
+    /// and never emitted for the synthetic `"Unknown"` bucket at all: it
+    /// aggregates panes with no resolvable directory, so there's no real
+    /// cwd to spawn a new pane into.
     SpawnNewInGroup(usize),
     SpawnNew,
 }
 
 /// Build the attach menu's current row list: a `GroupHeader` before each
 /// distinct cwd group's first member (matching `servers`' existing
-/// group-sorted order), that group's `Server` rows only if `collapsed`
-/// does not contain its key, then that group's own `SpawnNewInGroup` row
-/// (skipped for the synthetic `"Unknown"` bucket -- see
-/// `AttachMenuRow::SpawnNewInGroup`'s doc comment), then a trailing
-/// `SpawnNew`. A collapsed group still shows its `SpawnNewInGroup` row
-/// (right after the header, since there are no `Server` rows to follow)
-/// -- collapsing hides *detail*, not the ability to quickly spawn into
-/// that directory. Grouping itself stays `group_servers_by_cwd`'s job;
-/// this only decides which of those already-grouped rows are currently
-/// *visible* for selection/rendering. Takes the raw `servers` slice
-/// rather than a whole `AttachMenu` so a caller building the very first
-/// `AttachMenu` (no instance to borrow from yet) can still compute an
-/// initial `selected` from it — see `App::detach_and_open_menu`.
+/// group-sorted order), that group's `Server` rows and its own
+/// `SpawnNewInGroup` row only if `collapsed` does not contain its key
+/// (skipped entirely for the synthetic `"Unknown"` bucket regardless --
+/// see `AttachMenuRow::SpawnNewInGroup`'s doc comment), then a trailing
+/// `SpawnNew`. A collapsed group hides everything but its header --
+/// `SpawnNewInGroup` included, so collapsing a group fully tucks it away
+/// rather than leaving one row still poking out. Grouping itself stays
+/// `group_servers_by_cwd`'s job; this only decides which of those
+/// already-grouped rows are currently *visible* for selection/rendering.
+/// Takes the raw `servers` slice rather than a whole `AttachMenu` so a
+/// caller building the very first `AttachMenu` (no instance to borrow
+/// from yet) can still compute an initial `selected` from it — see
+/// `App::detach_and_open_menu`.
 fn visible_attach_menu_rows(
     servers: &[(String, ServerPaneInfo)],
     collapsed: &HashSet<String>,
@@ -1097,6 +1236,7 @@ fn visible_attach_menu_rows(
         if last_group != Some(group.as_str()) {
             if let Some(prev_group) = last_group
                 && prev_group != UNKNOWN
+                && !group_is_collapsed
             {
                 rows.push(AttachMenuRow::SpawnNewInGroup(group_start));
             }
@@ -1111,6 +1251,7 @@ fn visible_attach_menu_rows(
     }
     if let Some(last) = last_group
         && last != UNKNOWN
+        && !group_is_collapsed
     {
         rows.push(AttachMenuRow::SpawnNewInGroup(group_start));
     }
@@ -1185,67 +1326,71 @@ fn parse_attach_menu_input(bytes: &[u8]) -> AttachMenuAction {
     }
 }
 
-/// Apply one raw input chunk to a live rename field's edit buffer.
-/// Byte-level matching in the same minimal style as
-/// `parse_attach_menu_input`/`keys::parse` rather than pulling in a
-/// text-input crate — this field only ever needs insert/delete/cursor
-/// movement, not a general-purpose editor. Every branch that mutates
-/// `text`/`cursor` also clears `state.error`, so a fresh edit dismisses
-/// the last rejection message rather than leaving stale text stuck under
-/// the field. Enter/Esc are handled by the caller (`App::
-/// handle_attach_menu_input`'s rename branch), not here, since they
-/// trigger network requests or close rename mode entirely -- concerns
-/// outside this pure buffer-editing function.
-fn apply_rename_edit(state: &mut RenameState, bytes: &[u8]) {
+/// Apply one raw input chunk to a live inline-field edit buffer. Shared
+/// by the rename field (`r` on a server row) and the per-group spawn
+/// field ("+ spawn new in <dir>") -- both are a plain `(text, cursor,
+/// error)` triple edited identically, so this operates on those three
+/// pieces directly rather than on `RenameState`/`SpawnInGroupState`
+/// themselves, letting both wrap it with a one-line adapter instead of
+/// duplicating the whole match. Byte-level matching in the same minimal
+/// style as `parse_attach_menu_input`/`keys::parse` rather than pulling
+/// in a text-input crate — these fields only ever need insert/delete/
+/// cursor movement, not a general-purpose editor. Every branch that
+/// mutates `text`/`cursor` also clears `*error`, so a fresh edit
+/// dismisses the last rejection message rather than leaving stale text
+/// stuck under the field. Enter/Esc are handled by each caller, not
+/// here, since they trigger network requests or close the field
+/// entirely -- concerns outside this pure buffer-editing function.
+fn apply_text_edit(text: &mut String, cursor: &mut usize, error: &mut Option<String>, bytes: &[u8]) {
     match bytes {
         b"\x7f" | b"\x08" => {
-            if state.cursor > 0 {
-                let mut chars: Vec<char> = state.text.chars().collect();
-                let char_idx = state.text[..state.cursor].chars().count() - 1;
+            if *cursor > 0 {
+                let mut chars: Vec<char> = text.chars().collect();
+                let char_idx = text[..*cursor].chars().count() - 1;
                 chars.remove(char_idx);
-                state.text = chars.into_iter().collect();
-                state.cursor = state.text[..].chars().take(char_idx).map(|c| c.len_utf8()).sum();
+                *text = chars.into_iter().collect();
+                *cursor = text[..].chars().take(char_idx).map(|c| c.len_utf8()).sum();
             } else {
                 return;
             }
         }
         b"\x1b[3~" => {
-            let char_idx = state.text[..state.cursor].chars().count();
-            let mut chars: Vec<char> = state.text.chars().collect();
+            let char_idx = text[..*cursor].chars().count();
+            let mut chars: Vec<char> = text.chars().collect();
             if char_idx < chars.len() {
                 chars.remove(char_idx);
-                state.text = chars.into_iter().collect();
+                *text = chars.into_iter().collect();
             } else {
                 return;
             }
         }
         b"\x1b[D" => {
-            if state.cursor > 0 {
-                let char_idx = state.text[..state.cursor].chars().count() - 1;
-                state.cursor = state.text.chars().take(char_idx).map(|c| c.len_utf8()).sum();
+            if *cursor > 0 {
+                let char_idx = text[..*cursor].chars().count() - 1;
+                *cursor = text.chars().take(char_idx).map(|c| c.len_utf8()).sum();
             } else {
                 return;
             }
         }
         b"\x1b[C" => {
-            if state.cursor < state.text.len() {
-                let char_idx = state.text[..state.cursor].chars().count() + 1;
-                state.cursor = state.text.chars().take(char_idx).map(|c| c.len_utf8()).sum();
+            if *cursor < text.len() {
+                let char_idx = text[..*cursor].chars().count() + 1;
+                *cursor = text.chars().take(char_idx).map(|c| c.len_utf8()).sum();
             } else {
                 return;
             }
         }
         b"\x1b[H" | b"\x1b[1~" => {
-            if state.cursor == 0 {
+            if *cursor == 0 {
                 return;
             }
-            state.cursor = 0;
+            *cursor = 0;
         }
         b"\x1b[F" | b"\x1b[4~" => {
-            if state.cursor == state.text.len() {
+            if *cursor == text.len() {
                 return;
             }
-            state.cursor = state.text.len();
+            *cursor = text.len();
         }
         _ if bytes.first() == Some(&0x1b) => {
             // Any other escape sequence this field doesn't recognize --
@@ -1255,14 +1400,22 @@ fn apply_rename_edit(state: &mut RenameState, bytes: &[u8]) {
             return;
         }
         _ => match std::str::from_utf8(bytes) {
-            Ok(text) => {
-                state.text.insert_str(state.cursor, text);
-                state.cursor += text.len();
+            Ok(inserted) => {
+                text.insert_str(*cursor, inserted);
+                *cursor += inserted.len();
             }
             Err(_) => return,
         },
     }
-    state.error = None;
+    *error = None;
+}
+
+fn apply_rename_edit(state: &mut RenameState, bytes: &[u8]) {
+    apply_text_edit(&mut state.text, &mut state.cursor, &mut state.error, bytes);
+}
+
+fn apply_spawn_in_group_edit(state: &mut SpawnInGroupState, bytes: &[u8]) {
+    apply_text_edit(&mut state.text, &mut state.cursor, &mut state.error, bytes);
 }
 
 /// RAII guard ensuring the terminal is restored (raw mode disabled,
@@ -1748,7 +1901,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_attach_menu_rows_omits_server_rows_of_a_collapsed_group_but_keeps_its_spawn_row() {
+    fn visible_attach_menu_rows_omits_all_of_a_collapsed_groups_rows_except_its_header() {
         let servers = vec![
             ("/a".to_string(), server_with_cwd("x", Some("/a"))),
             ("/a".to_string(), server_with_cwd("y", Some("/a"))),
@@ -1757,14 +1910,14 @@ mod tests {
         let mut collapsed = HashSet::new();
         collapsed.insert("/a".to_string());
         let rows = visible_attach_menu_rows(&servers, &collapsed);
-        // Both of "/a"'s Server rows disappear; its header and its own
-        // "spawn new here" row stay so the group can still be
-        // re-expanded, or spawned into without expanding it first.
+        // Both of "/a"'s Server rows AND its own "spawn new here" row
+        // disappear -- only its header stays, so the group can still be
+        // found and re-expanded. The uncollapsed "/b" group is
+        // unaffected, spawn row included.
         assert_eq!(
             rows,
             vec![
                 AttachMenuRow::GroupHeader(0),
-                AttachMenuRow::SpawnNewInGroup(0),
                 AttachMenuRow::GroupHeader(2),
                 AttachMenuRow::Server(2),
                 AttachMenuRow::SpawnNewInGroup(2),
@@ -1797,7 +1950,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None, previously_bound: None }),
+            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
@@ -1812,23 +1965,23 @@ mod tests {
     fn toggle_group_collapse_clamps_selection_into_the_shrunk_row_list() {
         let servers = vec![("/a".to_string(), server_with_cwd("x", Some("/a")))];
         // Rows before collapse: 0 = header, 1 = server, 2 = "spawn new
-        // here", 3 = global spawn-new. Collapsing "/a" removes only its
-        // Server row (its own spawn-here row stays visible even
-        // collapsed -- see `visible_attach_menu_rows`), shrinking the
-        // list to 3 rows (0..=2). Selecting the last row beforehand must
-        // not leave `selected` pointing past that shrunk list.
+        // here", 3 = global spawn-new. Collapsing "/a" hides everything
+        // but its header (server row AND its own spawn-here row --
+        // see `visible_attach_menu_rows`), shrinking the list to 2 rows
+        // (0..=1). Selecting the last row beforehand must not leave
+        // `selected` pointing past that shrunk list.
         let mut app = App {
             workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 3, pending_delete: None, rename: None, previously_bound: None }),
+            attach_menu: Some(AttachMenu { servers, selected: 3, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
         };
         app.toggle_group_collapse(0);
-        assert_eq!(app.attach_menu.unwrap().selected, 2, "should clamp onto the new last row (global spawn-new)");
+        assert_eq!(app.attach_menu.unwrap().selected, 1, "should clamp onto the new last row (global spawn-new)");
     }
 
     #[test]
@@ -1842,7 +1995,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 3, pending_delete: None, rename: None, previously_bound: None }),
+            attach_menu: Some(AttachMenu { servers, selected: 3, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
@@ -1862,7 +2015,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 1, pending_delete: None, rename: None, previously_bound: None }),
+            attach_menu: Some(AttachMenu { servers, selected: 1, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
@@ -1879,7 +2032,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None, previously_bound: None }),
+            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
@@ -1904,6 +2057,7 @@ mod tests {
                 pending_delete: None,
                 rename: None,
                 previously_bound: None,
+                spawn_in_group: None,
             }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
@@ -2002,7 +2156,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 1, pending_delete: None, rename: None, previously_bound: None }),
+            attach_menu: Some(AttachMenu { servers, selected: 1, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
@@ -2022,7 +2176,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None, previously_bound: None }),
+            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
@@ -2047,6 +2201,7 @@ mod tests {
                 pending_delete: None,
                 rename: None,
                 previously_bound: None,
+                spawn_in_group: None,
             }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
@@ -2122,5 +2277,243 @@ mod tests {
         assert_eq!(received, 8, "expected all 8 frames to survive being raced against a faster branch");
         writer.await.unwrap();
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Connect a fresh `App` (via `bootstrap`) to a real, freshly started
+    /// daemon at workspace `"1"`, for the attach-menu-against-a-live-
+    /// daemon tests below. Returns the `App` plus the split connection
+    /// halves every `App` method needs.
+    async fn app_against_real_daemon() -> (App, OwnedWriteHalf, FrameReader) {
+        // Short filename -- `dimux-test-<full-uuid>.sock` under a long
+        // macOS temp dir can exceed `SUN_LEN`; this stays well under it.
+        static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let socket_path = std::env::temp_dir().join(format!("dmx-am-{}-{id}.sock", std::process::id()));
+        crate::daemon::run(socket_path.clone()).await.expect("daemon should bind and start");
+        let stream = tokio::net::UnixStream::connect(&socket_path).await.expect("connect to test daemon");
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = FrameReader::spawn(read_half);
+        let app = App::bootstrap(&mut write_half, &mut reader, "1").await.expect("bootstrap workspace 1");
+        (app, write_half, reader)
+    }
+
+    /// Open the attach menu directly (bypassing `detach_and_open_menu`,
+    /// which requires a focused client-pane to detach) with one
+    /// already-spawned server-pane grouped under `cwd`, selection
+    /// starting on that group's `SpawnNewInGroup` row -- row 2: 0 =
+    /// header, 1 = `existing`'s own `Server` row, 2 = spawn-in-group,
+    /// since the group has exactly one member and starts uncollapsed.
+    fn open_menu_with_one_group(app: &mut App, cwd: &str, existing: ServerPaneInfo) {
+        app.attach_menu = Some(AttachMenu {
+            servers: vec![(cwd.to_string(), existing)],
+            selected: 2,
+            pending_delete: None,
+            rename: None,
+            previously_bound: None,
+            spawn_in_group: None,
+        });
+    }
+
+    /// Plain Enter on a group's spawn field: spawns a new server-pane in
+    /// that cwd, binds it into the focused client-pane, and sends the
+    /// typed command. Exercises `confirm_spawn_in_group(bind: true, ..)`
+    /// end to end against a real daemon.
+    #[tokio::test]
+    async fn spawn_in_group_enter_spawns_binds_and_sends_typed_text() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+
+        // A client-pane to bind into -- `focused` is `None` on an empty
+        // workspace otherwise, and `confirm_spawn_in_group`'s bind path
+        // is a no-op with nothing focused.
+        let Response::ClientPaneCreated { pane, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientSpawn { workspace: "1".to_string(), split_of: None, dir: None, bind: None },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneCreated");
+        };
+        app.focused = Some(pane);
+
+        let Response::ServerPane(existing) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        let existing_id = existing.id;
+        open_menu_with_one_group(&mut app, "/tmp", existing);
+
+        app.handle_attach_menu_input(b"echo hi", &mut write_half, &mut reader).await.unwrap();
+        assert_eq!(
+            app.attach_menu.as_ref().unwrap().spawn_in_group.as_ref().unwrap().text,
+            "echo hi",
+            "typing while the spawn-in-group row is selected should open its field with that text"
+        );
+
+        app.handle_attach_menu_input(b"\r", &mut write_half, &mut reader).await.unwrap();
+        assert!(app.attach_menu.is_none(), "confirming should close the menu");
+
+        let Response::ClientPaneList { panes, .. } = app
+            .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneList");
+        };
+        let bound_pane = panes.iter().find(|p| p.id == pane).expect("pane should still exist");
+        let new_server_pane = bound_pane.bound.expect("Enter should have bound the newly spawned pane");
+        assert_ne!(new_server_pane, existing_id, "should bind the NEW pane, not the pre-existing one");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let Response::ServerReadOutput { text } = app
+                .request(
+                    &mut write_half,
+                    &mut reader,
+                    Request::ServerRead { target: new_server_pane.to_string() },
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("expected ServerReadOutput");
+            };
+            if text.contains("hi") {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "typed command never echoed back");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Shift+Enter on a group's spawn field: spawns and sends the typed
+    /// command, but leaves the new pane unbound -- the focused
+    /// client-pane's binding must be untouched.
+    #[tokio::test]
+    async fn spawn_in_group_shift_enter_spawns_and_sends_but_leaves_unbound() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+
+        let Response::ClientPaneCreated { pane, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientSpawn { workspace: "1".to_string(), split_of: None, dir: None, bind: None },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneCreated");
+        };
+        app.focused = Some(pane);
+
+        let Response::ServerPane(existing) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        let existing_id = existing.id;
+        open_menu_with_one_group(&mut app, "/tmp", existing);
+
+        app.handle_attach_menu_input(b"echo unbound-test", &mut write_half, &mut reader).await.unwrap();
+        app.handle_attach_menu_input(keys::SHIFT_ENTER_CHORD, &mut write_half, &mut reader).await.unwrap();
+        assert!(app.attach_menu.is_none(), "confirming should close the menu");
+
+        let Response::ClientPaneList { panes, .. } = app
+            .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneList");
+        };
+        let bound_pane = panes.iter().find(|p| p.id == pane).expect("pane should still exist");
+        assert_eq!(bound_pane.bound, None, "Shift+Enter must not bind the new pane into the focused client-pane");
+
+        // The command should still have been sent to *some* new pane --
+        // find it by listing server-panes and reading whichever one
+        // isn't `existing`.
+        let Response::ServerPaneList(server_panes) =
+            app.request(&mut write_half, &mut reader, Request::ServerList).await.unwrap()
+        else {
+            panic!("expected ServerPaneList");
+        };
+        let new_pane = server_panes
+            .iter()
+            .find(|p| p.id != existing_id)
+            .expect("a second server-pane should have been spawned");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let Response::ServerReadOutput { text } = app
+                .request(
+                    &mut write_half,
+                    &mut reader,
+                    Request::ServerRead { target: new_pane.id.to_string() },
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("expected ServerReadOutput");
+            };
+            if text.contains("unbound-test") {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "typed command never echoed back");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Arrow/`j`/`k` navigation off the spawn-in-group row must still
+    /// work as ordinary selection movement, not open the field -- only
+    /// plain printable bytes do that. Routed through the real
+    /// `handle_attach_menu_input` (hence needing a live connection, even
+    /// though this particular path never sends a request) rather than
+    /// calling `move_attach_menu_selection` directly, so this actually
+    /// exercises the dispatch logic that decides nav-vs-open-field.
+    #[tokio::test]
+    async fn spawn_in_group_row_nav_keys_move_selection_without_opening_the_field() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+        let Response::ServerPane(existing) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        // Rows: 0 = "/tmp" header, 1 = existing server, 2 = spawn-in-group.
+        open_menu_with_one_group(&mut app, "/tmp", existing);
+        assert_eq!(app.selected_attach_menu_row(), Some(AttachMenuRow::SpawnNewInGroup(0)));
+
+        app.handle_attach_menu_input(b"j", &mut write_half, &mut reader).await.unwrap();
+        assert!(
+            app.attach_menu.as_ref().unwrap().spawn_in_group.is_none(),
+            "`j` should navigate, not open the spawn field"
+        );
+        assert_eq!(app.selected_attach_menu_row(), Some(AttachMenuRow::SpawnNew), "`j` should move to the next row");
+
+        app.handle_attach_menu_input(b"\x1b[A", &mut write_half, &mut reader).await.unwrap();
+        assert_eq!(
+            app.selected_attach_menu_row(),
+            Some(AttachMenuRow::SpawnNewInGroup(0)),
+            "up-arrow should move back"
+        );
+        assert!(app.attach_menu.as_ref().unwrap().spawn_in_group.is_none());
     }
 }

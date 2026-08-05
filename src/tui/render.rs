@@ -413,7 +413,16 @@ pub(super) fn draw_attach_menu(frame: &mut Frame, menu: &super::AttachMenu, coll
             }
             super::AttachMenuRow::SpawnNewInGroup(server_index) => {
                 let group = &menu.servers[server_index].0;
-                lines.push(spawn_new_in_group_line(group, row_index == menu.selected));
+                let spawning = menu
+                    .spawn_in_group
+                    .as_ref()
+                    .filter(|s| s.group_server_index == server_index);
+                lines.push(spawn_new_in_group_line(group, row_index == menu.selected, spawning));
+                if let Some(spawn) = spawning
+                    && let Some(error) = &spawn.error
+                {
+                    lines.push(Line::styled(format!("    {error}"), Style::new().fg(Color::Red)));
+                }
             }
             super::AttachMenuRow::SpawnNew => {
                 lines.push(spawn_new_line(row_index == menu.selected));
@@ -441,11 +450,21 @@ fn group_header_line(group: &str, collapsed: bool, selected: bool) -> Line<'stat
 
 /// A group's own "+ spawn new here" row, indented like a `Server` row
 /// (matches its visual nesting under the group's header) rather than
-/// the global `spawn_new_line`'s unindented top-level look.
-fn spawn_new_in_group_line(group: &str, selected: bool) -> Line<'static> {
+/// the global `spawn_new_line`'s unindented top-level look. When
+/// `spawning` is `Some` (its inline field is open), shows the field's
+/// live text in brackets instead of the static label -- same visual
+/// convention `attach_menu_line` uses for an active rename.
+fn spawn_new_in_group_line(group: &str, selected: bool, spawning: Option<&super::SpawnInGroupState>) -> Line<'static> {
     let marker = if selected { ">" } else { " " };
-    let text = format!("  {marker} + spawn new in {group}");
-    let style = if selected { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+    let text = match spawning {
+        Some(spawn) => format!("  {marker} + [{}] in {group}", spawn.text),
+        None => format!("  {marker} + spawn new in {group}"),
+    };
+    let style = if selected || spawning.is_some() {
+        Style::new().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::new()
+    };
     Line::styled(text, style)
 }
 
@@ -957,6 +976,7 @@ mod tests {
             pending_delete: None,
             rename: None,
             previously_bound: None,
+        spawn_in_group: None,
         };
         // Wide enough that the popup (85% of frame width, see
         // draw_attach_menu) comfortably fits every column's full width
@@ -988,6 +1008,7 @@ mod tests {
             pending_delete: None,
             rename: None,
             previously_bound: None,
+        spawn_in_group: None,
         };
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1011,6 +1032,7 @@ mod tests {
             pending_delete: None,
             rename: None,
             previously_bound: None,
+        spawn_in_group: None,
         };
         let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1048,6 +1070,7 @@ mod tests {
             pending_delete: None,
             rename: None,
             previously_bound: None,
+        spawn_in_group: None,
         };
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1087,6 +1110,7 @@ mod tests {
             pending_delete: None,
             rename: None,
             previously_bound: None,
+        spawn_in_group: None,
         };
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1125,6 +1149,7 @@ mod tests {
             pending_delete: None,
             rename: None,
             previously_bound: None,
+        spawn_in_group: None,
         };
         let mut collapsed = HashSet::new();
         collapsed.insert("/home/dev/api".to_string());
@@ -1132,12 +1157,15 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw_attach_menu(frame, &menu, &collapsed)).unwrap();
         // The collapsed group's header stays visible (so it can be
-        // re-expanded), but its member row is gone.
+        // re-expanded), but its member row AND its own "spawn new
+        // here" row are both gone.
         assert!(buffer_contains(&terminal, "/home/dev/api"));
         assert!(!buffer_contains(&terminal, "api-shell"));
+        assert!(!buffer_contains(&terminal, "spawn new in /home/dev/api"));
         // The other, uncollapsed group is unaffected.
         assert!(buffer_contains(&terminal, "/home/dev/web"));
         assert!(buffer_contains(&terminal, "web-shell"));
+        assert!(buffer_contains(&terminal, "spawn new in /home/dev/web"));
     }
 
     #[test]
@@ -1158,6 +1186,7 @@ mod tests {
             pending_delete: None,
             rename: None,
             previously_bound: None,
+        spawn_in_group: None,
         };
 
         let backend = TestBackend::new(100, 20);
@@ -1188,6 +1217,7 @@ mod tests {
             pending_delete: Some(0),
             rename: None,
             previously_bound: None,
+        spawn_in_group: None,
         };
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1222,6 +1252,7 @@ mod tests {
             pending_delete: None,
             rename: None,
             previously_bound: Some(detached_from),
+        spawn_in_group: None,
         };
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1247,6 +1278,7 @@ mod tests {
             pending_delete: None,
             rename: None,
             previously_bound: None,
+        spawn_in_group: None,
         };
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1275,6 +1307,7 @@ mod tests {
                 error: Some("name taken".to_string()),
             }),
             previously_bound: None,
+        spawn_in_group: None,
         };
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();

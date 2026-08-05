@@ -53,6 +53,7 @@
 //! | `cmd-j`       | `j`  | `\x1b_Dj\x1b\\`               |
 //! | `cmd-k`       | `k`  | `\x1b_Dk\x1b\\`               |
 //! | `cmd-l`       | `l`  | `\x1b_Dl\x1b\\`               |
+//! | `shift-enter` | `s`  | `\x1b_Ds\x1b\\`               |
 //!
 //! (Named-chord tags are case-sensitive letters, deliberately mirroring
 //! the shift relationship: `cmd-shift-d` uses the uppercase of `cmd-d`'s
@@ -62,6 +63,16 @@
 //! (including a bare `ESC`, plain text, or an unrecognized tag) resolves
 //! to [`Action::PassThrough`], so the caller forwards the original bytes
 //! to the focused server-pane untouched.
+//!
+//! `shift-enter` is the one entry in this table with no [`Chord`]/
+//! [`Action`] variant of its own: plain Enter and Shift+Enter are
+//! otherwise indistinguishable (both just `\r`) without a terminal-level
+//! remap, but nothing in the *main* keymap currently needs to tell them
+//! apart -- only the attach menu's per-group spawn field does (spawn+
+//! bind+send vs. spawn+send-but-leave-unbound). So this chord is
+//! recognized as a raw byte sequence directly by `super::mod`'s
+//! attach-menu input handling, bypassing [`parse`]/[`Action`] entirely,
+//! via the [`SHIFT_ENTER_CHORD`] constant below.
 
 use super::Action;
 
@@ -69,6 +80,10 @@ use super::Action;
 const PREFIX: &[u8] = b"\x1b_D";
 /// String terminator: `ESC \`.
 const TERMINATOR: &[u8] = b"\x1b\\";
+
+/// The `shift-enter` chord's full byte sequence -- see module doc for why
+/// this is a bare constant rather than a [`Chord`]/[`Action`] variant.
+pub const SHIFT_ENTER_CHORD: &[u8] = b"\x1b_Ds\x1b\\";
 
 /// Recognized chord tag, decoded from the byte(s) between [`PREFIX`] and
 /// [`TERMINATOR`]. Kept separate from [`Action`] so the escape-sequence
