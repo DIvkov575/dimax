@@ -53,7 +53,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// See module doc comment "`SplitDir` -> `ratatui::Direction` mapping".
 fn ratatui_direction(dir: SplitDir) -> Direction {
@@ -370,10 +370,14 @@ fn cell_to_span(cell: &Cell) -> Span<'static> {
     Span::styled(cell.text.clone(), style)
 }
 
-/// Overlay for `cmd-shift-z`'s attach menu: lists every server-pane plus a
-/// trailing "spawn new" entry, opened after the focused client-pane has
-/// already been detached from whatever it was previously bound to.
-pub(super) fn draw_attach_menu(frame: &mut Frame, menu: &super::AttachMenu) {
+/// Overlay for `cmd-shift-z`'s attach menu: lists every server-pane
+/// (grouped under selectable per-cwd headers) plus a trailing "spawn
+/// new" entry, opened after the focused client-pane has already been
+/// detached from whatever it was previously bound to. `collapsed` names
+/// which groups (by `group_key`) should have their member rows hidden --
+/// lives on `App`, not `AttachMenu`, so it's threaded in as its own
+/// parameter rather than a field read off `menu`.
+pub(super) fn draw_attach_menu(frame: &mut Frame, menu: &super::AttachMenu, collapsed: &HashSet<String>) {
     // Wider than the previous 60% -- each row now packs four columns
     // (name/process/id/status, see `attach_menu_line`) rather than the
     // original two, and needs more horizontal room to avoid every field
@@ -381,30 +385,54 @@ pub(super) fn draw_attach_menu(frame: &mut Frame, menu: &super::AttachMenu) {
     let area = centered_rect(85, 60, frame.area());
     frame.render_widget(Clear, area);
 
-    let servers = &menu.servers;
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(servers.len() * 2 + 2);
-    let mut last_group: Option<&str> = None;
-    for (i, (group, server)) in servers.iter().enumerate() {
-        if last_group != Some(group.as_str()) {
-            lines.push(Line::styled(group.clone(), Style::new().add_modifier(Modifier::BOLD)));
-            last_group = Some(group.as_str());
-        }
-        let armed = menu.pending_delete == Some(i);
-        let renaming = menu.rename.as_ref().filter(|r| r.index == i);
-        let just_detached = menu.previously_bound == Some(server.id);
-        lines.push(attach_menu_line(server, i == menu.selected, armed, renaming, just_detached));
-        if let Some(rename) = renaming
-            && let Some(error) = &rename.error
-        {
-            lines.push(Line::styled(format!("    {error}"), Style::new().fg(Color::Red)));
+    let rows = super::visible_attach_menu_rows(&menu.servers, collapsed);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len() * 2);
+    for (row_index, row) in rows.iter().enumerate() {
+        match *row {
+            super::AttachMenuRow::GroupHeader(server_index) => {
+                let group = &menu.servers[server_index].0;
+                lines.push(group_header_line(group, collapsed.contains(group), row_index == menu.selected));
+            }
+            super::AttachMenuRow::Server(server_index) => {
+                let (_, server) = &menu.servers[server_index];
+                let armed = menu.pending_delete == Some(server_index);
+                let renaming = menu.rename.as_ref().filter(|r| r.index == server_index);
+                let just_detached = menu.previously_bound == Some(server.id);
+                lines.push(attach_menu_line(
+                    server,
+                    row_index == menu.selected,
+                    armed,
+                    renaming,
+                    just_detached,
+                ));
+                if let Some(rename) = renaming
+                    && let Some(error) = &rename.error
+                {
+                    lines.push(Line::styled(format!("    {error}"), Style::new().fg(Color::Red)));
+                }
+            }
+            super::AttachMenuRow::SpawnNew => {
+                lines.push(spawn_new_line(row_index == menu.selected));
+            }
         }
     }
 
-    let spawn_index = servers.len();
-    lines.push(spawn_new_line(menu.selected == spawn_index));
-
     let block = Block::bordered().title("Attach server-pane");
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// One directory-group header row: `group` (bold, as before headers were
+/// selectable) prefixed with a disclosure marker (`▾` expanded, `▸`
+/// collapsed) so the group's current state is visible without having to
+/// select it first, and reverse-video highlighted when it's the current
+/// selection -- matching how a real server-pane row highlights.
+fn group_header_line(group: &str, collapsed: bool, selected: bool) -> Line<'static> {
+    let marker = if collapsed { "▸" } else { "▾" };
+    let mut style = Style::new().add_modifier(Modifier::BOLD);
+    if selected {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    Line::styled(format!("{marker} {group}"), style)
 }
 
 /// Column widths for the attach menu's server-pane rows: `name | process
@@ -922,7 +950,7 @@ mod tests {
         // what caused this test to flake when the columns were added.
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu)).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new())).unwrap();
         assert!(buffer_contains(&terminal, "editor"));
         assert!(buffer_contains(&terminal, "vim"));
         assert!(buffer_contains(&terminal, "/home/dev/project"));
@@ -949,7 +977,7 @@ mod tests {
         };
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu)).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new())).unwrap();
         assert!(buffer_contains(&terminal, "editor"));
         assert!(buffer_contains(&terminal, "-"));
     }
@@ -972,7 +1000,7 @@ mod tests {
         };
         let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu)).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new())).unwrap();
         assert!(buffer_contains(&terminal, "spawn new"));
     }
 
@@ -1009,11 +1037,89 @@ mod tests {
         };
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu)).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new())).unwrap();
         assert!(buffer_contains(&terminal, "/home/dev/api"));
         assert!(buffer_contains(&terminal, "/home/dev/web"));
         assert!(buffer_contains(&terminal, "api-shell"));
         assert!(buffer_contains(&terminal, "web-shell"));
+    }
+
+    #[test]
+    fn draw_attach_menu_collapsed_group_hides_its_rows_but_keeps_its_header() {
+        let a = ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: Some("api-shell".to_string()),
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+            foreground: Some(ForegroundProcessInfo {
+                process_name: "bash".to_string(),
+                cwd: Some("/home/dev/api".to_string()),
+            }),
+        };
+        let b = ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: Some("web-shell".to_string()),
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+            foreground: Some(ForegroundProcessInfo {
+                process_name: "bash".to_string(),
+                cwd: Some("/home/dev/web".to_string()),
+            }),
+        };
+        let servers =
+            vec![("/home/dev/api".to_string(), a), ("/home/dev/web".to_string(), b)];
+        let menu = super::super::AttachMenu {
+            servers,
+            selected: 0,
+            pending_delete: None,
+            rename: None,
+            previously_bound: None,
+        };
+        let mut collapsed = HashSet::new();
+        collapsed.insert("/home/dev/api".to_string());
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu, &collapsed)).unwrap();
+        // The collapsed group's header stays visible (so it can be
+        // re-expanded), but its member row is gone.
+        assert!(buffer_contains(&terminal, "/home/dev/api"));
+        assert!(!buffer_contains(&terminal, "api-shell"));
+        // The other, uncollapsed group is unaffected.
+        assert!(buffer_contains(&terminal, "/home/dev/web"));
+        assert!(buffer_contains(&terminal, "web-shell"));
+    }
+
+    #[test]
+    fn draw_attach_menu_group_header_disclosure_marker_reflects_collapsed_state() {
+        let a = ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: Some("api-shell".to_string()),
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+            foreground: Some(ForegroundProcessInfo {
+                process_name: "bash".to_string(),
+                cwd: Some("/home/dev/api".to_string()),
+            }),
+        };
+        let menu = super::super::AttachMenu {
+            servers: vec![("/home/dev/api".to_string(), a)],
+            selected: 0,
+            pending_delete: None,
+            rename: None,
+            previously_bound: None,
+        };
+
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new())).unwrap();
+        assert!(buffer_contains(&terminal, "▾"), "expanded group should show the expanded marker");
+
+        let mut collapsed = HashSet::new();
+        collapsed.insert("/home/dev/api".to_string());
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu, &collapsed)).unwrap();
+        assert!(buffer_contains(&terminal, "▸"), "collapsed group should show the collapsed marker");
     }
 
     #[test]
@@ -1034,7 +1140,7 @@ mod tests {
         };
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu)).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new())).unwrap();
         assert!(buffer_contains(&terminal, "confirm delete"));
     }
 
@@ -1068,7 +1174,7 @@ mod tests {
         };
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu)).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new())).unwrap();
         let marked_row = buffer_row_containing(&terminal, "detached");
         let unmarked_row = buffer_row_containing(&terminal, "other-pane");
         assert!(marked_row.contains('*'), "row previously bound should carry the * marker: {marked_row:?}");
@@ -1093,7 +1199,7 @@ mod tests {
         };
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu)).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new())).unwrap();
         let row = buffer_row_containing(&terminal, "fresh");
         assert!(!row.contains('*'), "no row should be marked when previously_bound is None: {row:?}");
     }
@@ -1121,7 +1227,7 @@ mod tests {
         };
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu)).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new())).unwrap();
         assert!(buffer_contains(&terminal, "new-name"));
         assert!(buffer_contains(&terminal, "name taken"));
     }
