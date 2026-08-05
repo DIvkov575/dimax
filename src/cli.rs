@@ -80,6 +80,18 @@ pub enum ServerCmd {
     Kill { target: String },
     Rename { target: String, new_name: String },
     Ls,
+    /// Print a server-pane's current on-screen contents as plain text.
+    Read { target: String },
+    /// Type text into a server-pane, bypassing any workspace/client-pane
+    /// binding.
+    Send {
+        target: String,
+        text: String,
+        /// Append a trailing newline after `text`, as if the user typed
+        /// it and pressed Enter.
+        #[arg(long)]
+        enter: bool,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -230,6 +242,26 @@ async fn run_server(cmd: ServerCmd) -> anyhow::Result<()> {
             }
             other => Err(unexpected_response("server ls", other)),
         },
+        ServerCmd::Read { target } => {
+            let req = Request::ServerRead { target };
+            match client.request(req).await? {
+                Response::ServerReadOutput { text } => {
+                    println!("{text}");
+                    Ok(())
+                }
+                other => Err(unexpected_response("server read", other)),
+            }
+        }
+        ServerCmd::Send { target, text, enter } => {
+            let req = Request::ServerSend { target: target.clone(), text, enter };
+            match client.request(req).await? {
+                Response::Ack => {
+                    println!("sent to server-pane {target}");
+                    Ok(())
+                }
+                other => Err(unexpected_response("server send", other)),
+            }
+        }
     }
 }
 

@@ -522,6 +522,34 @@ async fn dispatch(
             };
             ok_or_err(server_pane.write_input(&bytes), |()| Response::Ack)
         }
+
+        Request::ServerRead { target } => {
+            let state = state.lock().await;
+            let id = match state.resolve_server_pane(&target) {
+                Ok(id) => id,
+                Err(err) => return Response::Error { message: err.to_string() },
+            };
+            let server_pane = state
+                .server_pane(id)
+                .expect("resolve_server_pane only yields ids present in the pool");
+            Response::ServerReadOutput { text: server_pane.snapshot_text() }
+        }
+
+        Request::ServerSend { target, text, enter } => {
+            let state = state.lock().await;
+            let id = match state.resolve_server_pane(&target) {
+                Ok(id) => id,
+                Err(err) => return Response::Error { message: err.to_string() },
+            };
+            let server_pane = state
+                .server_pane(id)
+                .expect("resolve_server_pane only yields ids present in the pool");
+            let mut bytes = text.into_bytes();
+            if enter {
+                bytes.push(b'\n');
+            }
+            ok_or_err(server_pane.write_input(&bytes), |()| Response::Ack)
+        }
     }
 }
 
@@ -1051,6 +1079,66 @@ mod tests {
                 );
             }
             other => panic!("expected ServerPaneList, got {other:?}"),
+        }
+    }
+
+    /// `ServerRead`/`ServerSend` let a caller drive a server-pane directly
+    /// by name-or-id, with no workspace or client-pane involved at all --
+    /// the gap this closes is that every other way to reach a pane's
+    /// input/output (`Request::Input`, `Subscribe`) requires first
+    /// binding it into a workspace's client-pane, which is unnecessary
+    /// ceremony for a scripting caller (e.g. a Claude Skill) that just
+    /// wants to type into a shell and read back what it printed.
+    #[tokio::test]
+    async fn server_send_and_read_round_trip_with_no_workspace_involved() {
+        let guard = start_daemon().await;
+        let mut conn = TestConn::connect(&guard.0).await;
+
+        let server_pane = match conn
+            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()) })
+            .await
+        {
+            Response::ServerPane(info) => info.id,
+            other => panic!("expected ServerPane, got {other:?}"),
+        };
+
+        match conn
+            .request(Request::ServerSend {
+                target: server_pane.to_string(),
+                text: "hello-from-server-send".to_string(),
+                enter: true,
+            })
+            .await
+        {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+
+        // `cat` echoes stdin back to its own stdout, so the text sent
+        // above should show up in the pane's screen shortly after.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match conn.request(Request::ServerRead { target: server_pane.to_string() }).await {
+                Response::ServerReadOutput { text } => {
+                    if text.contains("hello-from-server-send") {
+                        break;
+                    }
+                }
+                other => panic!("expected ServerReadOutput, got {other:?}"),
+            }
+            assert!(std::time::Instant::now() < deadline, "cat never echoed the sent text back");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn server_read_unknown_target_errors() {
+        let guard = start_daemon().await;
+        let mut conn = TestConn::connect(&guard.0).await;
+
+        match conn.request(Request::ServerRead { target: "no-such-pane".to_string() }).await {
+            Response::Error { .. } => {}
+            other => panic!("expected Error, got {other:?}"),
         }
     }
 

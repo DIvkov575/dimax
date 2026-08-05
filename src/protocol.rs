@@ -371,6 +371,23 @@ pub enum Request {
         pane: ClientPaneId,
         bytes: Vec<u8>,
     },
+    /// Read a server-pane's current on-screen contents directly, with no
+    /// workspace or client-pane involved -- for CLI/scripting callers
+    /// (e.g. a Claude Skill) that just want to see what a pane is
+    /// showing right now. `target` uses the same name-or-id addressing
+    /// as `ServerKill`/`ServerRename`.
+    ServerRead {
+        target: String,
+    },
+    /// Type into a server-pane directly, with no workspace or
+    /// client-pane involved -- the `ServerRead` counterpart for sending
+    /// input. `enter` appends a trailing `\n` after `text`, matching a
+    /// user typing a line and pressing Enter.
+    ServerSend {
+        target: String,
+        text: String,
+        enter: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,6 +403,13 @@ pub enum Response {
     Snapshot {
         workspace: WorkspaceInfo,
         grids: Vec<GridSnapshot>,
+    },
+    /// Reply to `ServerRead`: the pane's current screen, rendered as
+    /// plain text -- one line per row, trailing blank rows trimmed,
+    /// styling dropped (a script wants the characters on screen, not
+    /// SGR codes).
+    ServerReadOutput {
+        text: String,
     },
 }
 
