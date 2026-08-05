@@ -100,7 +100,12 @@ impl State {
 
     // -- server-panes --------------------------------------------------
 
-    pub fn server_spawn(&mut self, name: Option<String>, cmd: Option<String>) -> anyhow::Result<ServerPaneInfo> {
+    pub fn server_spawn(
+        &mut self,
+        name: Option<String>,
+        cmd: Option<String>,
+        cwd: Option<String>,
+    ) -> anyhow::Result<ServerPaneInfo> {
         if let Some(name) = &name
             && self.find_server_pane_by_name(name).is_some()
         {
@@ -111,6 +116,7 @@ impl State {
             id,
             name.clone(),
             cmd,
+            cwd,
             DEFAULT_PTY_SIZE,
             self.pane_events.clone(),
         )?;
@@ -694,7 +700,7 @@ mod tests {
     /// exercised without depending on process timing.
     fn spawn_pane(state: &mut State, name: &str) -> ServerPaneId {
         state
-            .server_spawn(Some(name.to_string()), Some("cat".to_string()))
+            .server_spawn(Some(name.to_string()), Some("cat".to_string()), None)
             .unwrap()
             .id
     }
@@ -726,7 +732,7 @@ mod tests {
     fn server_spawn_returns_info_and_lists_it() {
         let mut state = State::new();
         let info = state
-            .server_spawn(Some("shell".to_string()), Some("cat".to_string()))
+            .server_spawn(Some("shell".to_string()), Some("cat".to_string()), None)
             .unwrap();
         assert_eq!(info.name.as_deref(), Some("shell"));
         assert_eq!(info.size, DEFAULT_PTY_SIZE);
@@ -741,7 +747,7 @@ mod tests {
         let mut state = State::new();
         spawn_pane(&mut state, "shell");
         let err = state
-            .server_spawn(Some("shell".to_string()), Some("cat".to_string()))
+            .server_spawn(Some("shell".to_string()), Some("cat".to_string()), None)
             .unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
         assert_eq!(state.server_list().len(), 1);
@@ -750,8 +756,8 @@ mod tests {
     #[test]
     fn server_spawn_allows_repeated_anonymous_panes() {
         let mut state = State::new();
-        state.server_spawn(None, Some("cat".to_string())).unwrap();
-        state.server_spawn(None, Some("cat".to_string())).unwrap();
+        state.server_spawn(None, Some("cat".to_string()), None).unwrap();
+        state.server_spawn(None, Some("cat".to_string()), None).unwrap();
         assert_eq!(state.server_list().len(), 2);
     }
 
@@ -1311,7 +1317,7 @@ mod tests {
     #[test]
     fn scroll_server_pane_clamps_at_zero() {
         let mut state = State::new();
-        let info = state.server_spawn(None, Some("cat".to_string())).unwrap();
+        let info = state.server_spawn(None, Some("cat".to_string()), None).unwrap();
         let offset = state.scroll_server_pane(1, info.id, 5);
         assert_eq!(offset, 0);
         assert_eq!(state.scroll_offsets.get(&(1, info.id)), None);
@@ -1320,7 +1326,7 @@ mod tests {
     #[test]
     fn scroll_server_pane_absent_entry_defaults_to_zero_before_first_call() {
         let mut state = State::new();
-        let info = state.server_spawn(None, Some("cat".to_string())).unwrap();
+        let info = state.server_spawn(None, Some("cat".to_string()), None).unwrap();
         let offset = state.scroll_server_pane(1, info.id, -5);
         assert_eq!(offset, 0);
     }
@@ -1339,7 +1345,7 @@ mod tests {
         let mut state = State::new();
         let mut events = state.take_pane_events().unwrap();
         let info = state
-            .server_spawn(Some("greeter".to_string()), Some("printf hi".to_string()))
+            .server_spawn(Some("greeter".to_string()), Some("printf hi".to_string()), None)
             .unwrap();
         // `blocking_recv` outside a runtime is explicitly supported by
         // tokio, so this stays a plain synchronous unit test.

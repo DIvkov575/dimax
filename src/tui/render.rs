@@ -411,6 +411,10 @@ pub(super) fn draw_attach_menu(frame: &mut Frame, menu: &super::AttachMenu, coll
                     lines.push(Line::styled(format!("    {error}"), Style::new().fg(Color::Red)));
                 }
             }
+            super::AttachMenuRow::SpawnNewInGroup(server_index) => {
+                let group = &menu.servers[server_index].0;
+                lines.push(spawn_new_in_group_line(group, row_index == menu.selected));
+            }
             super::AttachMenuRow::SpawnNew => {
                 lines.push(spawn_new_line(row_index == menu.selected));
             }
@@ -433,6 +437,16 @@ fn group_header_line(group: &str, collapsed: bool, selected: bool) -> Line<'stat
         style = style.add_modifier(Modifier::REVERSED);
     }
     Line::styled(format!("{marker} {group}"), style)
+}
+
+/// A group's own "+ spawn new here" row, indented like a `Server` row
+/// (matches its visual nesting under the group's header) rather than
+/// the global `spawn_new_line`'s unindented top-level look.
+fn spawn_new_in_group_line(group: &str, selected: bool) -> Line<'static> {
+    let marker = if selected { ">" } else { " " };
+    let text = format!("  {marker} + spawn new in {group}");
+    let style = if selected { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+    Line::styled(text, style)
 }
 
 /// Column widths for the attach menu's server-pane rows: `name | process
@@ -1042,6 +1056,43 @@ mod tests {
         assert!(buffer_contains(&terminal, "/home/dev/web"));
         assert!(buffer_contains(&terminal, "api-shell"));
         assert!(buffer_contains(&terminal, "web-shell"));
+    }
+
+    #[test]
+    fn draw_attach_menu_shows_a_spawn_row_per_real_group_but_not_for_unknown() {
+        let a = ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: Some("api-shell".to_string()),
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+            foreground: Some(ForegroundProcessInfo {
+                process_name: "bash".to_string(),
+                cwd: Some("/home/dev/api".to_string()),
+            }),
+        };
+        let dead = ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: Some("dead-pane".to_string()),
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Dead,
+            foreground: None,
+        };
+        let servers = vec![
+            ("/home/dev/api".to_string(), a),
+            ("Unknown".to_string(), dead),
+        ];
+        let menu = super::super::AttachMenu {
+            servers,
+            selected: 0,
+            pending_delete: None,
+            rename: None,
+            previously_bound: None,
+        };
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new())).unwrap();
+        assert!(buffer_contains(&terminal, "+ spawn new in /home/dev/api"));
+        assert!(!buffer_contains(&terminal, "+ spawn new in Unknown"));
     }
 
     #[test]

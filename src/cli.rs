@@ -76,6 +76,10 @@ pub enum ServerCmd {
         name: String,
         #[arg(long)]
         cmd: Option<String>,
+        /// Starting working directory for the spawned process. Defaults
+        /// to the daemon's own cwd if omitted.
+        #[arg(long)]
+        cwd: Option<String>,
     },
     Kill { target: String },
     Rename { target: String, new_name: String },
@@ -202,8 +206,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 async fn run_server(cmd: ServerCmd) -> anyhow::Result<()> {
     let mut client = Client::connect().await?;
     match cmd {
-        ServerCmd::Spawn { name, cmd } => {
-            let req = Request::ServerSpawn { name: Some(name), cmd };
+        ServerCmd::Spawn { name, cmd, cwd } => {
+            let req = Request::ServerSpawn { name: Some(name), cmd, cwd };
             match client.request(req).await? {
                 Response::ServerPane(info) => {
                     let label = info.name.as_deref().unwrap_or("-");
