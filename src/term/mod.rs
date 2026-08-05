@@ -366,6 +366,25 @@ impl ServerPane {
         }
     }
 
+    /// Render the current live screen (`snapshot(0)`) as plain text for
+    /// scripting callers (`Request::ServerRead`) that want the characters
+    /// on screen, not a styled `GridSnapshot` -- one line per row, each
+    /// right-trimmed of the padding `blank_cell` fills unused columns
+    /// with, then trailing all-blank rows dropped so a mostly-empty pane
+    /// doesn't read back as a wall of blank lines.
+    pub fn snapshot_text(&self) -> String {
+        let snapshot = self.snapshot(0);
+        let mut lines: Vec<String> = snapshot
+            .lines
+            .iter()
+            .map(|row| row.iter().map(|c| c.text.as_str()).collect::<String>().trim_end().to_string())
+            .collect();
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+
     /// Write raw bytes (keystrokes) to the child process's stdin via the
     /// PTY master.
     pub fn write_input(&self, bytes: &[u8]) -> anyhow::Result<()> {
@@ -589,6 +608,26 @@ mod tests {
 
         pane.kill().unwrap();
         assert_eq!(pane.status(), ServerPaneStatus::Dead);
+    }
+
+    #[test]
+    fn snapshot_text_trims_trailing_blank_rows_and_padding() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let id = Uuid::new_v4();
+        let pane = ServerPane::spawn(
+            id,
+            None,
+            Some("printf hi".to_string()),
+            Size { rows: 24, cols: 80 },
+            tx,
+        )
+        .unwrap();
+
+        let found = wait_until(&mut rx, || pane.snapshot_text().contains("hi"));
+        assert!(found, "expected snapshot_text to contain \"hi\"");
+
+        let text = pane.snapshot_text();
+        assert_eq!(text, "hi", "should be exactly the one non-blank row, right-trimmed, with no trailing blank rows");
     }
 
     /// Regression test for the "dimux hangs often" investigation: a
