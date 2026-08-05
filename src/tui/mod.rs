@@ -132,7 +132,7 @@ use crate::protocol::{
     self, ClientPaneId, Event, GridSnapshot, Request, Response, ServerMessage, ServerPaneId,
     ServerPaneInfo, Size, SplitDir, SplitTree, WorkspaceInfo,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::io::AsyncReadExt;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
@@ -212,10 +212,16 @@ struct AttachMenu {
     /// `(cwd_group_key, server)` pairs, pre-sorted into cwd-bucket order
     /// by `group_servers_by_cwd` every time this field is populated —
     /// see that function's doc comment for the exact ordering rules.
-    /// `selected` indexes this `Vec` directly; grouping is a rendering
-    /// concern layered on top by `render::draw_attach_menu`, not a
-    /// change to how selection/nav math works.
+    /// `selected` does NOT index this `Vec` directly — group headers
+    /// are selectable rows too (see [`visible_attach_menu_rows`]), so
+    /// grouping stays this field's own concern while *which row is
+    /// selected* is a layer on top.
     servers: Vec<(String, ServerPaneInfo)>,
+    /// Index into `visible_attach_menu_rows(self, collapsed)`'s
+    /// returned row list — NOT into `servers` directly. `collapsed`
+    /// lives on `App` (`App.collapsed_groups`), not here, so any method
+    /// reading or moving `selected` needs both `self.attach_menu` and
+    /// `self.collapsed_groups` to make sense of it.
     selected: usize,
     /// `Some(index into servers)` while that row's delete is armed
     /// (first `x` pressed, awaiting a confirming `x`/Enter or a
@@ -308,6 +314,14 @@ struct App {
     /// `live_ratio` patched in via `SplitTree::resize_split`, reflecting
     /// the drag immediately without touching daemon state.
     dragging_split: Option<(crate::protocol::SplitId, f32)>,
+    /// Directory groups in the attach menu currently collapsed (their
+    /// member server-pane rows hidden, header still shown) -- keyed by
+    /// the same group-key strings `group_servers_by_cwd` produces.
+    /// Lives here rather than on `AttachMenu` so it survives closing and
+    /// reopening the menu (and switching workspaces): collapsing a noisy
+    /// group is expected to stay collapsed next time the menu opens, not
+    /// silently reset.
+    collapsed_groups: HashSet<String>,
 }
 
 impl App {
@@ -338,6 +352,7 @@ impl App {
                         attach_menu: None,
                         frame_area: ratatui::layout::Rect::default(),
                         dragging_split: None,
+                        collapsed_groups: HashSet::new(),
                     });
                 }
                 ServerMessage::Response(other) => {
@@ -606,7 +621,7 @@ impl App {
             AttachMenuAction::Up => self.move_attach_menu_selection(false),
             AttachMenuAction::Down => self.move_attach_menu_selection(true),
             AttachMenuAction::Cancel => self.attach_menu = None,
-            AttachMenuAction::Confirm => self.confirm_attach_menu(write_half, reader).await?,
+            AttachMenuAction::Confirm => self.confirm_or_toggle_attach_menu(write_half, reader).await?,
             AttachMenuAction::Delete => self.arm_delete(),
             AttachMenuAction::StartRename => self.start_rename(),
             AttachMenuAction::Ignore => {}
@@ -614,30 +629,78 @@ impl App {
         Ok(())
     }
 
+    /// The row `menu.selected` currently names, per
+    /// `visible_attach_menu_rows` -- `None` only if the menu has become
+    /// empty of rows entirely, which can't happen (there's always at
+    /// least the trailing `SpawnNew` row).
+    fn selected_attach_menu_row(&self) -> Option<AttachMenuRow> {
+        let menu = self.attach_menu.as_ref()?;
+        let rows = visible_attach_menu_rows(&menu.servers, &self.collapsed_groups);
+        rows.get(menu.selected).copied()
+    }
+
     fn move_attach_menu_selection(&mut self, forward: bool) {
+        let collapsed = self.collapsed_groups.clone();
         let Some(menu) = &mut self.attach_menu else { return };
-        // +1 for the trailing "spawn new" row, same convention the
-        // removed picker used (see `render::draw_attach_menu`).
-        let len = menu.servers.len() + 1;
+        let len = visible_attach_menu_rows(&menu.servers, &collapsed).len();
         menu.selected = if forward { (menu.selected + 1) % len } else { (menu.selected + len - 1) % len };
     }
 
-    /// Arm the selected row's deletion (first `x`), a no-op on the
-    /// trailing "spawn new" row (nothing to delete there).
-    fn arm_delete(&mut self) {
-        let Some(menu) = &mut self.attach_menu else { return };
-        if menu.selected < menu.servers.len() {
-            menu.pending_delete = Some(menu.selected);
+    /// Enter/`\r` on a group header toggles that group's collapse; on a
+    /// real server-pane row or the trailing "spawn new" row it binds, via
+    /// `confirm_attach_menu`, unchanged from before headers became
+    /// selectable.
+    async fn confirm_or_toggle_attach_menu(
+        &mut self,
+        write_half: &mut OwnedWriteHalf,
+        reader: &mut FrameReader,
+    ) -> anyhow::Result<()> {
+        match self.selected_attach_menu_row() {
+            Some(AttachMenuRow::GroupHeader(server_index)) => {
+                self.toggle_group_collapse(server_index);
+                Ok(())
+            }
+            _ => self.confirm_attach_menu(write_half, reader).await,
         }
+    }
+
+    /// Flip the collapsed state of the group whose first member sits at
+    /// `menu.servers[server_index]`. A no-op if `attach_menu` is `None`.
+    fn toggle_group_collapse(&mut self, server_index: usize) {
+        let Some(menu) = &self.attach_menu else { return };
+        let key = menu.servers[server_index].0.clone();
+        if !self.collapsed_groups.remove(&key) {
+            self.collapsed_groups.insert(key);
+        }
+        // Collapsing can shrink the visible row list out from under
+        // `selected` (e.g. the header itself was the last visible row
+        // before other groups' rows disappeared below it) -- clamp back
+        // onto the new last row rather than leaving an out-of-bounds
+        // index for the next lookup/render to trip over.
+        let collapsed = self.collapsed_groups.clone();
+        let Some(menu) = &mut self.attach_menu else { return };
+        let len = visible_attach_menu_rows(&menu.servers, &collapsed).len();
+        if menu.selected >= len {
+            menu.selected = len - 1;
+        }
+    }
+
+    /// Arm the selected row's deletion (first `x`) if it names a real
+    /// server-pane row; a no-op on a group header or the trailing "spawn
+    /// new" row (nothing to delete there).
+    fn arm_delete(&mut self) {
+        let Some(AttachMenuRow::Server(server_index)) = self.selected_attach_menu_row() else { return };
+        let Some(menu) = &mut self.attach_menu else { return };
+        menu.pending_delete = Some(server_index);
     }
 
     /// Confirm a previously-armed deletion: kill the server-pane, then
     /// re-fetch and re-group the server list so the menu reflects its
-    /// removal. Clamps `selected` into the shrunk list -- if the deleted
-    /// row was the last one, selection moves to the new last row;
-    /// otherwise the numeric index is left as-is (which now names
-    /// whatever slid up into that slot, an acceptable "selection moved
-    /// on" side effect of any list shrinking under the cursor).
+    /// removal. Clamps `selected` into the shrunk *visible* row list --
+    /// if the deleted row was the last one, selection moves to the new
+    /// last row; otherwise the numeric index is left as-is (which now
+    /// names whatever slid up into that slot, an acceptable "selection
+    /// moved on" side effect of any list shrinking under the cursor).
     async fn confirm_delete(
         &mut self,
         write_half: &mut OwnedWriteHalf,
@@ -651,11 +714,12 @@ impl App {
             self.request(write_half, reader, Request::ServerList).await?
         {
             let grouped = group_servers_by_cwd(servers);
+            let collapsed = self.collapsed_groups.clone();
             let Some(menu) = &mut self.attach_menu else { return Ok(()) };
             menu.servers = grouped;
-            let spawn_index = menu.servers.len();
-            if menu.selected > spawn_index {
-                menu.selected = spawn_index;
+            let len = visible_attach_menu_rows(&menu.servers, &collapsed).len();
+            if menu.selected >= len {
+                menu.selected = len - 1;
             }
         }
         Ok(())
@@ -665,15 +729,14 @@ impl App {
     /// pre-filled with its current custom name (empty if it's currently
     /// falling back to the id — see `render::attach_menu_line`'s
     /// `unwrap_or_else(|| short_id(...))`), cursor starting at the end
-    /// of the pre-filled text. A no-op on the trailing "spawn new" row.
+    /// of the pre-filled text. A no-op on a group header or the trailing
+    /// "spawn new" row.
     fn start_rename(&mut self) {
+        let Some(AttachMenuRow::Server(server_index)) = self.selected_attach_menu_row() else { return };
         let Some(menu) = &mut self.attach_menu else { return };
-        if menu.selected >= menu.servers.len() {
-            return;
-        }
-        let text = menu.servers[menu.selected].1.name.clone().unwrap_or_default();
+        let text = menu.servers[server_index].1.name.clone().unwrap_or_default();
         let cursor = text.len();
-        menu.rename = Some(RenameState { index: menu.selected, text, cursor, error: None });
+        menu.rename = Some(RenameState { index: server_index, text, cursor, error: None });
     }
 
     /// Submit the active rename field's current text: a no-op if empty
@@ -719,25 +782,28 @@ impl App {
 
     /// Confirm the attach menu's current selection: bind the just-detached
     /// client-pane to the selected server-pane, spawning a fresh one first
-    /// if the trailing "spawn new" row is selected.
+    /// if the trailing "spawn new" row is selected. Only ever called (via
+    /// `confirm_or_toggle_attach_menu`) when the selected row is a
+    /// `Server` or `SpawnNew` row -- a `GroupHeader` is intercepted
+    /// before this runs.
     async fn confirm_attach_menu(
         &mut self,
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
+        let Some(row) = self.selected_attach_menu_row() else { return Ok(()) };
         let Some(menu) = self.attach_menu.take() else { return Ok(()) };
         let Some(pane) = self.focused else { return Ok(()) };
-        let spawn_new_index = menu.servers.len();
-        let target = if menu.selected == spawn_new_index {
-            match self
+        let target = match row {
+            AttachMenuRow::Server(server_index) => menu.servers[server_index].1.id.to_string(),
+            AttachMenuRow::SpawnNew => match self
                 .request(write_half, reader, Request::ServerSpawn { name: None, cmd: None })
                 .await?
             {
                 Response::ServerPane(info) => info.id.to_string(),
                 _ => return Ok(()),
-            }
-        } else {
-            menu.servers[menu.selected].1.id.to_string()
+            },
+            AttachMenuRow::GroupHeader(_) => return Ok(()),
         };
         let req = Request::ClientBind { workspace: self.workspace.id.to_string(), pane, target };
         let _ = self.request(write_half, reader, req).await?;
@@ -961,6 +1027,56 @@ fn changed_pane_sizes(
 /// than a nested `Vec<Vec<_>>` so callers can walk it once and detect
 /// group boundaries by comparing consecutive keys, which is exactly what
 /// `render::draw_attach_menu` needs to decide where to emit a header.
+/// One selectable row in the attach menu, in on-screen order. Headers are
+/// selectable (Enter on one toggles that group's collapse) alongside the
+/// server-pane rows and the trailing "spawn new" row -- `AttachMenu
+/// .selected` indexes into whatever [`visible_attach_menu_rows`] returns,
+/// not into `servers` directly, since a collapsed group's member rows are
+/// omitted from that list entirely (skipped by navigation, not just
+/// hidden visually).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachMenuRow {
+    /// A directory-group header. Carries the index of that group's first
+    /// member in `AttachMenu.servers`, from which the group's key string
+    /// (`servers[first_index].0`) and collapsed state can be looked up —
+    /// cheaper than duplicating the key string into every row.
+    GroupHeader(usize),
+    /// A real server-pane row; the index into `AttachMenu.servers`.
+    Server(usize),
+    SpawnNew,
+}
+
+/// Build the attach menu's current row list: a `GroupHeader` before each
+/// distinct cwd group's first member (matching `servers`' existing
+/// group-sorted order), that group's `Server` rows only if `collapsed`
+/// does not contain its key, then a trailing `SpawnNew`. Grouping itself
+/// stays `group_servers_by_cwd`'s job; this only decides which of those
+/// already-grouped rows are currently *visible* for selection/rendering.
+/// Takes the raw `servers` slice rather than a whole `AttachMenu` so a
+/// caller building the very first `AttachMenu` (no instance to borrow
+/// from yet) can still compute an initial `selected` from it — see
+/// `App::detach_and_open_menu`.
+fn visible_attach_menu_rows(
+    servers: &[(String, ServerPaneInfo)],
+    collapsed: &HashSet<String>,
+) -> Vec<AttachMenuRow> {
+    let mut rows = Vec::with_capacity(servers.len() + 2);
+    let mut last_group: Option<&str> = None;
+    let mut group_is_collapsed = false;
+    for (index, (group, _)) in servers.iter().enumerate() {
+        if last_group != Some(group.as_str()) {
+            rows.push(AttachMenuRow::GroupHeader(index));
+            last_group = Some(group.as_str());
+            group_is_collapsed = collapsed.contains(group.as_str());
+        }
+        if !group_is_collapsed {
+            rows.push(AttachMenuRow::Server(index));
+        }
+    }
+    rows.push(AttachMenuRow::SpawnNew);
+    rows
+}
+
 fn group_servers_by_cwd(mut servers: Vec<ServerPaneInfo>) -> Vec<(String, ServerPaneInfo)> {
     const UNKNOWN: &str = "Unknown";
     servers.sort_by(|a, b| {
@@ -1217,7 +1333,7 @@ pub async fn run() -> anyhow::Result<()> {
                 None => render::draw(frame, &app.workspace, &app.grids, app.focused),
             }
             if let Some(menu) = &app.attach_menu {
-                render::draw_attach_menu(frame, menu);
+                render::draw_attach_menu(frame, menu, &app.collapsed_groups);
             }
         })?;
 
@@ -1568,7 +1684,131 @@ mod tests {
     }
 
     #[test]
+    fn visible_attach_menu_rows_lists_every_row_when_nothing_collapsed() {
+        let servers = vec![
+            ("/a".to_string(), server_with_cwd("x", Some("/a"))),
+            ("/a".to_string(), server_with_cwd("y", Some("/a"))),
+            ("/b".to_string(), server_with_cwd("z", Some("/b"))),
+        ];
+        let rows = visible_attach_menu_rows(&servers, &HashSet::new());
+        assert_eq!(
+            rows,
+            vec![
+                AttachMenuRow::GroupHeader(0),
+                AttachMenuRow::Server(0),
+                AttachMenuRow::Server(1),
+                AttachMenuRow::GroupHeader(2),
+                AttachMenuRow::Server(2),
+                AttachMenuRow::SpawnNew,
+            ]
+        );
+    }
+
+    #[test]
+    fn visible_attach_menu_rows_omits_server_rows_of_a_collapsed_group() {
+        let servers = vec![
+            ("/a".to_string(), server_with_cwd("x", Some("/a"))),
+            ("/a".to_string(), server_with_cwd("y", Some("/a"))),
+            ("/b".to_string(), server_with_cwd("z", Some("/b"))),
+        ];
+        let mut collapsed = HashSet::new();
+        collapsed.insert("/a".to_string());
+        let rows = visible_attach_menu_rows(&servers, &collapsed);
+        // Both of "/a"'s Server rows disappear; its header stays so the
+        // group can still be found and re-expanded.
+        assert_eq!(
+            rows,
+            vec![
+                AttachMenuRow::GroupHeader(0),
+                AttachMenuRow::GroupHeader(2),
+                AttachMenuRow::Server(2),
+                AttachMenuRow::SpawnNew,
+            ]
+        );
+    }
+
+    #[test]
+    fn toggle_group_collapse_collapses_then_expands() {
+        let servers = vec![("/a".to_string(), server_with_cwd("x", Some("/a")))];
+        let mut app = App {
+            workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
+            grids: HashMap::new(),
+            pane_sizes: HashMap::new(),
+            focused: None,
+            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None, previously_bound: None }),
+            frame_area: ratatui::layout::Rect::default(),
+            dragging_split: None,
+            collapsed_groups: HashSet::new(),
+        };
+        app.toggle_group_collapse(0);
+        assert!(app.collapsed_groups.contains("/a"));
+        app.toggle_group_collapse(0);
+        assert!(!app.collapsed_groups.contains("/a"));
+    }
+
+    #[test]
+    fn toggle_group_collapse_clamps_selection_into_the_shrunk_row_list() {
+        let servers = vec![("/a".to_string(), server_with_cwd("x", Some("/a")))];
+        // Rows before collapse: 0 = header, 1 = server, 2 = spawn-new.
+        // Selecting the server row, then collapsing its own group, must
+        // not leave `selected` pointing past the now-shorter row list
+        // (header, spawn-new).
+        let mut app = App {
+            workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
+            grids: HashMap::new(),
+            pane_sizes: HashMap::new(),
+            focused: None,
+            attach_menu: Some(AttachMenu { servers, selected: 1, pending_delete: None, rename: None, previously_bound: None }),
+            frame_area: ratatui::layout::Rect::default(),
+            dragging_split: None,
+            collapsed_groups: HashSet::new(),
+        };
+        app.toggle_group_collapse(0);
+        assert_eq!(app.attach_menu.unwrap().selected, 1, "should clamp onto the new last row (spawn-new)");
+    }
+
+    #[test]
+    fn move_attach_menu_selection_wraps_across_headers_and_spawn_new() {
+        let servers = vec![("/a".to_string(), server_with_cwd("x", Some("/a")))];
+        // Rows: 0 = header, 1 = server, 2 = spawn-new -- len 3, so moving
+        // down from the last row wraps back to 0, and up from 0 wraps to
+        // the last row.
+        let mut app = App {
+            workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
+            grids: HashMap::new(),
+            pane_sizes: HashMap::new(),
+            focused: None,
+            attach_menu: Some(AttachMenu { servers, selected: 2, pending_delete: None, rename: None, previously_bound: None }),
+            frame_area: ratatui::layout::Rect::default(),
+            dragging_split: None,
+            collapsed_groups: HashSet::new(),
+        };
+        app.move_attach_menu_selection(true);
+        assert_eq!(app.attach_menu.as_ref().unwrap().selected, 0);
+        app.move_attach_menu_selection(false);
+        assert_eq!(app.attach_menu.as_ref().unwrap().selected, 2);
+    }
+
+    #[test]
     fn arm_delete_sets_pending_delete_on_a_real_row() {
+        let servers = vec![("Unknown".to_string(), server_with_cwd("a", None))];
+        // Rows: 0 = "Unknown" header, 1 = the server row, 2 = spawn-new.
+        let mut app = App {
+            workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
+            grids: HashMap::new(),
+            pane_sizes: HashMap::new(),
+            focused: None,
+            attach_menu: Some(AttachMenu { servers, selected: 1, pending_delete: None, rename: None, previously_bound: None }),
+            frame_area: ratatui::layout::Rect::default(),
+            dragging_split: None,
+            collapsed_groups: HashSet::new(),
+        };
+        app.arm_delete();
+        assert_eq!(app.attach_menu.unwrap().pending_delete, Some(0));
+    }
+
+    #[test]
+    fn arm_delete_on_group_header_row_is_a_no_op() {
         let servers = vec![("Unknown".to_string(), server_with_cwd("a", None))];
         let mut app = App {
             workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
@@ -1578,15 +1818,17 @@ mod tests {
             attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None, previously_bound: None }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
+            collapsed_groups: HashSet::new(),
         };
         app.arm_delete();
-        assert_eq!(app.attach_menu.unwrap().pending_delete, Some(0));
+        assert_eq!(app.attach_menu.unwrap().pending_delete, None);
     }
 
     #[test]
     fn arm_delete_on_spawn_new_row_is_a_no_op() {
         let servers = vec![("Unknown".to_string(), server_with_cwd("a", None))];
-        let spawn_index = servers.len();
+        // Rows: 0 = "Unknown" header, 1 = the server row, 2 = spawn-new.
+        let spawn_index = 2;
         let mut app = App {
             workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
             grids: HashMap::new(),
@@ -1601,6 +1843,7 @@ mod tests {
             }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
+            collapsed_groups: HashSet::new(),
         };
         app.arm_delete();
         assert_eq!(app.attach_menu.unwrap().pending_delete, None);
@@ -1689,14 +1932,16 @@ mod tests {
     #[test]
     fn start_rename_prefills_current_name_with_cursor_at_end() {
         let servers = vec![("Unknown".to_string(), server_with_cwd("my-name", None))];
+        // Rows: 0 = "Unknown" header, 1 = the server row.
         let mut app = App {
             workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None, previously_bound: None }),
+            attach_menu: Some(AttachMenu { servers, selected: 1, pending_delete: None, rename: None, previously_bound: None }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
+            collapsed_groups: HashSet::new(),
         };
         app.start_rename();
         let rename = app.attach_menu.unwrap().rename.unwrap();
@@ -1706,9 +1951,27 @@ mod tests {
     }
 
     #[test]
+    fn start_rename_on_group_header_row_is_a_no_op() {
+        let servers = vec![("Unknown".to_string(), server_with_cwd("a", None))];
+        let mut app = App {
+            workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
+            grids: HashMap::new(),
+            pane_sizes: HashMap::new(),
+            focused: None,
+            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None, previously_bound: None }),
+            frame_area: ratatui::layout::Rect::default(),
+            dragging_split: None,
+            collapsed_groups: HashSet::new(),
+        };
+        app.start_rename();
+        assert!(app.attach_menu.unwrap().rename.is_none());
+    }
+
+    #[test]
     fn start_rename_on_spawn_new_row_is_a_no_op() {
         let servers = vec![("Unknown".to_string(), server_with_cwd("a", None))];
-        let spawn_index = servers.len();
+        // Rows: 0 = "Unknown" header, 1 = the server row, 2 = spawn-new.
+        let spawn_index = 2;
         let mut app = App {
             workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
             grids: HashMap::new(),
@@ -1723,6 +1986,7 @@ mod tests {
             }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
+            collapsed_groups: HashSet::new(),
         };
         app.start_rename();
         assert!(app.attach_menu.unwrap().rename.is_none());
