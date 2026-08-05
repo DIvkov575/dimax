@@ -391,7 +391,8 @@ pub(super) fn draw_attach_menu(frame: &mut Frame, menu: &super::AttachMenu) {
         }
         let armed = menu.pending_delete == Some(i);
         let renaming = menu.rename.as_ref().filter(|r| r.index == i);
-        lines.push(attach_menu_line(server, i == menu.selected, armed, renaming));
+        let just_detached = menu.previously_bound == Some(server.id);
+        lines.push(attach_menu_line(server, i == menu.selected, armed, renaming, just_detached));
         if let Some(rename) = renaming
             && let Some(error) = &rename.error
         {
@@ -421,6 +422,7 @@ fn attach_menu_line(
     selected: bool,
     delete_armed: bool,
     renaming: Option<&super::RenameState>,
+    just_detached: bool,
 ) -> Line<'static> {
     let status = match server.status {
         ServerPaneStatus::Running => "Running",
@@ -428,10 +430,16 @@ fn attach_menu_line(
     };
     let process = server.foreground.as_ref().map_or("-", |f| f.process_name.as_str());
     let marker = if selected { ">" } else { " " };
+    // Marks the row this client-pane was bound to right before this
+    // menu opened (see `AttachMenu.previously_bound`'s doc comment) --
+    // rendered as its own leading character ahead of the `>`/` `
+    // selection marker so it stays visible whether or not that row also
+    // happens to be selected right now.
+    let just_detached_marker = if just_detached { "*" } else { " " };
 
     if let Some(rename) = renaming {
         let text = format!(
-            "  {marker} [{}] {:<process_w$} {} {}",
+            "  {just_detached_marker}{marker} [{}] {:<process_w$} {} {}",
             rename.text,
             truncate_end(process, PROCESS_COL_WIDTH),
             short_id(server.id),
@@ -443,7 +451,7 @@ fn attach_menu_line(
 
     let name = server.name.clone().unwrap_or_else(|| short_id(server.id));
     let text = format!(
-        "  {marker} {:<name_w$} {:<process_w$} {} {}{}",
+        "  {just_detached_marker}{marker} {:<name_w$} {:<process_w$} {} {}{}",
         truncate_end(&name, NAME_COL_WIDTH),
         truncate_end(process, PROCESS_COL_WIDTH),
         short_id(server.id),
@@ -521,6 +529,23 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
         content.contains(needle)
+    }
+
+    /// Reconstruct one row of `terminal`'s backend buffer as a plain
+    /// `String`, picking the (first) row that contains `needle` --
+    /// unlike `buffer_contains`, `buffer.content()` is a flat cell array
+    /// with no row separators, so a substring search alone can't tell
+    /// you which *row* a match landed in; this splits by `buffer.area
+    /// .width` to recover row boundaries before searching.
+    fn buffer_row_containing(terminal: &Terminal<TestBackend>, needle: &str) -> String {
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let symbols: Vec<&str> = buffer.content().iter().map(|c| c.symbol()).collect();
+        symbols
+            .chunks(width)
+            .map(|row| row.concat())
+            .find(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("no row in the buffer contained {needle:?}"))
     }
 
     fn empty_workspace() -> WorkspaceInfo {
@@ -889,6 +914,7 @@ mod tests {
             selected: 0,
             pending_delete: None,
             rename: None,
+            previously_bound: None,
         };
         // Wide enough that the popup (85% of frame width, see
         // draw_attach_menu) comfortably fits every column's full width
@@ -919,6 +945,7 @@ mod tests {
             selected: 0,
             pending_delete: None,
             rename: None,
+            previously_bound: None,
         };
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -941,6 +968,7 @@ mod tests {
             selected: 0,
             pending_delete: None,
             rename: None,
+            previously_bound: None,
         };
         let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -977,6 +1005,7 @@ mod tests {
             selected: 0,
             pending_delete: None,
             rename: None,
+            previously_bound: None,
         };
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1001,11 +1030,72 @@ mod tests {
             selected: 0,
             pending_delete: Some(0),
             rename: None,
+            previously_bound: None,
         };
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw_attach_menu(frame, &menu)).unwrap();
         assert!(buffer_contains(&terminal, "confirm delete"));
+    }
+
+    #[test]
+    fn draw_attach_menu_marks_the_just_detached_row() {
+        let detached_from = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let server_a = ServerPaneInfo {
+            id: detached_from,
+            name: Some("detached".to_string()),
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+            foreground: None,
+        };
+        let server_b = ServerPaneInfo {
+            id: other,
+            name: Some("other-pane".to_string()),
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+            foreground: None,
+        };
+        let menu = super::super::AttachMenu {
+            servers: vec![
+                ("Unknown".to_string(), server_a),
+                ("Unknown".to_string(), server_b),
+            ],
+            selected: 1,
+            pending_delete: None,
+            rename: None,
+            previously_bound: Some(detached_from),
+        };
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu)).unwrap();
+        let marked_row = buffer_row_containing(&terminal, "detached");
+        let unmarked_row = buffer_row_containing(&terminal, "other-pane");
+        assert!(marked_row.contains('*'), "row previously bound should carry the * marker: {marked_row:?}");
+        assert!(!unmarked_row.contains('*'), "an unrelated row must not carry the marker: {unmarked_row:?}");
+    }
+
+    #[test]
+    fn draw_attach_menu_shows_no_marker_when_nothing_was_previously_bound() {
+        let server = ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: Some("fresh".to_string()),
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+            foreground: None,
+        };
+        let menu = super::super::AttachMenu {
+            servers: vec![("Unknown".to_string(), server)],
+            selected: 0,
+            pending_delete: None,
+            rename: None,
+            previously_bound: None,
+        };
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu)).unwrap();
+        let row = buffer_row_containing(&terminal, "fresh");
+        assert!(!row.contains('*'), "no row should be marked when previously_bound is None: {row:?}");
     }
 
     #[test]
@@ -1027,6 +1117,7 @@ mod tests {
                 cursor: 8,
                 error: Some("name taken".to_string()),
             }),
+            previously_bound: None,
         };
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();

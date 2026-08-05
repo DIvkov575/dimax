@@ -1,0 +1,3 @@
+- add server-pane preview when selecting from server-pane list
+- automatic server-pane naming based on claude session name
+- collapse (server-panes) associated with a directory group; maybe create a line for directory name and when selected/pressed-enter, minimize associated session

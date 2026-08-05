@@ -225,6 +225,16 @@ struct AttachMenu {
     /// `Some` while the inline rename field is focused for the row at
     /// `.index`. See `RenameState`'s own doc comment.
     rename: Option<RenameState>,
+    /// The server-pane the focused client-pane was bound to right
+    /// before `detach_and_open_menu` unbound it to open this menu --
+    /// `None` if it was already unbound (nothing to mark). Captured
+    /// from local state *before* sending `ClientUnbind` (once that
+    /// request lands, the binding is gone server-side too, so there's
+    /// no later point at which this could still be read back).
+    /// Rendered as a `*` marker on that row so picking a *different*
+    /// server-pane vs. re-attaching the same one is an informed choice,
+    /// not a guess from memory.
+    previously_bound: Option<ServerPaneId>,
 }
 
 /// Live edit state for the attach menu's inline rename field (`r` on a
@@ -504,6 +514,12 @@ impl App {
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
         let Some(pane) = self.focused else { return Ok(()) };
+        // Read the current binding from local workspace state *before*
+        // unbinding -- see `AttachMenu.previously_bound`'s doc comment
+        // for why this has to happen here, not after `ClientUnbind`
+        // lands (the binding is gone server-side by then too).
+        let previously_bound =
+            self.workspace.tree.as_ref().and_then(|tree| tree.find(pane)).and_then(|leaf| leaf.bound);
         let req = Request::ClientUnbind { workspace: self.workspace.id.to_string(), pane };
         let _ = self.request(write_half, reader, req).await?;
         if let Response::ServerPaneList(servers) =
@@ -514,6 +530,7 @@ impl App {
                 selected: 0,
                 pending_delete: None,
                 rename: None,
+                previously_bound,
             });
         }
         Ok(())
@@ -1558,7 +1575,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None }),
+            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None, previously_bound: None }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
         };
@@ -1580,6 +1597,7 @@ mod tests {
                 selected: spawn_index,
                 pending_delete: None,
                 rename: None,
+                previously_bound: None,
             }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
@@ -1676,7 +1694,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None }),
+            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None, previously_bound: None }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
         };
@@ -1701,6 +1719,7 @@ mod tests {
                 selected: spawn_index,
                 pending_delete: None,
                 rename: None,
+                previously_bound: None,
             }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
