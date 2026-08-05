@@ -274,9 +274,9 @@ async fn dispatch(
 ) -> Response {
     let _ = subscriber_id;
     match request {
-        Request::ServerSpawn { name, cmd } => {
+        Request::ServerSpawn { name, cmd, cwd } => {
             let mut state = state.lock().await;
-            ok_or_err(state.server_spawn(name, cmd), Response::ServerPane)
+            ok_or_err(state.server_spawn(name, cmd, cwd), Response::ServerPane)
         }
 
         Request::ServerKill { target } => {
@@ -826,6 +826,7 @@ mod tests {
             .request(Request::ServerSpawn {
                 name: None,
                 cmd: Some("printf hello".to_string()),
+                cwd: None,
             })
             .await
         {
@@ -963,6 +964,7 @@ mod tests {
             .request(Request::ServerSpawn {
                 name: None,
                 cmd: Some("cat".to_string()),
+                cwd: None,
             })
             .await
         {
@@ -1037,7 +1039,7 @@ mod tests {
         let mut conn = TestConn::connect(&guard.0).await;
 
         let server_pane = match conn
-            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()) })
+            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None })
             .await
         {
             Response::ServerPane(info) => info.id,
@@ -1095,7 +1097,7 @@ mod tests {
         let mut conn = TestConn::connect(&guard.0).await;
 
         let server_pane = match conn
-            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()) })
+            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None })
             .await
         {
             Response::ServerPane(info) => info.id,
@@ -1131,6 +1133,43 @@ mod tests {
         }
     }
 
+    /// `ServerSpawn { cwd: Some(..) }` -- the attach menu's per-group
+    /// "spawn new here" row -- must actually start the process in that
+    /// directory, not merely record it as metadata. Exercised through
+    /// `ServerRead`, so this also proves the full request/dispatch/
+    /// `ServerPane::spawn` wiring end to end.
+    #[tokio::test]
+    async fn server_spawn_with_cwd_starts_the_process_there() {
+        let guard = start_daemon().await;
+        let mut conn = TestConn::connect(&guard.0).await;
+
+        let server_pane = match conn
+            .request(Request::ServerSpawn {
+                name: None,
+                cmd: Some("pwd".to_string()),
+                cwd: Some("/tmp".to_string()),
+            })
+            .await
+        {
+            Response::ServerPane(info) => info.id,
+            other => panic!("expected ServerPane, got {other:?}"),
+        };
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match conn.request(Request::ServerRead { target: server_pane.to_string() }).await {
+                // `/tmp` resolves to `/private/tmp` on macOS -- match on
+                // "tmp" (what `pwd` actually prints) rather than the
+                // literal path string passed in.
+                Response::ServerReadOutput { text } if text.contains("tmp") => break,
+                Response::ServerReadOutput { .. } => {}
+                other => panic!("expected ServerReadOutput, got {other:?}"),
+            }
+            assert!(std::time::Instant::now() < deadline, "pwd never printed the /tmp cwd it was spawned with");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     #[tokio::test]
     async fn server_read_unknown_target_errors() {
         let guard = start_daemon().await;
@@ -1151,7 +1190,7 @@ mod tests {
         let mut conn = TestConn::connect(&guard.0).await;
 
         let server_pane = match conn
-            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()) })
+            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None })
             .await
         {
             Response::ServerPane(info) => info.id,
@@ -1334,7 +1373,7 @@ mod tests {
         }
 
         let server_pane = match conn
-            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()) })
+            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None })
             .await
         {
             Response::ServerPane(info) => info.id,
@@ -1376,7 +1415,7 @@ mod tests {
 
         let mut owner = TestConn::connect(&guard.0).await;
         let server_pane = match owner
-            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()) })
+            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None })
             .await
         {
             Response::ServerPane(info) => info.id,
@@ -1484,7 +1523,7 @@ mod tests {
         // already-cheap "nobody's watching" early-out.
         let mut busy_conn = TestConn::connect(&guard.0).await;
         let busy_server = match busy_conn
-            .request(Request::ServerSpawn { name: None, cmd: Some("yes".to_string()) })
+            .request(Request::ServerSpawn { name: None, cmd: Some("yes".to_string()), cwd: None })
             .await
         {
             Response::ServerPane(info) => info.id,
@@ -1521,7 +1560,7 @@ mod tests {
         let start = std::time::Instant::now();
         for i in 0..10 {
             match other_conn
-                .request(Request::ServerSpawn { name: Some(format!("unrelated-{i}")), cmd: None })
+                .request(Request::ServerSpawn { name: Some(format!("unrelated-{i}")), cmd: None, cwd: None })
                 .await
             {
                 Response::ServerPane(_) => {}

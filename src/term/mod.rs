@@ -95,6 +95,7 @@ impl ServerPane {
         id: ServerPaneId,
         name: Option<String>,
         cmd: Option<String>,
+        cwd: Option<String>,
         size: Size,
         events: UnboundedSender<ServerPaneEvent>,
     ) -> anyhow::Result<Self> {
@@ -107,7 +108,7 @@ impl ServerPane {
         })?;
         let PtyPair { slave, master } = pair;
 
-        let builder = match &cmd {
+        let mut builder = match &cmd {
             // `sh -c <string>` is the simplest portable way to run an
             // arbitrary shell command string.
             Some(shell_cmd) => {
@@ -120,6 +121,13 @@ impl ServerPane {
             // and runs it as a login shell — "$SHELL with no args".
             None => CommandBuilder::new_default_prog(),
         };
+        // `None` leaves `CommandBuilder`'s own default in place (the
+        // spawning process's cwd) -- this only overrides it when a
+        // caller actually wants a specific starting directory (the
+        // attach menu's per-group "spawn new here" row).
+        if let Some(cwd) = cwd {
+            builder.cwd(cwd);
+        }
 
         let child = slave.spawn_command(builder)?;
         // Drop our copy of the slave fd once the child has inherited its
@@ -570,6 +578,7 @@ mod tests {
             id,
             None,
             Some("printf hello-dimux".to_string()),
+            None,
             Size { rows: 24, cols: 80 },
             tx,
         )
@@ -596,6 +605,7 @@ mod tests {
             id,
             None,
             Some("cat".to_string()),
+            None,
             Size { rows: 24, cols: 80 },
             tx,
         )
@@ -618,6 +628,7 @@ mod tests {
             id,
             None,
             Some("printf hi".to_string()),
+            None,
             Size { rows: 24, cols: 80 },
             tx,
         )
@@ -646,8 +657,8 @@ mod tests {
     fn flooding_pane_batches_changed_events_instead_of_firing_per_read() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let id = Uuid::new_v4();
-        let pane =
-            ServerPane::spawn(id, None, Some("yes".to_string()), Size { rows: 24, cols: 80 }, tx).unwrap();
+        let pane = ServerPane::spawn(id, None, Some("yes".to_string()), None, Size { rows: 24, cols: 80 }, tx)
+            .unwrap();
 
         // Let `yes` actually get its output flowing before measuring, so
         // the count isn't diluted by process startup time.
@@ -682,7 +693,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let id = Uuid::new_v4();
         let pane =
-            ServerPane::spawn(id, None, Some("cat".to_string()), Size { rows: 24, cols: 80 }, tx).unwrap();
+            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx).unwrap();
 
         for line in ["alpha", "bravo", "charlie"] {
             pane.write_input(format!("{line}\n").as_bytes()).unwrap();
@@ -716,6 +727,7 @@ mod tests {
             id,
             None,
             Some("cat".to_string()),
+            None,
             Size { rows: 24, cols: 80 },
             tx,
         )
@@ -727,11 +739,38 @@ mod tests {
     }
 
     #[test]
+    fn spawn_with_cwd_starts_the_shell_in_that_directory() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let id = Uuid::new_v4();
+        // `/tmp` resolves to `/private/tmp` on macOS -- `pwd`'s actual
+        // printed output is the source of truth here, not the path
+        // string passed in, so this asserts against whatever `pwd`
+        // prints rather than the literal `"/tmp"`.
+        let pane = ServerPane::spawn(
+            id,
+            None,
+            Some("pwd".to_string()),
+            Some("/tmp".to_string()),
+            Size { rows: 24, cols: 80 },
+            tx,
+        )
+        .unwrap();
+
+        let found = wait_until(&mut rx, || !snapshot_text(&pane).trim().is_empty());
+        assert!(found, "expected pwd to print something");
+        let text = snapshot_text(&pane);
+        assert!(
+            text.contains("tmp"),
+            "expected pwd's output to reflect the /tmp cwd it was spawned with, got: {text:?}"
+        );
+    }
+
+    #[test]
     fn scrollback_rows_is_zero_for_a_fresh_pane() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let id = Uuid::new_v4();
         let pane =
-            ServerPane::spawn(id, None, Some("cat".to_string()), Size { rows: 24, cols: 80 }, tx).unwrap();
+            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx).unwrap();
         assert_eq!(pane.scrollback_rows(), 0);
     }
 
@@ -742,7 +781,7 @@ mod tests {
         // A small 5-row pane makes it easy to scroll content off the
         // top with a modest number of printed lines.
         let pane =
-            ServerPane::spawn(id, None, Some("cat".to_string()), Size { rows: 5, cols: 80 }, tx).unwrap();
+            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 5, cols: 80 }, tx).unwrap();
 
         // Write enough lines to scroll "first-line" off the top of a
         // 5-row screen and into scrollback.
@@ -790,7 +829,7 @@ mod tests {
     fn foreground_info_reports_the_running_shell_command() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let id = Uuid::new_v4();
-        let pane = ServerPane::spawn(id, None, Some("cat".to_string()), Size { rows: 24, cols: 80 }, tx)
+        let pane = ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx)
             .unwrap();
 
         // Wait for the shell to actually exec `cat` (there's a brief
@@ -824,7 +863,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let id = Uuid::new_v4();
         let mut pane =
-            ServerPane::spawn(id, None, Some("cat".to_string()), Size { rows: 24, cols: 80 }, tx).unwrap();
+            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx).unwrap();
         pane.kill().unwrap();
         // The process group leader is gone once killed; there's nothing
         // left to query.

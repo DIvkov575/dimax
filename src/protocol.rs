@@ -270,6 +270,11 @@ pub enum Request {
     ServerSpawn {
         name: Option<String>,
         cmd: Option<String>,
+        /// Starting working directory for the spawned process; `None`
+        /// leaves the daemon's own cwd in place (the pre-existing
+        /// default). Set by the attach menu's per-group "spawn new
+        /// here" row to start the new pane in that group's directory.
+        cwd: Option<String>,
     },
     /// `target` is matched against both pane name and id (as a string).
     ServerKill {

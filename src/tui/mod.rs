@@ -467,7 +467,7 @@ impl App {
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
         let Response::ServerPane(server) = self
-            .request(write_half, reader, Request::ServerSpawn { name: None, cmd: None })
+            .request(write_half, reader, Request::ServerSpawn { name: None, cmd: None, cwd: None })
             .await?
         else {
             return Ok(());
@@ -782,10 +782,11 @@ impl App {
 
     /// Confirm the attach menu's current selection: bind the just-detached
     /// client-pane to the selected server-pane, spawning a fresh one first
-    /// if the trailing "spawn new" row is selected. Only ever called (via
-    /// `confirm_or_toggle_attach_menu`) when the selected row is a
-    /// `Server` or `SpawnNew` row -- a `GroupHeader` is intercepted
-    /// before this runs.
+    /// if the trailing "spawn new" row (no particular cwd) or a group's
+    /// own "+ spawn new here" row (spawns with that group's cwd) is
+    /// selected. Only ever called (via `confirm_or_toggle_attach_menu`)
+    /// when the selected row is a `Server`, `SpawnNewInGroup`, or
+    /// `SpawnNew` row -- a `GroupHeader` is intercepted before this runs.
     async fn confirm_attach_menu(
         &mut self,
         write_half: &mut OwnedWriteHalf,
@@ -797,12 +798,26 @@ impl App {
         let target = match row {
             AttachMenuRow::Server(server_index) => menu.servers[server_index].1.id.to_string(),
             AttachMenuRow::SpawnNew => match self
-                .request(write_half, reader, Request::ServerSpawn { name: None, cmd: None })
+                .request(write_half, reader, Request::ServerSpawn { name: None, cmd: None, cwd: None })
                 .await?
             {
                 Response::ServerPane(info) => info.id.to_string(),
                 _ => return Ok(()),
             },
+            AttachMenuRow::SpawnNewInGroup(server_index) => {
+                let cwd = menu.servers[server_index].0.clone();
+                match self
+                    .request(
+                        write_half,
+                        reader,
+                        Request::ServerSpawn { name: None, cmd: None, cwd: Some(cwd) },
+                    )
+                    .await?
+                {
+                    Response::ServerPane(info) => info.id.to_string(),
+                    _ => return Ok(()),
+                }
+            }
             AttachMenuRow::GroupHeader(_) => return Ok(()),
         };
         let req = Request::ClientBind { workspace: self.workspace.id.to_string(), pane, target };
@@ -1043,35 +1058,61 @@ enum AttachMenuRow {
     GroupHeader(usize),
     /// A real server-pane row; the index into `AttachMenu.servers`.
     Server(usize),
+    /// A group's own "+ spawn new here" row, right after its `Server`
+    /// rows -- carries the same first-member index as that group's
+    /// `GroupHeader`, from which its cwd key can be looked up. Never
+    /// emitted for the synthetic `"Unknown"` bucket (see
+    /// `visible_attach_menu_rows`): it aggregates panes with no
+    /// resolvable directory, so there's no real cwd to spawn a new pane
+    /// into.
+    SpawnNewInGroup(usize),
     SpawnNew,
 }
 
 /// Build the attach menu's current row list: a `GroupHeader` before each
 /// distinct cwd group's first member (matching `servers`' existing
 /// group-sorted order), that group's `Server` rows only if `collapsed`
-/// does not contain its key, then a trailing `SpawnNew`. Grouping itself
-/// stays `group_servers_by_cwd`'s job; this only decides which of those
-/// already-grouped rows are currently *visible* for selection/rendering.
-/// Takes the raw `servers` slice rather than a whole `AttachMenu` so a
-/// caller building the very first `AttachMenu` (no instance to borrow
-/// from yet) can still compute an initial `selected` from it — see
-/// `App::detach_and_open_menu`.
+/// does not contain its key, then that group's own `SpawnNewInGroup` row
+/// (skipped for the synthetic `"Unknown"` bucket -- see
+/// `AttachMenuRow::SpawnNewInGroup`'s doc comment), then a trailing
+/// `SpawnNew`. A collapsed group still shows its `SpawnNewInGroup` row
+/// (right after the header, since there are no `Server` rows to follow)
+/// -- collapsing hides *detail*, not the ability to quickly spawn into
+/// that directory. Grouping itself stays `group_servers_by_cwd`'s job;
+/// this only decides which of those already-grouped rows are currently
+/// *visible* for selection/rendering. Takes the raw `servers` slice
+/// rather than a whole `AttachMenu` so a caller building the very first
+/// `AttachMenu` (no instance to borrow from yet) can still compute an
+/// initial `selected` from it — see `App::detach_and_open_menu`.
 fn visible_attach_menu_rows(
     servers: &[(String, ServerPaneInfo)],
     collapsed: &HashSet<String>,
 ) -> Vec<AttachMenuRow> {
+    const UNKNOWN: &str = "Unknown";
     let mut rows = Vec::with_capacity(servers.len() + 2);
     let mut last_group: Option<&str> = None;
     let mut group_is_collapsed = false;
+    let mut group_start = 0;
     for (index, (group, _)) in servers.iter().enumerate() {
         if last_group != Some(group.as_str()) {
+            if let Some(prev_group) = last_group
+                && prev_group != UNKNOWN
+            {
+                rows.push(AttachMenuRow::SpawnNewInGroup(group_start));
+            }
             rows.push(AttachMenuRow::GroupHeader(index));
             last_group = Some(group.as_str());
             group_is_collapsed = collapsed.contains(group.as_str());
+            group_start = index;
         }
         if !group_is_collapsed {
             rows.push(AttachMenuRow::Server(index));
         }
+    }
+    if let Some(last) = last_group
+        && last != UNKNOWN
+    {
+        rows.push(AttachMenuRow::SpawnNewInGroup(group_start));
     }
     rows.push(AttachMenuRow::SpawnNew);
     rows
@@ -1697,15 +1738,17 @@ mod tests {
                 AttachMenuRow::GroupHeader(0),
                 AttachMenuRow::Server(0),
                 AttachMenuRow::Server(1),
+                AttachMenuRow::SpawnNewInGroup(0),
                 AttachMenuRow::GroupHeader(2),
                 AttachMenuRow::Server(2),
+                AttachMenuRow::SpawnNewInGroup(2),
                 AttachMenuRow::SpawnNew,
             ]
         );
     }
 
     #[test]
-    fn visible_attach_menu_rows_omits_server_rows_of_a_collapsed_group() {
+    fn visible_attach_menu_rows_omits_server_rows_of_a_collapsed_group_but_keeps_its_spawn_row() {
         let servers = vec![
             ("/a".to_string(), server_with_cwd("x", Some("/a"))),
             ("/a".to_string(), server_with_cwd("y", Some("/a"))),
@@ -1714,16 +1757,35 @@ mod tests {
         let mut collapsed = HashSet::new();
         collapsed.insert("/a".to_string());
         let rows = visible_attach_menu_rows(&servers, &collapsed);
-        // Both of "/a"'s Server rows disappear; its header stays so the
-        // group can still be found and re-expanded.
+        // Both of "/a"'s Server rows disappear; its header and its own
+        // "spawn new here" row stay so the group can still be
+        // re-expanded, or spawned into without expanding it first.
         assert_eq!(
             rows,
             vec![
                 AttachMenuRow::GroupHeader(0),
+                AttachMenuRow::SpawnNewInGroup(0),
                 AttachMenuRow::GroupHeader(2),
                 AttachMenuRow::Server(2),
+                AttachMenuRow::SpawnNewInGroup(2),
                 AttachMenuRow::SpawnNew,
             ]
+        );
+    }
+
+    #[test]
+    fn visible_attach_menu_rows_omits_spawn_in_group_for_the_unknown_bucket() {
+        let servers = vec![server_with_cwd("no-cwd", None)]
+            .into_iter()
+            .map(|s| ("Unknown".to_string(), s))
+            .collect::<Vec<_>>();
+        let rows = visible_attach_menu_rows(&servers, &HashSet::new());
+        // The synthetic "Unknown" bucket has no real directory to spawn
+        // a new pane into, so it gets no SpawnNewInGroup row at all --
+        // only the real per-group rows do.
+        assert_eq!(
+            rows,
+            vec![AttachMenuRow::GroupHeader(0), AttachMenuRow::Server(0), AttachMenuRow::SpawnNew]
         );
     }
 
@@ -1749,36 +1811,38 @@ mod tests {
     #[test]
     fn toggle_group_collapse_clamps_selection_into_the_shrunk_row_list() {
         let servers = vec![("/a".to_string(), server_with_cwd("x", Some("/a")))];
-        // Rows before collapse: 0 = header, 1 = server, 2 = spawn-new.
-        // Selecting the server row, then collapsing its own group, must
-        // not leave `selected` pointing past the now-shorter row list
-        // (header, spawn-new).
+        // Rows before collapse: 0 = header, 1 = server, 2 = "spawn new
+        // here", 3 = global spawn-new. Collapsing "/a" removes only its
+        // Server row (its own spawn-here row stays visible even
+        // collapsed -- see `visible_attach_menu_rows`), shrinking the
+        // list to 3 rows (0..=2). Selecting the last row beforehand must
+        // not leave `selected` pointing past that shrunk list.
         let mut app = App {
             workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 1, pending_delete: None, rename: None, previously_bound: None }),
+            attach_menu: Some(AttachMenu { servers, selected: 3, pending_delete: None, rename: None, previously_bound: None }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
         };
         app.toggle_group_collapse(0);
-        assert_eq!(app.attach_menu.unwrap().selected, 1, "should clamp onto the new last row (spawn-new)");
+        assert_eq!(app.attach_menu.unwrap().selected, 2, "should clamp onto the new last row (global spawn-new)");
     }
 
     #[test]
     fn move_attach_menu_selection_wraps_across_headers_and_spawn_new() {
         let servers = vec![("/a".to_string(), server_with_cwd("x", Some("/a")))];
-        // Rows: 0 = header, 1 = server, 2 = spawn-new -- len 3, so moving
-        // down from the last row wraps back to 0, and up from 0 wraps to
-        // the last row.
+        // Rows: 0 = header, 1 = server, 2 = "spawn new here", 3 = global
+        // spawn-new -- len 4, so moving down from the last row wraps
+        // back to 0, and up from 0 wraps to the last row.
         let mut app = App {
             workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 2, pending_delete: None, rename: None, previously_bound: None }),
+            attach_menu: Some(AttachMenu { servers, selected: 3, pending_delete: None, rename: None, previously_bound: None }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
@@ -1786,7 +1850,7 @@ mod tests {
         app.move_attach_menu_selection(true);
         assert_eq!(app.attach_menu.as_ref().unwrap().selected, 0);
         app.move_attach_menu_selection(false);
-        assert_eq!(app.attach_menu.as_ref().unwrap().selected, 2);
+        assert_eq!(app.attach_menu.as_ref().unwrap().selected, 3);
     }
 
     #[test]
