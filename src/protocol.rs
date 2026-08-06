@@ -285,6 +285,23 @@ pub enum Request {
         new_name: String,
     },
     ServerList,
+    /// Flip whether `dir` sorts to the top of the attach menu's
+    /// directory groups -- pins it (if not already pinned) or unpins
+    /// it (if it is). `dir` is an opaque string matched against
+    /// `ServerPaneInfo::foreground.cwd` values on the client side (see
+    /// `tui::group_servers_by_cwd`); the daemon does no validation of
+    /// it beyond storing it verbatim, since pinning a directory with
+    /// no server-panes in it right now is entirely reasonable (it'll
+    /// just have no effect until one appears there). Persisted to disk
+    /// so it survives a daemon restart -- see `daemon::pinned_dirs`'s
+    /// module doc.
+    ToggleDirectoryPin {
+        dir: String,
+    },
+    /// The current pin order, earliest-pinned first -- fetched
+    /// alongside `ServerList` (see `Response::PinnedDirsList`) whenever
+    /// a client needs to reproduce the attach menu's grouping.
+    PinnedDirsList,
 
     /// Create a client-pane in `workspace` (created if it doesn't exist).
     /// `split_of` names an existing leaf to split; if `None`, the
@@ -401,6 +418,11 @@ pub enum Response {
     Error { message: String },
     ServerPane(ServerPaneInfo),
     ServerPaneList(Vec<ServerPaneInfo>),
+    /// Reply to `PinnedDirsList` (and to `ToggleDirectoryPin`, so a
+    /// caller can update its local grouping from the same round trip
+    /// that changed it, with no separate re-fetch needed): the current
+    /// pin order, earliest-pinned first.
+    PinnedDirsList(Vec<String>),
     ClientPaneCreated { workspace: WorkspaceId, pane: ClientPaneId },
     ClientPaneList { workspace: WorkspaceId, panes: Vec<ClientPane> },
     /// Full state handed back on `Subscribe`: current layout plus a grid

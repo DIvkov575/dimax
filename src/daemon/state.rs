@@ -62,6 +62,15 @@ pub struct State {
     /// report output/exit.
     pane_events: UnboundedSender<ServerPaneEvent>,
     pane_events_rx: Option<UnboundedReceiver<ServerPaneEvent>>,
+    /// Directory-group cwd strings the attach menu should sort first
+    /// (in this order -- the earliest-pinned dir sorts above a
+    /// later-pinned one, both above every unpinned dir), persisted to
+    /// disk via `super::pinned_dirs` so pinning survives a daemon
+    /// restart -- see that module's doc comment for why this is the
+    /// one piece of `State` that isn't purely in-memory/ephemeral.
+    /// Loaded once in `State::new`; every mutation
+    /// (`toggle_pinned_dir`) re-saves immediately.
+    pinned_dirs: Vec<String>,
 }
 
 struct Workspace {
@@ -87,6 +96,7 @@ impl State {
             scroll_offsets: HashMap::new(),
             pane_events,
             pane_events_rx: Some(pane_events_rx),
+            pinned_dirs: super::pinned_dirs::load(),
         }
     }
 
@@ -240,6 +250,37 @@ impl State {
     /// `State` itself never reads grids or writes input.
     pub fn server_pane(&self, id: ServerPaneId) -> Option<&ServerPane> {
         self.server_panes.get(&id)
+    }
+
+    /// The current pin order (earliest-pinned first) -- what
+    /// `tui::group_servers_by_cwd` sorts against. A plain accessor
+    /// rather than something folded into `server_list`'s own return
+    /// value: pinning is a directory-level concept independent of
+    /// which (if any) server-panes currently exist for that directory,
+    /// so it doesn't belong on `ServerPaneInfo` -- see `Request
+    /// ::ServerList`'s dispatch arm, which fetches this alongside the
+    /// pane list precisely because a client needs both to reproduce
+    /// the attach menu's grouping.
+    pub fn pinned_dirs(&self) -> &[String] {
+        &self.pinned_dirs
+    }
+
+    /// Flip `dir`'s pinned state: pins it (appended to the end of the
+    /// current pin order, so it sorts after every already-pinned dir
+    /// but still above every unpinned one) if not already pinned,
+    /// unpins it otherwise. Persists the new order to disk immediately
+    /// via `pinned_dirs::save` -- see that module's doc comment for
+    /// why this doesn't batch. Always succeeds (no validation: `dir` is
+    /// just an opaque string from the caller's point of view, matched
+    /// against whatever `ServerPaneInfo::foreground.cwd` values happen
+    /// to be in play -- there's nothing to look up or fail on here).
+    pub fn toggle_pinned_dir(&mut self, dir: String) {
+        if let Some(pos) = self.pinned_dirs.iter().position(|d| *d == dir) {
+            self.pinned_dirs.remove(pos);
+        } else {
+            self.pinned_dirs.push(dir);
+        }
+        super::pinned_dirs::save(&self.pinned_dirs);
     }
 
     fn find_server_pane_by_name(&self, name: &str) -> Option<ServerPaneId> {
@@ -900,6 +941,88 @@ mod tests {
                 Some("c".to_string())
             ]
         );
+    }
+
+    // -- directory pinning -----------------------------------------------
+
+    /// Serializes every test in this section: `toggle_pinned_dir` saves
+    /// to disk via `pinned_dirs::save`, which reads `$XDG_CONFIG_HOME`
+    /// (process-global), so two such tests running concurrently (the
+    /// default under `cargo test`) could otherwise stomp on each
+    /// other's env state or on-disk file mid-test.
+    static PIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_fake_config_home<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let _guard = PIN_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", dir);
+        }
+        let result = f();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn toggle_pinned_dir_pins_then_unpins() {
+        let dir = std::env::temp_dir().join(format!("dmx-state-pin-test-{}", std::process::id()));
+        with_fake_config_home(&dir, || {
+            let mut state = State::new();
+            assert_eq!(state.pinned_dirs(), &[] as &[String]);
+
+            state.toggle_pinned_dir("/home/dev/api".to_string());
+            assert_eq!(state.pinned_dirs(), &["/home/dev/api".to_string()]);
+
+            state.toggle_pinned_dir("/home/dev/api".to_string());
+            assert_eq!(state.pinned_dirs(), &[] as &[String]);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toggle_pinned_dir_appends_new_pins_after_existing_ones() {
+        let dir = std::env::temp_dir().join(format!("dmx-state-pin-test-{}", std::process::id() + 1));
+        with_fake_config_home(&dir, || {
+            let mut state = State::new();
+            state.toggle_pinned_dir("/a".to_string());
+            state.toggle_pinned_dir("/b".to_string());
+            assert_eq!(state.pinned_dirs(), &["/a".to_string(), "/b".to_string()]);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toggle_pinned_dir_unpinning_the_first_of_several_preserves_the_rest_in_order() {
+        let dir = std::env::temp_dir().join(format!("dmx-state-pin-test-{}", std::process::id() + 2));
+        with_fake_config_home(&dir, || {
+            let mut state = State::new();
+            state.toggle_pinned_dir("/a".to_string());
+            state.toggle_pinned_dir("/b".to_string());
+            state.toggle_pinned_dir("/c".to_string());
+            state.toggle_pinned_dir("/a".to_string()); // unpin
+            assert_eq!(state.pinned_dirs(), &["/b".to_string(), "/c".to_string()]);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toggle_pinned_dir_persists_across_a_fresh_state_load() {
+        let dir = std::env::temp_dir().join(format!("dmx-state-pin-test-{}", std::process::id() + 3));
+        with_fake_config_home(&dir, || {
+            let mut state = State::new();
+            state.toggle_pinned_dir("/home/dev/api".to_string());
+
+            // A brand-new `State` (as a daemon restart would construct)
+            // must pick the pin back up from disk.
+            let reloaded = State::new();
+            assert_eq!(reloaded.pinned_dirs(), &["/home/dev/api".to_string()]);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -- workspace resolution ------------------------------------------
