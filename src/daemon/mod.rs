@@ -290,7 +290,7 @@ async fn dispatch(
         }
 
         Request::ServerList => {
-            let state = state.lock().await;
+            let mut state = state.lock().await;
             Response::ServerPaneList(state.server_list())
         }
 
