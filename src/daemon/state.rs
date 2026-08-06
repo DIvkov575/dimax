@@ -575,9 +575,13 @@ impl State {
             (removed, empty)
         };
         if remaining_empty {
-            return self
-                .client_close(workspace, pane)
-                .map(|()| CloseTabResult::LeafClosed);
+            // `removed` is already gone from `leaf.tabs` by this point, so
+            // `client_close`'s own resize logic (which reads the leaf's
+            // *current* active_bound, now empty) recomputes nothing for
+            // it -- apply it explicitly, same as the non-empty path below.
+            let result = self.client_close(workspace, pane).map(|()| CloseTabResult::LeafClosed);
+            self.apply_pty_size(removed);
+            return result;
         }
         let new_active = self.bound_server_pane(pane);
         self.apply_pty_size(removed);
@@ -874,8 +878,17 @@ fn unbind_all(tree: &mut SplitTree, server_pane: ServerPaneId) {
         SplitTree::Leaf(pane) => {
             // Background tabs bind the killed pane just as much as the
             // active one does, so this drops every occurrence, not one.
+            // `active_tab` is an *index*: removing an occurrence that
+            // sits before it must shift it down by one, or the leaf
+            // ends up silently displaying a different tab than the one
+            // the user was looking at.
+            let removed_before = pane.tabs[..pane.active_tab.min(pane.tabs.len())]
+                .iter()
+                .filter(|&&id| id == server_pane)
+                .count();
             pane.tabs.retain(|&id| id != server_pane);
-            if pane.active_tab >= pane.tabs.len() && !pane.tabs.is_empty() {
+            pane.active_tab = pane.active_tab.saturating_sub(removed_before);
+            if !pane.tabs.is_empty() && pane.active_tab >= pane.tabs.len() {
                 pane.active_tab = pane.tabs.len() - 1;
             }
         }
@@ -1565,6 +1578,34 @@ mod tests {
         assert_eq!(state.workspace_info(ws).unwrap().tree, None);
     }
 
+    /// Closing a leaf's last tab must still recompute the freed
+    /// server-pane's PTY size for its *other* viewers -- the `LeafClosed`
+    /// path removes the tab from `leaf.tabs` before delegating to
+    /// `client_close`, so `client_close`'s own resize (which reads the
+    /// leaf's now-empty `active_bound()`) sees nothing to resize; this
+    /// regresses unless the removed pane's size is recomputed explicitly.
+    #[test]
+    fn client_close_tab_last_tab_recomputes_pty_size_for_remaining_viewers() {
+        let mut state = State::new();
+        let shared = spawn_pane(&mut state, "shared");
+        let (ws_a, small) = workspace_with_bound_pane(&mut state, "1", shared);
+        let (ws_b, _big) = workspace_with_bound_pane(&mut state, "2", shared);
+        state.subscribe(1, ws_a);
+        state.subscribe(2, ws_b);
+        state.resize_client_pane(small, size(10, 20));
+        let big_pane = state.workspace_info(ws_b).unwrap().tree.unwrap().leaves()[0].id;
+        state.resize_client_pane(big_pane, size(40, 100));
+        assert_eq!(pane_size(&state, shared), size(10, 20), "smallest viewer should win before closing");
+
+        assert_eq!(state.client_close_tab(ws_a, small).unwrap(), CloseTabResult::LeafClosed);
+
+        assert_eq!(
+            pane_size(&state, shared),
+            size(40, 100),
+            "closing the small viewer's only tab should hand the PTY back to the remaining viewer"
+        );
+    }
+
     #[test]
     fn client_close_tab_on_unbound_pane_closes_the_leaf() {
         let mut state = State::new();
@@ -1593,6 +1634,31 @@ mod tests {
         let leaf = leaf_of(&state, ws, pane);
         assert_eq!(leaf.tabs, vec![sp2]);
         assert_eq!(leaf.active_tab, 0);
+    }
+
+    /// A background tab *before* the active one is removed: `active_tab`
+    /// must shift down to keep pointing at the same server-pane, not just
+    /// get clamped (which happens to be a no-op here since the index stays
+    /// in range after the shift -- the exact case `..from_background_tabs`
+    /// above can't catch, since there the active tab is last).
+    #[test]
+    fn unbind_all_removes_a_background_tab_before_the_active_one_without_shifting_the_active_pane() {
+        let mut state = State::new();
+        let sp1 = spawn_pane(&mut state, "a");
+        let sp2 = spawn_pane(&mut state, "b");
+        let sp3 = spawn_pane(&mut state, "c");
+        let (ws, pane) = workspace_with_bound_pane(&mut state, "1", sp1);
+        state.client_add_tab(ws, pane, sp2).unwrap();
+        state.client_add_tab(ws, pane, sp3).unwrap();
+        // active_tab is 2 (sp3); step back to sp2 so the killed pane (sp1)
+        // sits *before* the active index.
+        state.client_cycle_tab(ws, pane, false).unwrap();
+
+        state.server_kill("a").unwrap();
+
+        let leaf = leaf_of(&state, ws, pane);
+        assert_eq!(leaf.tabs, vec![sp2, sp3]);
+        assert_eq!(leaf.active_bound(), Some(sp2), "killing a background tab must not change which tab is displayed");
     }
 
     #[test]
