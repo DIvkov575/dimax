@@ -223,8 +223,20 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
+/// `dimux config`: regenerate `dimux.conf` (Kitty chord mappings) if
+/// needed, then open it in `$EDITOR`/`$VISUAL`. Pure local file/process
+/// work -- unlike every other `Cli` variant this touches, it never
+/// connects to the daemon.
 pub async fn run_config() -> anyhow::Result<()> {
-    unimplemented!("filled in by Task 2")
+    let path = crate::tui::kitty_setup::ensure_config_written()?;
+    let editor = std::env::var("EDITOR")
+        .or_else(|_| std::env::var("VISUAL"))
+        .map_err(|_| anyhow::anyhow!("set $EDITOR or $VISUAL to use `dimux config`"))?;
+    let status = std::process::Command::new(editor).arg(&path).status()?;
+    if !status.success() {
+        anyhow::bail!("editor exited with {status}");
+    }
+    Ok(())
 }
 
 async fn run_server(cmd: ServerCmd) -> anyhow::Result<()> {

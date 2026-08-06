@@ -124,7 +124,7 @@
 //!   not live throughout the drag.
 
 pub mod keys;
-mod kitty_setup;
+pub(crate) mod kitty_setup;
 pub mod mouse;
 pub mod render;
 

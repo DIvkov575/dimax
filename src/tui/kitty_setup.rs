@@ -117,28 +117,49 @@ fn kitty_config_dir() -> Option<PathBuf> {
 ///
 /// Called once at the top of [`super::run`], before anything else --
 /// see that call site for why a failure here must never propagate.
+/// Thin wrapper over [`ensure_config_written`] that swallows every
+/// error for that silent-failure contract; `dimux config` (which wants
+/// a *real* error, not silence) calls `ensure_config_written` directly.
 pub fn ensure_installed() {
-    let _ = try_ensure_installed();
+    let _ = ensure_config_written();
 }
 
-fn try_ensure_installed() -> std::io::Result<()> {
+/// The fallible core of [`ensure_installed`]: same silent-no-op rules
+/// documented there (not under Kitty / no existing `kitty.conf` / a
+/// hand-written `dimux.conf`), but returns those as `Ok(path)` --
+/// callers that only care about "did it run" use [`ensure_installed`]
+/// instead. Also returns `Ok(path)` when a hand-written `dimux.conf`
+/// blocked the actual write, since `dimux config` still wants to open
+/// *that* file (just not overwrite it first). Returns an `Err` only for
+/// a genuine failure: not running under Kitty at all (nothing to open),
+/// no resolvable Kitty config directory, or an I/O error. On success,
+/// returns the path to `dimux.conf` (written or left alone) so the
+/// caller can open it directly rather than recomputing the path itself.
+pub fn ensure_config_written() -> anyhow::Result<PathBuf> {
     if !running_under_kitty() {
-        return Ok(());
+        anyhow::bail!("not running inside a Kitty window (KITTY_WINDOW_ID is unset)");
     }
-    let Some(config_dir) = kitty_config_dir() else { return Ok(()) };
+    let config_dir = kitty_config_dir().ok_or_else(|| {
+        anyhow::anyhow!("could not resolve a Kitty config directory (no $HOME or $KITTY_CONFIG_DIRECTORY)")
+    })?;
+    let dimux_conf = config_dir.join("dimux.conf");
     let kitty_conf = config_dir.join("kitty.conf");
     if !kitty_conf.is_file() {
-        return Ok(());
+        // No existing kitty.conf to patch -- nothing written, but the
+        // path is still meaningful for a caller that wants to inspect
+        // or create it themselves.
+        return Ok(dimux_conf);
     }
 
-    let dimux_conf = config_dir.join("dimux.conf");
     let is_ours = match std::fs::read_to_string(&dimux_conf) {
         Ok(existing) => existing.starts_with(GENERATED_MARKER),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-        Err(e) => return Err(e),
+        Err(e) => return Err(e.into()),
     };
     if !is_ours {
-        return Ok(());
+        // A hand-written dimux.conf -- leave it untouched, but this is
+        // still the file a caller should open.
+        return Ok(dimux_conf);
     }
     std::fs::write(&dimux_conf, render_dimux_conf())?;
 
@@ -149,7 +170,7 @@ fn try_ensure_installed() -> std::io::Result<()> {
         // one, so this never gets glued onto the previous line.
         writeln!(file, "\ninclude dimux.conf")?;
     }
-    Ok(())
+    Ok(dimux_conf)
 }
 
 #[cfg(test)]
@@ -205,7 +226,7 @@ mod tests {
         }
     }
 
-    /// Runs `try_ensure_installed` against a fake config directory by
+    /// Runs `ensure_config_written` against a fake config directory by
     /// setting `KITTY_WINDOW_ID` and `KITTY_CONFIG_DIRECTORY` for the
     /// duration of `f`, then restoring both -- these tests can't run
     /// concurrently with each other (env vars are process-global), so
@@ -236,23 +257,22 @@ mod tests {
 
     #[test]
     fn ensure_installed_is_a_no_op_when_not_running_under_kitty() {
-        let dir = std::env::temp_dir().join(format!("dmx-kitty-test-{}", std::process::id()));
-        setup_fake_kitty_config(&dir, Some("# my config\n"), None);
-
         let _guard = ENV_LOCK.lock().unwrap();
         let prev = std::env::var_os("KITTY_WINDOW_ID");
         unsafe {
             std::env::remove_var("KITTY_WINDOW_ID");
         }
-        try_ensure_installed().unwrap();
+        let result = ensure_config_written();
         unsafe {
-            if let Some(v) = prev {
-                std::env::set_var("KITTY_WINDOW_ID", v);
+            match prev {
+                Some(v) => std::env::set_var("KITTY_WINDOW_ID", v),
+                None => std::env::remove_var("KITTY_WINDOW_ID"),
             }
         }
-
-        assert!(!dir.join("dimux.conf").exists(), "should not write anything when not under Kitty");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.is_err());
+        // ensure_installed itself, which swallows the error, must still be
+        // a true no-op: no dimux.conf/kitty.conf files should exist to
+        // check here since none were set up by this test.
     }
 
     #[test]
@@ -260,7 +280,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dmx-kitty-test-{}", std::process::id() + 1));
         setup_fake_kitty_config(&dir, None, None);
 
-        with_fake_kitty_env(&dir, || try_ensure_installed().unwrap());
+        with_fake_kitty_env(&dir, || ensure_config_written().unwrap());
 
         assert!(!dir.join("dimux.conf").exists());
         let _ = std::fs::remove_dir_all(&dir);
@@ -271,7 +291,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dmx-kitty-test-{}", std::process::id() + 2));
         setup_fake_kitty_config(&dir, Some("# my existing config\nfont_size 12\n"), None);
 
-        with_fake_kitty_env(&dir, || try_ensure_installed().unwrap());
+        with_fake_kitty_env(&dir, || ensure_config_written().unwrap());
 
         let dimux_conf = std::fs::read_to_string(dir.join("dimux.conf")).unwrap();
         assert!(dimux_conf.starts_with(GENERATED_MARKER));
@@ -285,13 +305,39 @@ mod tests {
     }
 
     #[test]
+    fn ensure_config_written_returns_the_dimux_conf_path() {
+        let dir = std::env::temp_dir().join(format!("dmx-kitty-config-path-{}", std::process::id()));
+        setup_fake_kitty_config(&dir, Some(""), None);
+        let path = with_fake_kitty_env(&dir, || ensure_config_written().unwrap());
+        assert_eq!(path, dir.join("dimux.conf"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_config_written_errors_when_not_under_kitty() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("KITTY_WINDOW_ID");
+        unsafe {
+            std::env::remove_var("KITTY_WINDOW_ID");
+        }
+        let result = ensure_config_written();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("KITTY_WINDOW_ID", v),
+                None => std::env::remove_var("KITTY_WINDOW_ID"),
+            }
+        }
+        assert!(result.is_err(), "dimux config should surface a real error, not silently no-op, when not under Kitty");
+    }
+
+    #[test]
     fn ensure_installed_does_not_duplicate_the_include_line_on_a_second_run() {
         let dir = std::env::temp_dir().join(format!("dmx-kitty-test-{}", std::process::id() + 3));
         setup_fake_kitty_config(&dir, Some("# my config\n"), None);
 
         with_fake_kitty_env(&dir, || {
-            try_ensure_installed().unwrap();
-            try_ensure_installed().unwrap();
+            ensure_config_written().unwrap();
+            ensure_config_written().unwrap();
         });
 
         let kitty_conf = std::fs::read_to_string(dir.join("kitty.conf")).unwrap();
@@ -307,7 +353,7 @@ mod tests {
         let stale_generated = format!("{GENERATED_MARKER}\nmap cmd+1 send_text all \\x1b_D1\\x1b\\\\\n");
         setup_fake_kitty_config(&dir, Some("include dimux.conf\n"), Some(&stale_generated));
 
-        with_fake_kitty_env(&dir, || try_ensure_installed().unwrap());
+        with_fake_kitty_env(&dir, || ensure_config_written().unwrap());
 
         let dimux_conf = std::fs::read_to_string(dir.join("dimux.conf")).unwrap();
         assert!(dimux_conf.contains("map cmd+shift+z"), "should have been regenerated with the full current table");
@@ -321,7 +367,7 @@ mod tests {
         let hand_written = "# my own custom dimux.conf, not generated by dimux\nmap cmd+x send_text all foo\n";
         setup_fake_kitty_config(&dir, Some("include dimux.conf\n"), Some(hand_written));
 
-        with_fake_kitty_env(&dir, || try_ensure_installed().unwrap());
+        with_fake_kitty_env(&dir, || ensure_config_written().unwrap());
 
         let dimux_conf = std::fs::read_to_string(dir.join("dimux.conf")).unwrap();
         assert_eq!(dimux_conf, hand_written, "a dimux.conf without the generated marker must be left untouched");
