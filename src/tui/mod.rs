@@ -366,6 +366,18 @@ struct App {
     /// means closing/reopening the menu doesn't need to remember to
     /// carry it along.
     attach_menu_preview: Option<(ServerPaneId, String)>,
+    /// The daemon's current pin order (earliest-pinned first), cached
+    /// client-side the same way `collapsed_groups` is -- fetched via
+    /// `Request::PinnedDirsList`/`ToggleDirectoryPin` whenever the
+    /// server list is (re-)fetched, and passed to
+    /// `group_servers_by_cwd` every time `menu.servers` is (re)built.
+    /// Lives on `App`, not `AttachMenu`: unlike `collapsed_groups` this
+    /// is genuinely server-owned state (persisted to disk, shared
+    /// across every connected frontend), not a purely local UI
+    /// preference, but it's still most convenient to read from
+    /// wherever the menu's grouping gets rebuilt, same as
+    /// `collapsed_groups`.
+    pinned_dirs: Vec<String>,
 }
 
 impl App {
@@ -398,6 +410,7 @@ impl App {
                         dragging_split: None,
                         collapsed_groups: HashSet::new(),
                         attach_menu_preview: None,
+                        pinned_dirs: Vec::new(),
                     });
                 }
                 ServerMessage::Response(other) => {
@@ -582,11 +595,16 @@ impl App {
             self.workspace.tree.as_ref().and_then(|tree| tree.find(pane)).and_then(|leaf| leaf.bound);
         let req = Request::ClientUnbind { workspace: self.workspace.id.to_string(), pane };
         let _ = self.request(write_half, reader, req).await?;
+        if let Response::PinnedDirsList(pinned) =
+            self.request(write_half, reader, Request::PinnedDirsList).await?
+        {
+            self.pinned_dirs = pinned;
+        }
         if let Response::ServerPaneList(servers) =
             self.request(write_half, reader, Request::ServerList).await?
         {
             self.attach_menu = Some(AttachMenu {
-                servers: group_servers_by_cwd(servers),
+                servers: group_servers_by_cwd(servers, &self.pinned_dirs),
                 selected: 0,
                 pending_delete: None,
                 rename: None,
@@ -735,6 +753,7 @@ impl App {
             AttachMenuAction::Confirm => self.confirm_or_toggle_attach_menu(write_half, reader).await?,
             AttachMenuAction::Delete => self.arm_delete(),
             AttachMenuAction::StartRename => self.start_rename(),
+            AttachMenuAction::TogglePin => self.toggle_directory_pin(write_half, reader).await?,
             AttachMenuAction::Ignore => {}
         }
         Ok(())
@@ -830,6 +849,46 @@ impl App {
         }
     }
 
+    /// `p` on a group header: pin the directory if it isn't pinned yet,
+    /// unpin it if it is (see `state::State::toggle_pinned_dir`'s doc
+    /// comment for the exact ordering rule). A no-op on any other row --
+    /// there's no directory to pin from a server/spawn/spawn-new row.
+    /// Re-fetches and re-groups the server list afterward since pin
+    /// order can move every group's position, not just the toggled
+    /// one's, then clamps `selected` the same way `toggle_group_collapse`
+    /// does in case the row list's length or the header's own position
+    /// shifted out from under the cursor.
+    async fn toggle_directory_pin(
+        &mut self,
+        write_half: &mut OwnedWriteHalf,
+        reader: &mut FrameReader,
+    ) -> anyhow::Result<()> {
+        let Some(AttachMenuRow::GroupHeader(server_index)) = self.selected_attach_menu_row() else {
+            return Ok(());
+        };
+        let Some(menu) = &self.attach_menu else { return Ok(()) };
+        let dir = menu.servers[server_index].0.clone();
+
+        if let Response::PinnedDirsList(pinned) =
+            self.request(write_half, reader, Request::ToggleDirectoryPin { dir }).await?
+        {
+            self.pinned_dirs = pinned;
+        }
+        if let Response::ServerPaneList(servers) =
+            self.request(write_half, reader, Request::ServerList).await?
+        {
+            let grouped = group_servers_by_cwd(servers, &self.pinned_dirs);
+            let collapsed = self.collapsed_groups.clone();
+            let Some(menu) = &mut self.attach_menu else { return Ok(()) };
+            menu.servers = grouped;
+            let len = visible_attach_menu_rows(&menu.servers, &collapsed).len();
+            if menu.selected >= len {
+                menu.selected = len - 1;
+            }
+        }
+        Ok(())
+    }
+
     /// Arm the selected row's deletion (first `x`) if it names a real
     /// server-pane row; a no-op on a group header or the trailing "spawn
     /// new" row (nothing to delete there).
@@ -858,7 +917,7 @@ impl App {
         if let Response::ServerPaneList(servers) =
             self.request(write_half, reader, Request::ServerList).await?
         {
-            let grouped = group_servers_by_cwd(servers);
+            let grouped = group_servers_by_cwd(servers, &self.pinned_dirs);
             let collapsed = self.collapsed_groups.clone();
             let Some(menu) = &mut self.attach_menu else { return Ok(()) };
             menu.servers = grouped;
@@ -908,8 +967,9 @@ impl App {
                 if let Response::ServerPaneList(servers) =
                     self.request(write_half, reader, Request::ServerList).await?
                 {
+                    let grouped = group_servers_by_cwd(servers, &self.pinned_dirs);
                     let Some(menu) = &mut self.attach_menu else { return Ok(()) };
-                    menu.servers = group_servers_by_cwd(servers);
+                    menu.servers = grouped;
                     menu.rename = None;
                 }
             }
@@ -1026,7 +1086,7 @@ impl App {
             if let Response::ServerPaneList(servers) =
                 self.request(write_half, reader, Request::ServerList).await?
             {
-                let grouped = group_servers_by_cwd(servers);
+                let grouped = group_servers_by_cwd(servers, &self.pinned_dirs);
                 let collapsed = self.collapsed_groups.clone();
                 if let Some(menu) = &mut self.attach_menu {
                     menu.servers = grouped;
@@ -1340,25 +1400,48 @@ fn visible_attach_menu_rows(
     rows
 }
 
-fn group_servers_by_cwd(mut servers: Vec<ServerPaneInfo>) -> Vec<(String, ServerPaneInfo)> {
-    const UNKNOWN: &str = "Unknown";
-    servers.sort_by(|a, b| {
-        let key_a = a.foreground.as_ref().and_then(|f| f.cwd.as_deref()).unwrap_or(UNKNOWN);
-        let key_b = b.foreground.as_ref().and_then(|f| f.cwd.as_deref()).unwrap_or(UNKNOWN);
-        match (key_a == UNKNOWN, key_b == UNKNOWN) {
-            (true, true) => std::cmp::Ordering::Equal,
-            (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            (false, false) => key_a.cmp(key_b),
+/// Synthetic group key for a server-pane with no resolvable foreground
+/// `cwd` (a `Dead` pane, or a live one whose lookup failed) -- always
+/// sorted last, regardless of pin state: pinning is a directory-level
+/// preference, and there's no real directory here to have pinned.
+const UNKNOWN_GROUP: &str = "Unknown";
+
+/// Sort `servers` into cwd-bucket order for the attach menu's grouped
+/// display, then hand back `(group_key, server)` pairs (see this
+/// function's return type doc below for why a flat `Vec` rather than
+/// nested groups). Order: every directory in `pinned` first, in
+/// `pinned`'s own order (the earliest-pinned dir sorts above a
+/// later-pinned one -- `pinned` is itself already in that order, see
+/// `state::State::toggle_pinned_dir`'s doc comment), then every
+/// remaining real directory ascending alphabetically, then
+/// [`UNKNOWN_GROUP`] last regardless of anything else. Within a bucket,
+/// panes keep their relative input order (stable sort, no secondary
+/// key) -- whatever order `ServerList`/`ServerPaneList` returned.
+/// Returns `(group_key, server)` pairs rather than a nested
+/// `Vec<Vec<_>>` so callers can walk it once and detect group
+/// boundaries by comparing consecutive keys, which is exactly what
+/// `render::draw_attach_menu` needs to decide where to emit a header.
+fn group_servers_by_cwd(mut servers: Vec<ServerPaneInfo>, pinned: &[String]) -> Vec<(String, ServerPaneInfo)> {
+    let key_of = |s: &ServerPaneInfo| -> String {
+        s.foreground.as_ref().and_then(|f| f.cwd.clone()).unwrap_or_else(|| UNKNOWN_GROUP.to_string())
+    };
+    // `(pin_rank, key)`: `pin_rank` is the dir's index into `pinned`
+    // (so earlier-pinned sorts first), `pinned.len()` for any real,
+    // unpinned directory (sorts after every pinned one, then subject
+    // to the plain alphabetical `key` tie-break), or `usize::MAX` for
+    // `UNKNOWN_GROUP` (always last, full stop).
+    let rank_of = |key: &str| -> usize {
+        if key == UNKNOWN_GROUP {
+            usize::MAX
+        } else {
+            pinned.iter().position(|p| p == key).unwrap_or(pinned.len())
         }
+    };
+    servers.sort_by(|a, b| {
+        let (key_a, key_b) = (key_of(a), key_of(b));
+        rank_of(&key_a).cmp(&rank_of(&key_b)).then_with(|| key_a.cmp(&key_b))
     });
-    servers
-        .into_iter()
-        .map(|s| {
-            let key = s.foreground.as_ref().and_then(|f| f.cwd.clone()).unwrap_or_else(|| UNKNOWN.to_string());
-            (key, s)
-        })
-        .collect()
+    servers.into_iter().map(|s| (key_of(&s), s)).collect()
 }
 
 /// Attach-menu input, decoupled from the raw bytes that produced it (same
@@ -1380,6 +1463,10 @@ enum AttachMenuAction {
     Delete,
     /// `r` on a real server-pane row: open the inline rename field.
     StartRename,
+    /// `p` on a group header row: pin/unpin that directory (see
+    /// `App::toggle_directory_pin`). A no-op on any other row -- there's
+    /// no directory to pin from a server/spawn/spawn-new row.
+    TogglePin,
     Ignore,
 }
 
@@ -1387,14 +1474,14 @@ enum AttachMenuAction {
 /// arrow-key escape sequences and vi-style `j`/`k` move the selection,
 /// Enter (`\r` or `\n`) confirms, a bare `Esc` cancels (leaving the pane
 /// unbound — it was already detached by `detach_and_open_menu` before the
-/// menu opened), `x` arms/confirms delete, `r` opens rename. Anything else
-/// is ignored rather than passed through — the menu is modal and has no
-/// server-pane to forward keystrokes to yet. Note: this table is only
-/// consulted for *browsing* mode — `App::handle_attach_menu_input` routes
-/// to entirely separate byte-handling while `pending_delete`/`rename` are
-/// active, so `x`/Enter's *confirm* behavior when a delete is already
-/// armed is handled there, not by this function returning some third
-/// "confirm delete" variant.
+/// menu opened), `x` arms/confirms delete, `r` opens rename, `p` toggles a
+/// pin. Anything else is ignored rather than passed through — the menu is
+/// modal and has no server-pane to forward keystrokes to yet. Note: this
+/// table is only consulted for *browsing* mode — `App::handle_attach_menu_input`
+/// routes to entirely separate byte-handling while `pending_delete`/
+/// `rename` are active, so `x`/Enter's *confirm* behavior when a delete is
+/// already armed is handled there, not by this function returning some
+/// third "confirm delete" variant.
 fn parse_attach_menu_input(bytes: &[u8]) -> AttachMenuAction {
     match bytes {
         b"\r" | b"\n" => AttachMenuAction::Confirm,
@@ -1403,6 +1490,7 @@ fn parse_attach_menu_input(bytes: &[u8]) -> AttachMenuAction {
         b"\x1b[B" | b"j" => AttachMenuAction::Down,
         b"x" => AttachMenuAction::Delete,
         b"r" => AttachMenuAction::StartRename,
+        b"p" => AttachMenuAction::TogglePin,
         _ => AttachMenuAction::Ignore,
     }
 }
@@ -1631,6 +1719,7 @@ pub async fn run() -> anyhow::Result<()> {
                     menu,
                     &app.collapsed_groups,
                     app.attach_menu_preview.as_ref(),
+                    &app.pinned_dirs,
                 );
             }
         })?;
@@ -1922,6 +2011,11 @@ mod tests {
     }
 
     #[test]
+    fn parse_attach_menu_input_p_is_toggle_pin() {
+        assert_eq!(parse_attach_menu_input(b"p"), AttachMenuAction::TogglePin);
+    }
+
+    #[test]
     fn quit_byte_is_ctrl_q_not_ctrl_c() {
         assert!(is_quit(&[0x11]));
         assert!(!is_quit(&[0x03]), "Ctrl-C must remain a pass-through byte, not the quit key");
@@ -1966,7 +2060,7 @@ mod tests {
             server_with_cwd("b", Some("/home/dev/web")),
             server_with_cwd("c", Some("/home/dev/api")),
         ];
-        let grouped = group_servers_by_cwd(servers);
+        let grouped = group_servers_by_cwd(servers, &[]);
         let names: Vec<&str> = grouped.iter().map(|(_, s)| s.name.as_deref().unwrap()).collect();
         // Ascending by cwd: api's two panes (in original relative order),
         // then web's one pane.
@@ -1981,7 +2075,7 @@ mod tests {
             server_with_cwd("no-cwd", None),
             server_with_cwd("has-cwd", Some("/zzz/last-alphabetically")),
         ];
-        let grouped = group_servers_by_cwd(servers);
+        let grouped = group_servers_by_cwd(servers, &[]);
         let names: Vec<&str> = grouped.iter().map(|(_, s)| s.name.as_deref().unwrap()).collect();
         // "/zzz/..." sorts after "Unknown" alphabetically, but Unknown is
         // forced last regardless.
@@ -1993,7 +2087,58 @@ mod tests {
     fn group_servers_by_cwd_empty_list_is_empty() {
         // `ServerPaneInfo` doesn't derive `PartialEq`, so compare lengths
         // rather than the whole `Vec` via `assert_eq!`.
-        assert_eq!(group_servers_by_cwd(vec![]).len(), 0);
+        assert_eq!(group_servers_by_cwd(vec![], &[]).len(), 0);
+    }
+
+    #[test]
+    fn group_servers_by_cwd_sorts_pinned_dirs_before_unpinned_ones() {
+        let servers = vec![
+            server_with_cwd("a", Some("/home/dev/api")), // alphabetically first, but unpinned
+            server_with_cwd("b", Some("/home/dev/web")),
+            server_with_cwd("c", Some("/home/dev/zzz")),
+        ];
+        // "/home/dev/zzz" is pinned despite sorting last alphabetically --
+        // it must still come out first.
+        let pinned = vec!["/home/dev/zzz".to_string()];
+        let grouped = group_servers_by_cwd(servers, &pinned);
+        let keys: Vec<&str> = grouped.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["/home/dev/zzz", "/home/dev/api", "/home/dev/web"]);
+    }
+
+    #[test]
+    fn group_servers_by_cwd_orders_multiple_pinned_dirs_by_pin_order_not_alphabetically() {
+        let servers = vec![
+            server_with_cwd("a", Some("/aaa")),
+            server_with_cwd("b", Some("/bbb")),
+            server_with_cwd("c", Some("/ccc")),
+        ];
+        // Pinned in this exact order -- "/ccc" pinned first, so it must
+        // sort first despite being alphabetically last.
+        let pinned = vec!["/ccc".to_string(), "/aaa".to_string()];
+        let grouped = group_servers_by_cwd(servers, &pinned);
+        let keys: Vec<&str> = grouped.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["/ccc", "/aaa", "/bbb"]);
+    }
+
+    #[test]
+    fn group_servers_by_cwd_unknown_group_stays_last_even_when_pinned_dirs_exist() {
+        let servers = vec![server_with_cwd("no-cwd", None), server_with_cwd("has-cwd", Some("/pinned"))];
+        let pinned = vec!["/pinned".to_string()];
+        let grouped = group_servers_by_cwd(servers, &pinned);
+        let keys: Vec<&str> = grouped.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["/pinned", "Unknown"]);
+    }
+
+    #[test]
+    fn group_servers_by_cwd_a_pinned_dir_with_no_current_servers_has_no_effect() {
+        // Pinning is a plain string preference, independent of whether
+        // any server-pane currently has that cwd -- a stale/no-longer-
+        // relevant pin must not panic or otherwise affect grouping.
+        let servers = vec![server_with_cwd("a", Some("/real"))];
+        let pinned = vec!["/nonexistent".to_string()];
+        let grouped = group_servers_by_cwd(servers, &pinned);
+        let keys: Vec<&str> = grouped.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["/real"]);
     }
 
     #[test]
@@ -2074,6 +2219,7 @@ mod tests {
             dragging_split: None,
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
+            pinned_dirs: Vec::new(),
         };
         app.toggle_group_collapse(0);
         assert!(app.collapsed_groups.contains("/a"));
@@ -2100,6 +2246,7 @@ mod tests {
             dragging_split: None,
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
+            pinned_dirs: Vec::new(),
         };
         app.toggle_group_collapse(0);
         assert_eq!(app.attach_menu.unwrap().selected, 1, "should clamp onto the new last row (global spawn-new)");
@@ -2121,6 +2268,7 @@ mod tests {
             dragging_split: None,
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
+            pinned_dirs: Vec::new(),
         };
         app.move_attach_menu_selection(true);
         assert_eq!(app.attach_menu.as_ref().unwrap().selected, 0);
@@ -2142,6 +2290,7 @@ mod tests {
             dragging_split: None,
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
+            pinned_dirs: Vec::new(),
         };
         app.arm_delete();
         assert_eq!(app.attach_menu.unwrap().pending_delete, Some(0));
@@ -2160,6 +2309,7 @@ mod tests {
             dragging_split: None,
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
+            pinned_dirs: Vec::new(),
         };
         app.arm_delete();
         assert_eq!(app.attach_menu.unwrap().pending_delete, None);
@@ -2187,6 +2337,7 @@ mod tests {
             dragging_split: None,
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
+            pinned_dirs: Vec::new(),
         };
         app.arm_delete();
         assert_eq!(app.attach_menu.unwrap().pending_delete, None);
@@ -2286,6 +2437,7 @@ mod tests {
             dragging_split: None,
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
+            pinned_dirs: Vec::new(),
         };
         app.start_rename();
         let rename = app.attach_menu.unwrap().rename.unwrap();
@@ -2307,6 +2459,7 @@ mod tests {
             dragging_split: None,
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
+            pinned_dirs: Vec::new(),
         };
         app.start_rename();
         assert!(app.attach_menu.unwrap().rename.is_none());
@@ -2334,6 +2487,7 @@ mod tests {
             dragging_split: None,
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
+            pinned_dirs: Vec::new(),
         };
         app.start_rename();
         assert!(app.attach_menu.unwrap().rename.is_none());
@@ -2724,5 +2878,153 @@ mod tests {
         app.attach_menu.as_mut().unwrap().selected = 0; // the group header
         app.refresh_attach_menu_preview(&mut write_half, &mut reader).await.unwrap();
         assert!(app.attach_menu_preview.is_none(), "selecting the header should clear the cached preview");
+    }
+
+    /// Serializes every test in this module that spawns a real daemon
+    /// AND toggles a pin: `State::new`/`toggle_pinned_dir` both read or
+    /// write `$XDG_CONFIG_HOME` (process-global) via `daemon::pinned_dirs`,
+    /// so without this a concurrently-running such test could read/write
+    /// the wrong fake config dir mid-test -- and without redirecting
+    /// `$XDG_CONFIG_HOME` at all, these tests would otherwise touch the
+    /// real user's `~/.config/dimux/pinned_dirs.json`.
+    static PIN_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn app_against_real_daemon_with_fake_pin_config(
+        config_dir: &std::path::Path,
+    ) -> (App, OwnedWriteHalf, FrameReader) {
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", config_dir);
+        }
+        app_against_real_daemon().await
+    }
+
+    /// `p` on a group header pins the directory: it must sort first
+    /// (ahead of an alphabetically-earlier, unpinned directory) and the
+    /// header must round-trip a pinned state back from the daemon after
+    /// a fresh `PinnedDirsList` fetch -- exercises the full
+    /// `Request::ToggleDirectoryPin`/`PinnedDirsList` wire round-trip,
+    /// not just `State::toggle_pinned_dir` directly.
+    #[tokio::test]
+    async fn toggle_directory_pin_on_a_header_row_sorts_it_first() {
+        let config_dir = std::env::temp_dir().join(format!("dmx-am-pin-config-{}", std::process::id()));
+        let _guard = PIN_ENV_LOCK.lock().await;
+        let (mut app, mut write_half, mut reader) =
+            app_against_real_daemon_with_fake_pin_config(&config_dir).await;
+
+        // Real directories -- `ServerSpawn`'s `cwd` does a genuine
+        // `chdir`, which silently falls back to the daemon's own cwd
+        // for a directory that doesn't exist, defeating the "which
+        // group sorts first" check below.
+        let dir_a = std::env::temp_dir().join(format!("dmx-am-pin-aaa-{}", std::process::id()));
+        let dir_z = std::env::temp_dir().join(format!("dmx-am-pin-zzz-{}", std::process::id()));
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_z).unwrap();
+        let (dir_a_str, dir_z_str) = (dir_a.to_str().unwrap().to_string(), dir_z.to_str().unwrap().to_string());
+
+        let Response::ServerPane(a) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some(dir_a_str) },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        let Response::ServerPane(z) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some(dir_z_str) },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        // Read back the *actually resolved* cwd (e.g. macOS resolves
+        // `/tmp` to `/private/tmp` for a real process) rather than
+        // assuming the input string round-trips exactly.
+        let resolved_a = a.foreground.as_ref().and_then(|f| f.cwd.clone()).expect("cwd should resolve for `cat`");
+        let resolved_z = z.foreground.as_ref().and_then(|f| f.cwd.clone()).expect("cwd should resolve for `cat`");
+
+        let Response::ServerPaneList(servers) =
+            app.request(&mut write_half, &mut reader, Request::ServerList).await.unwrap()
+        else {
+            panic!("expected ServerPaneList");
+        };
+        app.attach_menu = Some(AttachMenu {
+            servers: group_servers_by_cwd(servers, &app.pinned_dirs),
+            selected: 0,
+            pending_delete: None,
+            rename: None,
+            previously_bound: None,
+            spawn_in_group: None,
+        });
+        // Before pinning: alphabetically-earlier `resolved_a` sorts
+        // first (both dirs share the same "dmx-am-pin-" prefix, so
+        // ordinary string comparison between them is exactly "aaa" vs
+        // "zzz").
+        let sort_key = |app: &App| app.attach_menu.as_ref().unwrap().servers[0].0.clone();
+        assert_eq!(sort_key(&app), resolved_a);
+
+        // Select `dir_z`'s header (row 3: header(a)=0, server(a)=1,
+        // spawn-in-group(a)=2, header(z)=3) and pin it.
+        app.attach_menu.as_mut().unwrap().selected = 3;
+        assert_eq!(
+            app.selected_attach_menu_row(),
+            Some(AttachMenuRow::GroupHeader(1)),
+            "row 3 should be dir_z's header"
+        );
+        app.toggle_directory_pin(&mut write_half, &mut reader).await.unwrap();
+
+        assert_eq!(app.pinned_dirs, vec![resolved_z.clone()]);
+        assert_eq!(sort_key(&app), resolved_z, "pinning dir_z should move it to the front of the grouped list");
+
+        // Confirm the pin also comes back from a totally fresh fetch
+        // (i.e. it's real daemon-side state, not just local bookkeeping).
+        let Response::PinnedDirsList(pinned) =
+            app.request(&mut write_half, &mut reader, Request::PinnedDirsList).await.unwrap()
+        else {
+            panic!("expected PinnedDirsList");
+        };
+        assert_eq!(pinned, vec![resolved_z]);
+
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&config_dir);
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_z);
+    }
+
+    /// `toggle_directory_pin` on a non-header row must be a genuine
+    /// no-op: no request sent (verified indirectly -- if a request had
+    /// been sent, this daemon has nothing pinned, and `app.pinned_dirs`
+    /// would be mutated by the response handling either way, so
+    /// asserting it's still empty after calling this on a `Server` row
+    /// confirms the early-return path, not just "nothing happened to
+    /// look at").
+    #[tokio::test]
+    async fn toggle_directory_pin_on_a_non_header_row_is_a_no_op() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+        let Response::ServerPane(existing) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        open_menu_with_one_group(&mut app, "/tmp", existing);
+        app.attach_menu.as_mut().unwrap().selected = 1; // the server row, not the header
+        assert_eq!(app.selected_attach_menu_row(), Some(AttachMenuRow::Server(0)));
+
+        app.toggle_directory_pin(&mut write_half, &mut reader).await.unwrap();
+        assert!(app.pinned_dirs.is_empty(), "toggling on a non-header row must not pin anything");
     }
 }

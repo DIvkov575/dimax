@@ -13,6 +13,7 @@
 //! request; this is fine at the pane counts dimux targets (see design doc
 //! non-goals) and keeps the logic in `state` free of async concerns.
 
+pub mod pinned_dirs;
 pub mod state;
 
 use crate::protocol::{self, ClientPane, Event, Request, Response, ServerMessage, ServerPaneId, WorkspaceId};
@@ -292,6 +293,17 @@ async fn dispatch(
         Request::ServerList => {
             let mut state = state.lock().await;
             Response::ServerPaneList(state.server_list())
+        }
+
+        Request::ToggleDirectoryPin { dir } => {
+            let mut state = state.lock().await;
+            state.toggle_pinned_dir(dir);
+            Response::PinnedDirsList(state.pinned_dirs().to_vec())
+        }
+
+        Request::PinnedDirsList => {
+            let state = state.lock().await;
+            Response::PinnedDirsList(state.pinned_dirs().to_vec())
         }
 
         Request::ClientSpawn { workspace, split_of, dir, bind } => {
