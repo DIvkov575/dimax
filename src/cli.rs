@@ -113,6 +113,7 @@ pub enum ClientCmd {
     Rename { addr: String, new_name: String },
     Bind { addr: String, target: String },
     Unbind { addr: String },
+    AddTab { addr: String, target: String },
     Ls { workspace: Option<String> },
 }
 
@@ -175,14 +176,20 @@ fn format_server_pane_line(info: &ServerPaneInfo) -> String {
     )
 }
 
-/// Format one `ClientPane` as a single scriptable line: `id  name  bound-server-pane-or-dash`.
+/// Format one `ClientPane` as a single scriptable line:
+/// `id  name  active-server-pane-or-dash  active-index/tab-count-or-dash`.
 fn format_client_pane_line(pane: &ClientPane) -> String {
     let name = pane.name.as_deref().unwrap_or("-");
-    let bound = pane
-        .bound
+    let active = pane
+        .active_bound()
         .map(|id| id.to_string())
         .unwrap_or_else(|| "-".to_string());
-    format!("{}\t{}\t{}", pane.id, name, bound)
+    let count = if pane.tabs.is_empty() {
+        "-".to_string()
+    } else {
+        format!("{}/{}", pane.active_tab + 1, pane.tabs.len())
+    };
+    format!("{}\t{}\t{}\t{}", pane.id, name, active, count)
 }
 
 /// Execute a parsed `Cli` command against a real daemon connection and
@@ -331,6 +338,17 @@ async fn run_client(cmd: ClientCmd) -> anyhow::Result<()> {
                 other => Err(unexpected_response("client unbind", other)),
             }
         }
+        ClientCmd::AddTab { addr, target } => {
+            let (workspace, pane) = parse_pane_addr(&addr)?;
+            let req = Request::ClientAddTab { workspace, pane, target: target.clone() };
+            match client.request(req).await? {
+                Response::Ack => {
+                    println!("added tab {target} to {addr}");
+                    Ok(())
+                }
+                other => Err(unexpected_response("client add-tab", other)),
+            }
+        }
         ClientCmd::Ls { workspace } => {
             let req = Request::ClientList { workspace };
             match client.request(req).await? {
@@ -420,24 +438,42 @@ mod tests {
     }
 
     #[test]
-    fn format_client_pane_line_bound() {
+    fn format_client_pane_line_single_tab() {
         let server_pane = Uuid::new_v4();
         let pane = ClientPane {
             id: Uuid::nil(),
             name: Some("shell".to_string()),
-            bound: Some(server_pane),
+            tabs: vec![server_pane],
+            active_tab: 0,
         };
         let line = format_client_pane_line(&pane);
         assert_eq!(
             line,
-            format!("{}\tshell\t{server_pane}", Uuid::nil())
+            format!("{}\tshell\t{server_pane}\t1/1", Uuid::nil())
+        );
+    }
+
+    #[test]
+    fn format_client_pane_line_multiple_tabs() {
+        let sp1 = Uuid::new_v4();
+        let sp2 = Uuid::new_v4();
+        let pane = ClientPane {
+            id: Uuid::nil(),
+            name: Some("editor".to_string()),
+            tabs: vec![sp1, sp2],
+            active_tab: 1,
+        };
+        let line = format_client_pane_line(&pane);
+        assert_eq!(
+            line,
+            format!("{}\teditor\t{sp2}\t2/2", Uuid::nil())
         );
     }
 
     #[test]
     fn format_client_pane_line_unbound_unnamed() {
-        let pane = ClientPane { id: Uuid::nil(), name: None, bound: None };
+        let pane = ClientPane { id: Uuid::nil(), name: None, tabs: vec![], active_tab: 0 };
         let line = format_client_pane_line(&pane);
-        assert_eq!(line, format!("{}\t-\t-", Uuid::nil()));
+        assert_eq!(line, format!("{}\t-\t-\t-", Uuid::nil()));
     }
 }
