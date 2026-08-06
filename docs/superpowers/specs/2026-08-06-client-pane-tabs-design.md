@@ -60,7 +60,7 @@ No CLI surface for cycling — cycling is an interactive, momentary action with 
 
 **Add-tab mode** is a new field on `AttachMenu`: `adding_tab: bool`, set at construction time by whichever chord opened the menu (`cmd-shift-z` → `false`, `cmd-t` → `true`) and read only at the one place the picker's selection gets committed. `confirm_attach_menu`'s eventual bind call branches on it between sending `ClientBind` (replace, `adding_tab: false`) and `ClientAddTab` (append, `adding_tab: true`). Everything else about the picker (grouping, collapsing, pin markers, the per-group spawn field, preview panel) is identical in both modes — only that one terminal action differs. The per-group spawn field's own Enter/Shift+Enter behavior (spawn+bind vs. spawn+send-unbound) is unaffected either way; when `adding_tab` is true, its "bind" branch calls `ClientAddTab` instead of `ClientBind`, same substitution.
 
-**Rendering** (`render::draw_leaf`): the title bar's text becomes `"<active tab's name-or-id>"` (unchanged) with `" (N/M)"` appended only when `tabs.len() > 1` — a single-tab leaf's title bar is pixel-for-pixel identical to today's. No per-tab names are shown, per explicit direction — this is a position/count indicator, not a named tab strip.
+**Rendering** (`render::draw_leaf`): the title bar's existing text (`pane.name` if set, else the client-pane's own short id — this is a property of the leaf itself, independent of which tab is active, and needs no code change) gains `" (N/M)"` appended only when `tabs.len() > 1` — a single-tab leaf's title bar is pixel-for-pixel identical to today's. No per-tab names are shown, per explicit direction — this is a position/count indicator, not a named tab strip.
 
 ## Non-Goals
 
