@@ -1,2 +1,0 @@
-- add server-pane preview when selecting from server-pane list
-- automatic server-pane naming based on claude session name

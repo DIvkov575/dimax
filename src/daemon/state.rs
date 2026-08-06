@@ -180,7 +180,44 @@ impl State {
         Ok(())
     }
 
-    pub fn server_list(&self) -> Vec<ServerPaneInfo> {
+    /// Give every still-unnamed server-pane whose foreground process is
+    /// a Claude Code or Codex CLI session (see
+    /// `term::session_name::derive_session_name`) that session's
+    /// derived title as its real name -- the same `set_name` a manual
+    /// `dimux server rename` would use, so once applied it's sticky:
+    /// this only ever touches a pane while `name()` is still `None`,
+    /// never overwrites one that already has a name (auto-derived or
+    /// manual) even if the session's title later changes. Silently
+    /// skips a pane whose derived name collides with one already taken
+    /// -- worth quietly falling back to no name rather than erroring
+    /// out of `server_list` entirely over a cosmetic naming clash.
+    fn apply_pending_session_names(&mut self) {
+        let to_name: Vec<(ServerPaneId, String)> = self
+            .server_panes
+            .iter()
+            .filter(|(_, pane)| pane.name().is_none())
+            .filter_map(|(&id, pane)| pane.derive_session_name().map(|name| (id, name)))
+            .collect();
+        for (id, name) in to_name {
+            if self.find_server_pane_by_name(&name).is_some() {
+                continue;
+            }
+            if let Some(pane) = self.server_panes.get_mut(&id) {
+                pane.set_name(Some(name));
+            }
+        }
+    }
+
+    /// `&mut self`, not `&self`: this is the one place a still-unnamed
+    /// pane picks up an auto-derived name from its foreground process
+    /// (see [`Self::apply_pending_session_names`]) -- every caller of
+    /// `server_list` (the attach menu, `dimux server ls`) already
+    /// expects it to reflect the pool's current state, and applying the
+    /// name here (rather than a separate poll) means it happens exactly
+    /// on the same cadence those callers already re-fetch on, with no
+    /// new background task.
+    pub fn server_list(&mut self) -> Vec<ServerPaneInfo> {
+        self.apply_pending_session_names();
         let mut panes: Vec<ServerPaneInfo> = self
             .server_panes
             .values()
@@ -831,6 +868,21 @@ mod tests {
     fn server_kill_unknown_errors() {
         let mut state = State::new();
         assert!(state.server_kill("ghost").is_err());
+    }
+
+    /// `server_list`'s auto-naming pass must leave an unnamed pane whose
+    /// foreground process isn't Claude Code or Codex (here: `cat`, same
+    /// as every other test pane in this file) alone -- a real
+    /// Claude/Codex-session test would need one of those actually
+    /// running, out of scope for a unit test; this covers the "doesn't
+    /// touch anything it doesn't recognize" side, which is the
+    /// overwhelmingly common case in practice.
+    #[test]
+    fn server_list_leaves_unnamed_non_session_panes_unnamed() {
+        let mut state = State::new();
+        state.server_spawn(None, Some("cat".to_string()), None).unwrap();
+        let names: Vec<Option<String>> = state.server_list().into_iter().map(|i| i.name).collect();
+        assert_eq!(names, vec![None]);
     }
 
     #[test]

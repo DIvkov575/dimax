@@ -346,6 +346,25 @@ struct App {
     /// group is expected to stay collapsed next time the menu opens, not
     /// silently reset.
     collapsed_groups: HashSet<String>,
+    /// The attach menu's preview panel content: whichever server-pane's
+    /// row was selected as of the last `refresh_attach_menu_preview`
+    /// call, and the plain-text screen contents fetched for it via
+    /// `Request::ServerRead` at that moment. `None` before any fetch has
+    /// completed, or whenever the selection isn't on a `Server` row at
+    /// all (a header/spawn row has no pane to preview) -- rendered as a
+    /// blank panel in both cases, per the "fixed-height panel, content
+    /// optional" design (see `render::draw_attach_menu`'s doc comment):
+    /// the popup's layout split never changes shape based on whether
+    /// there's anything to show.
+    ///
+    /// Deliberately NOT part of `AttachMenu` (unlike `rename`/
+    /// `pending_delete`/`spawn_in_group`): those are edit *state* the
+    /// user is actively manipulating, while this is a fetched *cache*
+    /// of read-only server data, refreshed by network round-trips the
+    /// same way `grids` is -- keeping it here mirrors that split and
+    /// means closing/reopening the menu doesn't need to remember to
+    /// carry it along.
+    attach_menu_preview: Option<(ServerPaneId, String)>,
 }
 
 impl App {
@@ -377,6 +396,7 @@ impl App {
                         frame_area: ratatui::layout::Rect::default(),
                         dragging_split: None,
                         collapsed_groups: HashSet::new(),
+                        attach_menu_preview: None,
                     });
                 }
                 ServerMessage::Response(other) => {
@@ -727,6 +747,40 @@ impl App {
         let menu = self.attach_menu.as_ref()?;
         let rows = visible_attach_menu_rows(&menu.servers, &self.collapsed_groups);
         rows.get(menu.selected).copied()
+    }
+
+    /// Keep `attach_menu_preview` in sync with whatever server-pane row
+    /// is currently selected: a no-op if the menu is closed or the
+    /// selection isn't on a `Server` row (clears any stale preview from
+    /// a previous selection in that case, so a header/spawn row never
+    /// shows the last real pane's leftover content); otherwise fetches
+    /// that pane's current screen via `Request::ServerRead` -- the same
+    /// wire request `dimux server read` uses, chosen because it needs
+    /// no workspace/client-pane binding at all, matching how little the
+    /// rest of the attach menu (`ServerRead`'s siblings `ServerKill`/
+    /// `ServerRename`) needs to reach a pane.
+    ///
+    /// Called from `run`'s loop on every iteration the menu is open
+    /// (not just when the selection changes), so the preview tracks a
+    /// pane's *live* output rather than freezing at the moment it was
+    /// selected -- e.g. watching a build's output scroll by without
+    /// having to re-select the row after every line.
+    async fn refresh_attach_menu_preview(
+        &mut self,
+        write_half: &mut OwnedWriteHalf,
+        reader: &mut FrameReader,
+    ) -> anyhow::Result<()> {
+        let Some(AttachMenuRow::Server(server_index)) = self.selected_attach_menu_row() else {
+            self.attach_menu_preview = None;
+            return Ok(());
+        };
+        let Some(menu) = &self.attach_menu else { return Ok(()) };
+        let target = menu.servers[server_index].1.id;
+        let req = Request::ServerRead { target: target.to_string() };
+        if let Response::ServerReadOutput { text } = self.request(write_half, reader, req).await? {
+            self.attach_menu_preview = Some((target, text));
+        }
+        Ok(())
     }
 
     fn move_attach_menu_selection(&mut self, forward: bool) {
@@ -1497,6 +1551,14 @@ pub async fn run() -> anyhow::Result<()> {
 
     let mut stdin = tokio::io::stdin();
     let mut buf = [0u8; 512];
+    // Keeps the attach menu's preview panel showing a selected pane's
+    // *live* output (see `refresh_attach_menu_preview`'s doc comment)
+    // rather than only updating it right after a selection change --
+    // ticking unconditionally is deliberate: the refresh call itself is
+    // a cheap no-op whenever the menu is closed or the selection isn't
+    // on a server-pane row, so there's no need to start/stop this timer
+    // as the menu opens and closes.
+    let mut preview_tick = tokio::time::interval(std::time::Duration::from_millis(300));
     // A `\x1b[<...` mouse sequence whose terminator (`M`/`m`) hadn't
     // arrived yet by the end of the previous read -- carried forward
     // and prepended to the next one so `mouse::parse_all` sees the whole
@@ -1527,7 +1589,12 @@ pub async fn run() -> anyhow::Result<()> {
                 None => render::draw(frame, &app.workspace, &app.grids, app.focused),
             }
             if let Some(menu) = &app.attach_menu {
-                render::draw_attach_menu(frame, menu, &app.collapsed_groups);
+                render::draw_attach_menu(
+                    frame,
+                    menu,
+                    &app.collapsed_groups,
+                    app.attach_menu_preview.as_ref(),
+                );
             }
         })?;
 
@@ -1599,11 +1666,26 @@ pub async fn run() -> anyhow::Result<()> {
                 if !leftover.is_empty() {
                     if app.attach_menu.is_some() {
                         app.handle_attach_menu_input(leftover, &mut write_half, &mut reader).await?;
+                        // Refresh right away rather than waiting for
+                        // `preview_tick` -- otherwise opening the menu
+                        // or moving the selection shows a blank/stale
+                        // panel for up to one tick interval.
+                        app.refresh_attach_menu_preview(&mut write_half, &mut reader).await?;
                     } else {
                         let action = keys::parse(leftover);
                         app.handle_action(action, leftover, &mut write_half, &mut reader).await?;
+                        // Catches the chord that just opened the menu
+                        // (`Action::DetachAndAttach`) -- `attach_menu`
+                        // was still `None` when this branch started, so
+                        // the `is_some()` check above routed here
+                        // instead of through the other immediate-refresh
+                        // call.
+                        app.refresh_attach_menu_preview(&mut write_half, &mut reader).await?;
                     }
                 }
+            }
+            _ = preview_tick.tick() => {
+                app.refresh_attach_menu_preview(&mut write_half, &mut reader).await?;
             }
             frame = reader.next() => {
                 match frame {
@@ -1954,6 +2036,7 @@ mod tests {
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
+            attach_menu_preview: None,
         };
         app.toggle_group_collapse(0);
         assert!(app.collapsed_groups.contains("/a"));
@@ -1979,6 +2062,7 @@ mod tests {
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
+            attach_menu_preview: None,
         };
         app.toggle_group_collapse(0);
         assert_eq!(app.attach_menu.unwrap().selected, 1, "should clamp onto the new last row (global spawn-new)");
@@ -1999,6 +2083,7 @@ mod tests {
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
+            attach_menu_preview: None,
         };
         app.move_attach_menu_selection(true);
         assert_eq!(app.attach_menu.as_ref().unwrap().selected, 0);
@@ -2019,6 +2104,7 @@ mod tests {
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
+            attach_menu_preview: None,
         };
         app.arm_delete();
         assert_eq!(app.attach_menu.unwrap().pending_delete, Some(0));
@@ -2036,6 +2122,7 @@ mod tests {
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
+            attach_menu_preview: None,
         };
         app.arm_delete();
         assert_eq!(app.attach_menu.unwrap().pending_delete, None);
@@ -2062,6 +2149,7 @@ mod tests {
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
+            attach_menu_preview: None,
         };
         app.arm_delete();
         assert_eq!(app.attach_menu.unwrap().pending_delete, None);
@@ -2160,6 +2248,7 @@ mod tests {
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
+            attach_menu_preview: None,
         };
         app.start_rename();
         let rename = app.attach_menu.unwrap().rename.unwrap();
@@ -2180,6 +2269,7 @@ mod tests {
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
+            attach_menu_preview: None,
         };
         app.start_rename();
         assert!(app.attach_menu.unwrap().rename.is_none());
@@ -2206,6 +2296,7 @@ mod tests {
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
+            attach_menu_preview: None,
         };
         app.start_rename();
         assert!(app.attach_menu.unwrap().rename.is_none());
@@ -2515,5 +2606,78 @@ mod tests {
             "up-arrow should move back"
         );
         assert!(app.attach_menu.as_ref().unwrap().spawn_in_group.is_none());
+    }
+
+    /// `refresh_attach_menu_preview` fetches the selected server-pane's
+    /// current screen via `Request::ServerRead` and caches it -- the
+    /// full round-trip `run`'s loop relies on to keep the attach menu's
+    /// preview panel showing live content.
+    #[tokio::test]
+    async fn refresh_attach_menu_preview_fetches_the_selected_servers_output() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+        let Response::ServerPane(existing) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        let existing_id = existing.id;
+        // Row 0 = "/tmp" header, row 1 = the server row itself.
+        open_menu_with_one_group(&mut app, "/tmp", existing);
+        app.attach_menu.as_mut().unwrap().selected = 1;
+        assert_eq!(app.selected_attach_menu_row(), Some(AttachMenuRow::Server(0)));
+
+        app.request(
+            &mut write_half,
+            &mut reader,
+            Request::ServerSend { target: existing_id.to_string(), text: "preview-marker".to_string(), enter: true },
+        )
+        .await
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            app.refresh_attach_menu_preview(&mut write_half, &mut reader).await.unwrap();
+            if let Some((id, text)) = &app.attach_menu_preview
+                && *id == existing_id
+                && text.contains("preview-marker")
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "preview never picked up the sent text");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Moving off the server row (onto the group header) must clear any
+    /// cached preview -- otherwise a header/spawn row would render the
+    /// previously selected pane's stale content.
+    #[tokio::test]
+    async fn refresh_attach_menu_preview_clears_when_selection_leaves_a_server_row() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+        let Response::ServerPane(existing) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        open_menu_with_one_group(&mut app, "/tmp", existing);
+        app.attach_menu.as_mut().unwrap().selected = 1;
+        app.refresh_attach_menu_preview(&mut write_half, &mut reader).await.unwrap();
+        assert!(app.attach_menu_preview.is_some(), "expected a preview to be cached for the server row");
+
+        app.attach_menu.as_mut().unwrap().selected = 0; // the group header
+        app.refresh_attach_menu_preview(&mut write_half, &mut reader).await.unwrap();
+        assert!(app.attach_menu_preview.is_none(), "selecting the header should clear the cached preview");
     }
 }

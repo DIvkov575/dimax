@@ -12,6 +12,8 @@
 //!   block on I/O) except `write_input`, which does a non-blocking PTY
 //!   write.
 
+pub mod session_name;
+
 use crate::protocol::{Cell, ForegroundProcessInfo, GridSnapshot, ServerPaneId, ServerPaneStatus, Size};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtyPair, PtySize};
 use std::io::{Read, Write};
@@ -333,6 +335,43 @@ impl ServerPane {
             process_name: process.name().to_string_lossy().into_owned(),
             cwd: process.cwd().map(|p| p.display().to_string()),
         })
+    }
+
+    /// A display name derived from this pane's foreground process, if
+    /// it's a Claude Code or Codex CLI session with a resolvable title
+    /// -- see [`session_name::derive_session_name`]. Returns `None` for
+    /// every other foreground process (a plain shell, editor, etc.),
+    /// which is the overwhelmingly common case, not an error.
+    ///
+    /// Does its own separate `sysinfo` lookup rather than reusing
+    /// [`Self::foreground_info`]'s: that method only exposes
+    /// `process.name()` (the short process name, e.g. `"claude"`), but
+    /// distinguishing a real Claude Code invocation from anything else
+    /// with "claude" in its name -- and finding a `--session-id`/
+    /// `--resume` argument at all -- needs the full command line
+    /// (`process.cmd()`), which `ForegroundProcessInfo` has no field for
+    /// (a v1 "just enough to display" struct, not a general process
+    /// inspector). Two lookups is an acceptable cost here: this is only
+    /// ever called for a pane that's still unnamed (see
+    /// `State::server_list`), not on every pane on every call.
+    pub fn derive_session_name(&self) -> Option<String> {
+        let guard = self.inner.lock().unwrap();
+        let pid = guard.master.process_group_leader()?;
+        drop(guard);
+
+        let mut system = sysinfo::System::new();
+        let sysinfo_pid = sysinfo::Pid::from_u32(pid as u32);
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[sysinfo_pid]),
+            true,
+            sysinfo::ProcessRefreshKind::nothing()
+                .with_cwd(sysinfo::UpdateKind::Always)
+                .with_cmd(sysinfo::UpdateKind::Always),
+        );
+        let process = system.process(sysinfo_pid)?;
+        let cmd: Vec<String> = process.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect();
+        let cwd = process.cwd()?.display().to_string();
+        session_name::derive_session_name(&cmd, &cwd)
     }
 
     /// `offset` shifts the returned window back from the live tail by
