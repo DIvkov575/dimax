@@ -18,7 +18,7 @@ pub mod state;
 
 use crate::protocol::{self, ClientPane, Event, Request, Response, ServerMessage, ServerPaneId, WorkspaceId};
 use crate::term::ServerPaneEvent;
-use state::{State, SubscriberId};
+use state::{CloseTabResult, State, SubscriberId};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -392,6 +392,88 @@ async fn dispatch(
             }
         }
 
+        Request::ClientAddTab { workspace, pane, target } => {
+            let mut state = state.lock().await;
+            let ws_id = match state.resolve_workspace(&workspace) {
+                Ok(id) => id,
+                Err(err) => return Response::Error { message: err.to_string() },
+            };
+            let target_id = match state.resolve_server_pane(&target) {
+                Ok(id) => id,
+                Err(err) => return Response::Error { message: err.to_string() },
+            };
+            match state.client_add_tab(ws_id, pane, target_id) {
+                Ok(()) => {
+                    broadcast_layout(&state, registry, ws_id).await;
+                    // The newly-active tab (target_id) has no grid pushed
+                    // to its viewers yet -- without this, it renders
+                    // "(server-pane closed)" until it next produces
+                    // output on its own (see broadcast_grid_prepare's doc
+                    // comment for why this is a separate, post-lock step).
+                    let prepared = broadcast_grid_prepare(&state, target_id);
+                    drop(state);
+                    if let Some(broadcast) = prepared {
+                        broadcast_grid_send(registry, broadcast).await;
+                    }
+                    Response::Ack
+                }
+                Err(err) => Response::Error { message: err.to_string() },
+            }
+        }
+
+        Request::ClientCycleTab { workspace, pane, forward } => {
+            let mut state = state.lock().await;
+            let ws_id = match state.resolve_workspace(&workspace) {
+                Ok(id) => id,
+                Err(err) => return Response::Error { message: err.to_string() },
+            };
+            match state.client_cycle_tab(ws_id, pane, forward) {
+                Ok(()) => {
+                    broadcast_layout(&state, registry, ws_id).await;
+                    // Same rationale as ClientAddTab above: the tab
+                    // cycled onto needs its grid pushed, not just the
+                    // layout change that says which tab is now active.
+                    let prepared =
+                        state.bound_server_pane(pane).and_then(|sp| broadcast_grid_prepare(&state, sp));
+                    drop(state);
+                    if let Some(broadcast) = prepared {
+                        broadcast_grid_send(registry, broadcast).await;
+                    }
+                    Response::Ack
+                }
+                Err(err) => Response::Error { message: err.to_string() },
+            }
+        }
+
+        Request::ClientCloseTab { workspace, pane } => {
+            let mut state = state.lock().await;
+            let ws_id = match state.resolve_workspace(&workspace) {
+                Ok(id) => id,
+                Err(err) => return Response::Error { message: err.to_string() },
+            };
+            match state.client_close_tab(ws_id, pane) {
+                // Both outcomes need the same broadcast: `LeafClosed` already
+                // ran `client_close` internally, so the workspace tree in the
+                // delta reflects either change on its own.
+                Ok(CloseTabResult::TabRemoved | CloseTabResult::LeafClosed) => {
+                    broadcast_layout(&state, registry, ws_id).await;
+                    // TabRemoved leaves a *different* tab active than
+                    // before -- it needs its grid pushed for the same
+                    // reason ClientCycleTab does. LeafClosed leaves no
+                    // pane bound here at all, so `bound_server_pane`
+                    // correctly yields nothing to push.
+                    let prepared =
+                        state.bound_server_pane(pane).and_then(|sp| broadcast_grid_prepare(&state, sp));
+                    drop(state);
+                    if let Some(broadcast) = prepared {
+                        broadcast_grid_send(registry, broadcast).await;
+                    }
+                    Response::Ack
+                }
+                Err(err) => Response::Error { message: err.to_string() },
+            }
+        }
+
         Request::ClientList { workspace } => {
             let state = state.lock().await;
             match workspace {
@@ -456,7 +538,7 @@ async fn dispatch(
                 .map(|tree| {
                     tree.leaves()
                         .into_iter()
-                        .filter_map(|leaf| leaf.bound)
+                        .filter_map(|leaf| leaf.active_bound())
                         .filter_map(|bound| {
                             let pane = state.server_pane(bound)?;
                             let offset = state.scroll_offset_for(subscriber_id, bound);
@@ -1029,7 +1111,11 @@ mod tests {
                 Response::Snapshot { workspace: info, .. } => {
                     let tree = info.tree.expect("workspace should still have its pane");
                     let leaf = tree.find(pane).expect("client-pane should still exist");
-                    assert_eq!(leaf.bound, None, "client-pane should be unbound after server_kill");
+                    assert_eq!(
+                        leaf.active_bound(),
+                        None,
+                        "client-pane should be unbound after server_kill"
+                    );
                 }
                 other => panic!("expected Snapshot, got {other:?}"),
             }
@@ -1234,7 +1320,7 @@ mod tests {
             Response::Snapshot { workspace: info, .. } => {
                 let tree = info.tree.expect("workspace should still have its pane");
                 let leaf = tree.find(pane).expect("client-pane should still exist");
-                assert_eq!(leaf.bound, None, "client-pane should be unbound");
+                assert_eq!(leaf.active_bound(), None, "client-pane should be unbound");
             }
             other => panic!("expected Snapshot, got {other:?}"),
         }
@@ -1248,6 +1334,265 @@ mod tests {
             }
             other => panic!("expected ServerPaneList, got {other:?}"),
         }
+    }
+
+    /// Wire-level walk through the whole tab lifecycle on one leaf:
+    /// `ClientAddTab` appends-and-activates, `ClientCycleTab` wraps in both
+    /// directions, and `ClientCloseTab` drops just the active tab (leaving
+    /// its server-pane running) until the last one takes the leaf with it.
+    /// Covers all three dispatch arms plus the `CloseTabResult` split.
+    #[tokio::test]
+    async fn client_tab_requests_add_cycle_and_close_over_the_wire() {
+        let guard = start_daemon().await;
+        let mut conn = TestConn::connect(&guard.0).await;
+
+        async fn spawn_server_pane(conn: &mut TestConn) -> ServerPaneId {
+            match conn
+                .request(Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: None,
+                })
+                .await
+            {
+                Response::ServerPane(info) => info.id,
+                other => panic!("expected ServerPane, got {other:?}"),
+            }
+        }
+        let first = spawn_server_pane(&mut conn).await;
+        let second = spawn_server_pane(&mut conn).await;
+
+        let (workspace, pane) = match conn
+            .request(Request::ClientSpawn {
+                workspace: "1".to_string(),
+                split_of: None,
+                dir: None,
+                bind: Some(first.to_string()),
+            })
+            .await
+        {
+            Response::ClientPaneCreated { workspace, pane } => (workspace, pane),
+            other => panic!("expected ClientPaneCreated, got {other:?}"),
+        };
+
+        // Reads the leaf's current (tabs, active_tab) straight off the wire,
+        // so every assertion below is about what a real frontend would see.
+        async fn tabs_of(
+            conn: &mut TestConn,
+            workspace: WorkspaceId,
+            pane: protocol::ClientPaneId,
+        ) -> (Vec<ServerPaneId>, usize) {
+            match conn.request(Request::Subscribe { workspace: workspace.to_string() }).await {
+                Response::Snapshot { workspace: info, .. } => {
+                    let tree = info.tree.expect("workspace should have a tree");
+                    let leaf = tree.find(pane).expect("client-pane should exist");
+                    (leaf.tabs.clone(), leaf.active_tab)
+                }
+                other => panic!("expected Snapshot, got {other:?}"),
+            }
+        }
+
+        match conn
+            .request(Request::ClientAddTab {
+                workspace: workspace.to_string(),
+                pane,
+                target: second.to_string(),
+            })
+            .await
+        {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+        assert_eq!(
+            tabs_of(&mut conn, workspace, pane).await,
+            (vec![first, second], 1),
+            "add-tab should append the new tab and make it active"
+        );
+
+        // Unknown targets must be rejected, same as `ClientBind`.
+        match conn
+            .request(Request::ClientAddTab {
+                workspace: workspace.to_string(),
+                pane,
+                target: "no-such-pane".to_string(),
+            })
+            .await
+        {
+            Response::Error { .. } => {}
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // Forward from the last tab wraps to the first, and back again.
+        for (forward, expected_active) in [(true, 0), (false, 1)] {
+            match conn
+                .request(Request::ClientCycleTab {
+                    workspace: workspace.to_string(),
+                    pane,
+                    forward,
+                })
+                .await
+            {
+                Response::Ack => {}
+                other => panic!("expected Ack, got {other:?}"),
+            }
+            let (tabs, active) = tabs_of(&mut conn, workspace, pane).await;
+            assert_eq!(tabs, vec![first, second], "cycling must not change the tab list");
+            assert_eq!(active, expected_active, "cycle forward={forward} should wrap");
+        }
+
+        // Closing the active tab (`second`) leaves the other tab, and the
+        // closed tab's server-pane, alive.
+        match conn.request(Request::ClientCloseTab { workspace: workspace.to_string(), pane }).await
+        {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+        assert_eq!(
+            tabs_of(&mut conn, workspace, pane).await,
+            (vec![first], 0),
+            "close-tab should drop only the active tab and clamp active_tab"
+        );
+        match conn.request(Request::ServerList).await {
+            Response::ServerPaneList(list) => assert!(
+                list.iter().any(|p| p.id == second),
+                "closing a tab must not kill its server-pane"
+            ),
+            other => panic!("expected ServerPaneList, got {other:?}"),
+        }
+
+        // Closing the last tab closes the leaf itself (design doc: there is
+        // no reachable 0-tab-but-present leaf state).
+        match conn.request(Request::ClientCloseTab { workspace: workspace.to_string(), pane }).await
+        {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+        match conn.request(Request::Subscribe { workspace: workspace.to_string() }).await {
+            Response::Snapshot { workspace: info, .. } => {
+                assert!(
+                    info.tree.is_none(),
+                    "closing the last tab of the only leaf should empty the workspace"
+                );
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+    }
+
+    /// Regression test: cycling to (or adding) a tab must push a
+    /// `GridDelta` for the tab's server-pane immediately, not leave a
+    /// subscriber waiting for that pane's own next PTY output. Without
+    /// this, a subscriber who cycles to an idle tab (nothing producing
+    /// fresh output right now) sees "(server-pane closed)" until
+    /// something happens to write to it -- which may be never, for a
+    /// finished build or a paused REPL, exactly the kind of pane a user
+    /// cycles to in order to read.
+    #[tokio::test]
+    async fn cycling_and_adding_tabs_pushes_a_grid_for_the_newly_active_pane() {
+        let guard = start_daemon().await;
+        let mut conn = TestConn::connect(&guard.0).await;
+        let mut subscriber = TestConn::connect(&guard.0).await;
+
+        async fn spawn_printing_pane(conn: &mut TestConn, text: &str) -> ServerPaneId {
+            let id = match conn
+                .request(Request::ServerSpawn {
+                    name: None,
+                    cmd: Some(format!("printf {text}")),
+                    cwd: None,
+                })
+                .await
+            {
+                Response::ServerPane(info) => info.id,
+                other => panic!("expected ServerPane, got {other:?}"),
+            };
+            // Wait for the pane's own output to actually land before
+            // moving on -- under heavy parallel test load, `printf`'s
+            // process may not even be scheduled yet a fixed number of ms
+            // later, and this test needs the pane's content to be
+            // present and *stable* before the tab-add/cycle push it's
+            // checking for happens, or the assertion below can't tell
+            // "still starting up" from "the fix didn't work".
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                match conn.request(Request::ServerRead { target: id.to_string() }).await {
+                    Response::ServerReadOutput { text: seen } if seen.contains(text) => break,
+                    Response::ServerReadOutput { .. } => {}
+                    other => panic!("expected ServerReadOutput, got {other:?}"),
+                }
+                assert!(std::time::Instant::now() < deadline, "pane never printed {text:?}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            id
+        }
+        let first = spawn_printing_pane(&mut conn, "first-output").await;
+
+        let (workspace, pane) = match conn
+            .request(Request::ClientSpawn {
+                workspace: "1".to_string(),
+                split_of: None,
+                dir: None,
+                bind: Some(first.to_string()),
+            })
+            .await
+        {
+            Response::ClientPaneCreated { workspace, pane } => (workspace, pane),
+            other => panic!("expected ClientPaneCreated, got {other:?}"),
+        };
+
+        match subscriber.request(Request::Subscribe { workspace: workspace.to_string() }).await {
+            Response::Snapshot { .. } => {}
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+        // Drain whatever GridDelta(s) `first`'s own printf produced so
+        // they can't be mistaken for the tab-add/cycle push below.
+        while subscriber.read_event(Duration::from_millis(100)).await.is_some() {}
+
+        // Spawn a *second* pane whose own output already happened and
+        // finished well before it's ever added as a tab -- nothing about
+        // adding or cycling to it should depend on it producing anything
+        // new.
+        let second = spawn_printing_pane(&mut conn, "second-output").await;
+        while conn.read_event(Duration::from_millis(50)).await.is_some() {}
+
+        match conn
+            .request(Request::ClientAddTab { workspace: workspace.to_string(), pane, target: second.to_string() })
+            .await
+        {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+        let grid = loop {
+            match subscriber
+                .read_event(Duration::from_secs(2))
+                .await
+                .expect("ClientAddTab should push a GridDelta for the newly-active tab")
+            {
+                Event::GridDelta { snapshot } if snapshot.server_pane == second => break snapshot,
+                _ => continue,
+            }
+        };
+        let text: String =
+            grid.lines.iter().flat_map(|row| row.iter().map(|c| c.text.as_str())).collect();
+        assert!(text.contains("second-output"), "pushed grid should be for the newly-active pane: {text:?}");
+
+        // Cycle back to `first` -- same requirement applies.
+        match conn.request(Request::ClientCycleTab { workspace: workspace.to_string(), pane, forward: false }).await
+        {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+        let grid = loop {
+            match subscriber
+                .read_event(Duration::from_secs(2))
+                .await
+                .expect("ClientCycleTab should push a GridDelta for the newly-active tab")
+            {
+                Event::GridDelta { snapshot } if snapshot.server_pane == first => break snapshot,
+                _ => continue,
+            }
+        };
+        let text: String =
+            grid.lines.iter().flat_map(|row| row.iter().map(|c| c.text.as_str())).collect();
+        assert!(text.contains("first-output"), "pushed grid should be for the newly-active pane: {text:?}");
     }
 
     /// `ResizeSplit` updates a divider's ratio (mouse-drag resizing,

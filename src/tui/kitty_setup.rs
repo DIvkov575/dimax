@@ -41,6 +41,9 @@ const CHORDS: &[(&str, u8)] = &[
     ("cmd+j", b'j'),
     ("cmd+k", b'k'),
     ("cmd+l", b'l'),
+    ("cmd+t", b't'),
+    ("cmd+]", b']'),
+    ("cmd+[", b'['),
 ];
 
 /// Marker comment that opens the generated block -- present so
