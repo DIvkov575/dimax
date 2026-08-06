@@ -487,14 +487,24 @@ fn draw_attach_menu_preview(
     preview: Option<&(ServerPaneId, String)>,
     area: Rect,
 ) {
-    let text = selected
+    let full_text = selected
         .zip(preview)
         .filter(|(selected, (cached, _))| selected == cached)
         .map(|(_, (_, text))| text.as_str())
         .unwrap_or("");
 
+    // The panel is only a handful of rows tall (see `PREVIEW_PANEL_HEIGHT`)
+    // but `ServerRead` returns the pane's *entire* current screen, which
+    // is routinely taller -- rendering it as-is via `Paragraph` (which
+    // draws from the top, with no scroll) would only ever show the
+    // pane's oldest visible rows, not its most recent output. Interior
+    // height is `area.height` minus the block's own top+bottom border.
+    let interior_rows = area.height.saturating_sub(2) as usize;
+    let lines: Vec<&str> = full_text.lines().collect();
+    let visible_text = lines[lines.len().saturating_sub(interior_rows)..].join("\n");
+
     let block = Block::bordered().title("Preview");
-    frame.render_widget(Paragraph::new(text).block(block), area);
+    frame.render_widget(Paragraph::new(visible_text).block(block), area);
 }
 
 /// One directory-group header row: `group` (bold, as before headers were
@@ -1200,6 +1210,54 @@ mod tests {
             row_index_empty, row_index_filled,
             "the server row must land on the identical screen row whether or not the preview panel has content"
         );
+    }
+
+    #[test]
+    fn draw_attach_menu_preview_shows_the_last_lines_not_the_first_when_content_overflows() {
+        let server = ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: Some("editor".to_string()),
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+            foreground: None,
+        };
+        let selected_id = server.id;
+        let menu = super::super::AttachMenu {
+            servers: vec![("Unknown".to_string(), server)],
+            selected: 1,
+            pending_delete: None,
+            rename: None,
+            previously_bound: None,
+            spawn_in_group: None,
+        };
+        // More lines than the preview panel's interior can hold
+        // (PREVIEW_PANEL_HEIGHT is 8, i.e. 6 interior rows) -- a naive
+        // top-down render would show "line-0" and cut off before ever
+        // reaching the pane's actual current/most-recent output.
+        let full_text = (0..20).map(|i| format!("line-{i}")).collect::<Vec<_>>().join("\n");
+        let preview = (selected_id, full_text);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), Some(&preview))).unwrap();
+        assert!(buffer_contains(&terminal, "line-19"), "the most recent line must be visible");
+        assert!(
+            !buffer_row_matches_exactly(&terminal, "line-0"),
+            "the earliest line should have scrolled off, not just be a substring of a later one"
+        );
+    }
+
+    /// Like `buffer_contains`, but requires an exact (trimmed) row match
+    /// rather than a substring anywhere in the flattened buffer --
+    /// needed to tell "line-0" is genuinely absent as its own row rather
+    /// than merely not being a substring of "line-10"/"line-0"-adjacent
+    /// text (a plain substring check for "line-0" would actually still
+    /// find it inside "line-01"..."line-09" if those existed, though
+    /// they don't here -- this is the more precise tool regardless).
+    fn buffer_row_matches_exactly(terminal: &Terminal<TestBackend>, needle: &str) -> bool {
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let symbols: Vec<&str> = buffer.content().iter().map(|c| c.symbol()).collect();
+        symbols.chunks(width).map(|row| row.concat()).any(|row| row.trim() == needle)
     }
 
     #[test]
