@@ -369,7 +369,9 @@ pub enum Request {
     },
     /// Drop `pane`'s active tab, leaving the pane's other tabs (and the
     /// dropped tab's server-pane, which keeps running) intact. Closing
-    /// the last tab leaves `pane` unbound rather than removing the pane.
+    /// the last tab closes `pane` itself, exactly like `ClientClose` —
+    /// there is no "0-tab but still present" leaf state reachable this
+    /// way (see design doc "Architecture").
     ClientCloseTab {
         workspace: String,
         pane: ClientPaneId,
