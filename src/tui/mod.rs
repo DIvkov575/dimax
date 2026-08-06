@@ -194,6 +194,9 @@ pub enum Action {
     /// server-pane (which keeps running) and open the attach menu to pick
     /// its replacement.
     DetachAndAttach,
+    AddTab,
+    CycleTabForward,
+    CycleTabBackward,
     FocusLeft,
     FocusRight,
     FocusUp,

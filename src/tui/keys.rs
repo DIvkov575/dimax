@@ -54,6 +54,9 @@
 //! | `cmd-k`       | `k`  | `\x1b_Dk\x1b\\`               |
 //! | `cmd-l`       | `l`  | `\x1b_Dl\x1b\\`               |
 //! | `shift-enter` | `s`  | `\x1b_Ds\x1b\\`               |
+//! | `cmd-t`       | `t`  | `\x1b_Dt\x1b\\`               |
+//! | `cmd-]`       | `]`  | `\x1b_D]\x1b\\`               |
+//! | `cmd-[`       | `[`  | `\x1b_D[\x1b\\`               |
 //!
 //! (Named-chord tags are case-sensitive letters, deliberately mirroring
 //! the shift relationship: `cmd-shift-d` uses the uppercase of `cmd-d`'s
@@ -99,6 +102,9 @@ enum Chord {
     FocusDown,
     FocusUp,
     FocusRight,
+    AddTab,
+    CycleTabForward,
+    CycleTabBackward,
 }
 
 impl Chord {
@@ -114,6 +120,9 @@ impl Chord {
             b'j' => Some(Chord::FocusDown),
             b'k' => Some(Chord::FocusUp),
             b'l' => Some(Chord::FocusRight),
+            b't' => Some(Chord::AddTab),
+            b']' => Some(Chord::CycleTabForward),
+            b'[' => Some(Chord::CycleTabBackward),
             _ => None,
         }
     }
@@ -130,6 +139,9 @@ impl Chord {
             Chord::FocusDown => Action::FocusDown,
             Chord::FocusUp => Action::FocusUp,
             Chord::FocusRight => Action::FocusRight,
+            Chord::AddTab => Action::AddTab,
+            Chord::CycleTabForward => Action::CycleTabForward,
+            Chord::CycleTabBackward => Action::CycleTabBackward,
         }
     }
 }
@@ -228,6 +240,21 @@ mod tests {
     #[test]
     fn focus_right() {
         assert_eq!(parse(&chord_bytes(b'l')), Action::FocusRight);
+    }
+
+    #[test]
+    fn add_tab() {
+        assert_eq!(parse(&chord_bytes(b't')), Action::AddTab);
+    }
+
+    #[test]
+    fn cycle_tab_forward() {
+        assert_eq!(parse(&chord_bytes(b']')), Action::CycleTabForward);
+    }
+
+    #[test]
+    fn cycle_tab_backward() {
+        assert_eq!(parse(&chord_bytes(b'[')), Action::CycleTabBackward);
     }
 
     #[test]
