@@ -124,6 +124,7 @@
 //!   not live throughout the drag.
 
 pub mod keys;
+mod kitty_setup;
 pub mod mouse;
 pub mod render;
 
@@ -973,11 +974,19 @@ impl App {
     /// server-pane in that group's directory, then (if `bind`) bind it
     /// into the just-detached client-pane, then (if the field's text is
     /// non-empty) send that text into the new pane followed by Enter, as
-    /// if typed live. `bind = true` is plain Enter; `bind = false` is
-    /// Shift+Enter, which spawns and sends but deliberately leaves the
-    /// pane unbound -- per the design intent that this row not force a
-    /// bind just to run a one-off command in that directory. Closes the
-    /// attach menu on success either way, same as `confirm_attach_menu`.
+    /// if typed live. `bind = true` is plain Enter, which closes the
+    /// attach menu on success (same as `confirm_attach_menu` -- binding
+    /// is "commit and go"). `bind = false` is Shift+Enter, which spawns
+    /// and sends but deliberately leaves the pane unbound -- per the
+    /// design intent that this row not force a bind just to run a
+    /// one-off command in that directory -- and correspondingly leaves
+    /// the menu *open* rather than closing it: Shift+Enter's whole point
+    /// is firing off a quick command without disturbing the current
+    /// pane, so staying in the menu to spawn/inspect more (rather than
+    /// having to reopen it) matches that same "don't disturb the
+    /// current flow" intent. The just-confirmed field is cleared and
+    /// the server list re-fetched either way, so the new pane appears
+    /// in the row list immediately when the menu stays open.
     async fn confirm_spawn_in_group(
         &mut self,
         bind: bool,
@@ -1011,6 +1020,24 @@ impl App {
         if !text.is_empty() {
             let req = Request::ServerSend { target: server_pane.to_string(), text, enter: true };
             let _ = self.request(write_half, reader, req).await?;
+        }
+
+        if !bind {
+            if let Response::ServerPaneList(servers) =
+                self.request(write_half, reader, Request::ServerList).await?
+            {
+                let grouped = group_servers_by_cwd(servers);
+                let collapsed = self.collapsed_groups.clone();
+                if let Some(menu) = &mut self.attach_menu {
+                    menu.servers = grouped;
+                    menu.spawn_in_group = None;
+                    let len = visible_attach_menu_rows(&menu.servers, &collapsed).len();
+                    if menu.selected >= len {
+                        menu.selected = len - 1;
+                    }
+                }
+            }
+            return Ok(());
         }
 
         self.attach_menu = None;
@@ -1531,6 +1558,16 @@ fn disable_button_event_mouse_tracking() -> std::io::Result<()> {
 /// workspace, then loop handling terminal input events and pushed daemon
 /// `Event`s until the user quits.
 pub async fn run() -> anyhow::Result<()> {
+    // Best-effort, silent, before anything else starts -- see
+    // `kitty_setup::ensure_installed`'s doc comment for the exact
+    // conditions under which this does nothing (not running under
+    // Kitty, no existing kitty.conf to patch, a hand-written
+    // dimux.conf already present, etc.). Deliberately swallows its own
+    // errors internally rather than returning a `Result` here: whether
+    // the Cmd-chord config could be installed must never affect
+    // whether `dimux attach` itself starts.
+    kitty_setup::ensure_installed();
+
     let client = Client::connect().await?;
     let (read_half, mut write_half) = client.into_split();
     let mut reader = FrameReader::spawn(read_half);
@@ -2521,7 +2558,15 @@ mod tests {
 
         app.handle_attach_menu_input(b"echo unbound-test", &mut write_half, &mut reader).await.unwrap();
         app.handle_attach_menu_input(keys::SHIFT_ENTER_CHORD, &mut write_half, &mut reader).await.unwrap();
-        assert!(app.attach_menu.is_none(), "confirming should close the menu");
+        assert!(app.attach_menu.is_some(), "Shift+Enter should keep the menu open, unlike plain Enter");
+        assert!(
+            app.attach_menu.as_ref().unwrap().spawn_in_group.is_none(),
+            "the just-confirmed field should close even though the menu itself stays open"
+        );
+        assert!(
+            app.attach_menu.as_ref().unwrap().servers.iter().any(|(_, s)| s.id != existing_id),
+            "the newly spawned pane should already be visible in the still-open menu's row list"
+        );
 
         let Response::ClientPaneList { panes, .. } = app
             .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
