@@ -36,7 +36,7 @@ fn config_subcommand_parses() {
 ```
 
 Run: `cargo check 2>&1 | head -30`
-Expected: compile errors — `Args` doesn't exist yet, `Cli::Config` doesn't exist yet, `clap::Parser` trait method `try_parse_from` needs `use clap::Parser;` (already imported at the top of `cli.rs`'s test module via `use super::*;`).
+Expected: compile errors — `Args` doesn't exist yet, `Cli::Config` doesn't exist yet, and `try_parse_from` is unresolved because the `clap::Parser` trait is not in scope. Note: `use super::*;` does NOT bring it in, since `cli.rs` only ever names clap fully-qualified in `#[derive(clap::Parser)]`. Add an explicit `use clap::Parser;` to the test module.
 
 - [ ] **Step 2: Change `Cli` from a `Parser` to a `Subcommand`, add `Config`, add the `Args` wrapper**
 
@@ -72,12 +72,17 @@ pub enum Cli {
 /// `dimux` (no subcommand at all) parses successfully instead of
 /// erroring -- `main` then defaults it to [`Cli::Attach`].
 #[derive(clap::Parser)]
-#[command(name = "dimux")]
+#[command(name = "dimux", about = "A terminal multiplexer. With no subcommand, attaches to the TUI.")]
 pub struct Args {
     #[command(subcommand)]
     pub command: Option<Cli>,
 }
 ```
+
+The explicit `about` is required, not cosmetic: the crate has no `description`
+in `Cargo.toml`, so without it clap falls back to the struct's doc comment and
+prints that internal note (rustdoc link syntax and all) as the first line of
+`dimux --help`.
 
 - [ ] **Step 3: Update `main.rs` to parse `Args` and default to `Cli::Attach`**
 
