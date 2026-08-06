@@ -306,6 +306,11 @@ async fn dispatch(
             Response::PinnedDirsList(state.pinned_dirs().to_vec())
         }
 
+        Request::ConsumeShellFallback => {
+            let mut state = state.lock().await;
+            Response::ShellFallback { available: state.consume_shell_fallback() }
+        }
+
         Request::ClientSpawn { workspace, split_of, dir, bind } => {
             let mut state = state.lock().await;
             let ws_id = match state.resolve_or_create_workspace(&workspace) {
@@ -1276,6 +1281,21 @@ mod tests {
         match conn.request(Request::ServerRead { target: "no-such-pane".to_string() }).await {
             Response::Error { .. } => {}
             other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn consume_shell_fallback_over_the_wire_grants_once_then_denies() {
+        let guard = start_daemon().await;
+        let mut conn = TestConn::connect(&guard.0).await;
+
+        match conn.request(Request::ConsumeShellFallback).await {
+            Response::ShellFallback { available } => assert!(available, "first call should grant"),
+            other => panic!("expected ShellFallback, got {other:?}"),
+        }
+        match conn.request(Request::ConsumeShellFallback).await {
+            Response::ShellFallback { available } => assert!(!available, "second call should deny"),
+            other => panic!("expected ShellFallback, got {other:?}"),
         }
     }
 
