@@ -250,6 +250,15 @@ struct AttachMenu {
     /// Mutually exclusive with `rename`/`pending_delete` — opening this
     /// clears both, same as `rename` already does.
     spawn_in_group: Option<SpawnInGroupState>,
+    /// `true` when `cmd-t` opened this menu (append the pick as a new
+    /// tab, leaving existing tabs bound), `false` when `cmd-shift-z`
+    /// did (replace the active tab, having already unbound it). Set at
+    /// construction and read at exactly one point per commit path —
+    /// `confirm_attach_menu` and `confirm_spawn_in_group`'s bind branch
+    /// — to choose between `ClientAddTab` and `ClientBind`. Every other
+    /// aspect of the menu (grouping, rename/delete, spawn field,
+    /// preview) behaves identically in both modes.
+    adding_tab: bool,
 }
 
 /// Live edit state for the attach menu's inline rename field (`r` on a
@@ -545,24 +554,6 @@ impl App {
         Ok(())
     }
 
-    /// `cmd-w`: close the focused client-pane. Its bound server-pane
-    /// keeps running (design doc "CLI surface" / "Default keybinds").
-    /// Focus reassignment happens via `reconcile_focus` once the
-    /// resulting `LayoutDelta` lands (immediately, if it interleaved
-    /// ahead of this request's `Response`; on the next loop iteration
-    /// otherwise) rather than being computed here from a tree this
-    /// function doesn't have an up-to-date copy of yet.
-    async fn close_focused(
-        &mut self,
-        write_half: &mut OwnedWriteHalf,
-        reader: &mut FrameReader,
-    ) -> anyhow::Result<()> {
-        let Some(pane) = self.focused else { return Ok(()) };
-        let req = Request::ClientClose { workspace: self.workspace.id.to_string(), pane };
-        let _ = self.request(write_half, reader, req).await?;
-        Ok(())
-    }
-
     /// `cmd-shift-w`: kill the server-pane bound to the focused
     /// client-pane, if any.
     async fn kill_focused_server_pane(
@@ -571,7 +562,8 @@ impl App {
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
         let Some(pane) = self.focused else { return Ok(()) };
-        let Some(bound) = self.workspace.tree.as_ref().and_then(|t| t.find(pane)).and_then(|p| p.bound)
+        let Some(bound) =
+            self.workspace.tree.as_ref().and_then(|t| t.find(pane)).and_then(|p| p.active_bound())
         else {
             return Ok(());
         };
@@ -594,8 +586,12 @@ impl App {
         // unbinding -- see `AttachMenu.previously_bound`'s doc comment
         // for why this has to happen here, not after `ClientUnbind`
         // lands (the binding is gone server-side by then too).
-        let previously_bound =
-            self.workspace.tree.as_ref().and_then(|tree| tree.find(pane)).and_then(|leaf| leaf.bound);
+        let previously_bound = self
+            .workspace
+            .tree
+            .as_ref()
+            .and_then(|tree| tree.find(pane))
+            .and_then(|leaf| leaf.active_bound());
         let req = Request::ClientUnbind { workspace: self.workspace.id.to_string(), pane };
         let _ = self.request(write_half, reader, req).await?;
         if let Response::PinnedDirsList(pinned) =
@@ -613,8 +609,78 @@ impl App {
                 rename: None,
                 previously_bound,
                 spawn_in_group: None,
+                adding_tab: false,
             });
         }
+        Ok(())
+    }
+
+    /// `cmd-t`: open the attach menu in add-tab mode. Unlike
+    /// `detach_and_open_menu` this deliberately does NOT unbind first —
+    /// the focused client-pane keeps every tab it has, and the pick is
+    /// appended as a new one (see `AttachMenu.adding_tab`). Consequently
+    /// there is no `previously_bound` to mark: nothing was detached.
+    async fn open_add_tab_menu(
+        &mut self,
+        write_half: &mut OwnedWriteHalf,
+        reader: &mut FrameReader,
+    ) -> anyhow::Result<()> {
+        let Some(_pane) = self.focused else { return Ok(()) };
+        if let Response::PinnedDirsList(pinned) =
+            self.request(write_half, reader, Request::PinnedDirsList).await?
+        {
+            self.pinned_dirs = pinned;
+        }
+        if let Response::ServerPaneList(servers) =
+            self.request(write_half, reader, Request::ServerList).await?
+        {
+            self.attach_menu = Some(AttachMenu {
+                servers: group_servers_by_cwd(servers, &self.pinned_dirs),
+                selected: 0,
+                pending_delete: None,
+                rename: None,
+                previously_bound: None,
+                spawn_in_group: None,
+                adding_tab: true,
+            });
+        }
+        Ok(())
+    }
+
+    /// `cmd-]` / `cmd-[`: step the focused client-pane's active tab one
+    /// position forward/back, wrapping. The daemon owns the wrapping and
+    /// the resulting `LayoutDelta` broadcast; this only forwards the
+    /// intent.
+    async fn cycle_tab(
+        &mut self,
+        forward: bool,
+        write_half: &mut OwnedWriteHalf,
+        reader: &mut FrameReader,
+    ) -> anyhow::Result<()> {
+        let Some(pane) = self.focused else { return Ok(()) };
+        let req =
+            Request::ClientCycleTab { workspace: self.workspace.id.to_string(), pane, forward };
+        let _ = self.request(write_half, reader, req).await?;
+        Ok(())
+    }
+
+    /// `cmd-w`: drop the focused client-pane's active tab. Its
+    /// server-pane keeps running. When that was the pane's only tab the
+    /// daemon closes the whole leaf instead (see `state::client_close_tab`),
+    /// so this degrades to the old close-the-pane behavior on a
+    /// single-tab leaf rather than needing a separate chord. In that
+    /// leaf-closing case focus reassignment happens via
+    /// `reconcile_focus` once the resulting `LayoutDelta` lands, rather
+    /// than being computed here from a tree this function doesn't have
+    /// an up-to-date copy of yet.
+    async fn close_tab(
+        &mut self,
+        write_half: &mut OwnedWriteHalf,
+        reader: &mut FrameReader,
+    ) -> anyhow::Result<()> {
+        let Some(pane) = self.focused else { return Ok(()) };
+        let req = Request::ClientCloseTab { workspace: self.workspace.id.to_string(), pane };
+        let _ = self.request(write_half, reader, req).await?;
         Ok(())
     }
 
@@ -1002,6 +1068,7 @@ impl App {
     ) -> anyhow::Result<()> {
         let Some(row) = self.selected_attach_menu_row() else { return Ok(()) };
         let Some(menu) = self.attach_menu.take() else { return Ok(()) };
+        let adding_tab = menu.adding_tab;
         let Some(pane) = self.focused else { return Ok(()) };
         let target = match row {
             AttachMenuRow::Server(server_index) => menu.servers[server_index].1.id.to_string(),
@@ -1028,7 +1095,11 @@ impl App {
             }
             AttachMenuRow::GroupHeader(_) => return Ok(()),
         };
-        let req = Request::ClientBind { workspace: self.workspace.id.to_string(), pane, target };
+        let req = if adding_tab {
+            Request::ClientAddTab { workspace: self.workspace.id.to_string(), pane, target }
+        } else {
+            Request::ClientBind { workspace: self.workspace.id.to_string(), pane, target }
+        };
         let _ = self.request(write_half, reader, req).await?;
         Ok(())
     }
@@ -1072,10 +1143,19 @@ impl App {
         if bind
             && let Some(pane) = self.focused
         {
-            let req = Request::ClientBind {
-                workspace: self.workspace.id.to_string(),
-                pane,
-                target: server_pane.to_string(),
+            let adding_tab = self.attach_menu.as_ref().is_some_and(|m| m.adding_tab);
+            let req = if adding_tab {
+                Request::ClientAddTab {
+                    workspace: self.workspace.id.to_string(),
+                    pane,
+                    target: server_pane.to_string(),
+                }
+            } else {
+                Request::ClientBind {
+                    workspace: self.workspace.id.to_string(),
+                    pane,
+                    target: server_pane.to_string(),
+                }
             };
             let _ = self.request(write_half, reader, req).await?;
         }
@@ -1213,11 +1293,14 @@ impl App {
             Action::SwitchWorkspace(n) => self.switch_workspace(n, write_half, reader).await?,
             Action::SplitVertical => self.split(SplitDir::Vertical, write_half, reader).await?,
             Action::SplitHorizontal => self.split(SplitDir::Horizontal, write_half, reader).await?,
-            Action::CloseFocusedPane => self.close_focused(write_half, reader).await?,
+            Action::CloseFocusedPane => self.close_tab(write_half, reader).await?,
             Action::KillFocusedServerPane => {
                 self.kill_focused_server_pane(write_half, reader).await?
             }
             Action::DetachAndAttach => self.detach_and_open_menu(write_half, reader).await?,
+            Action::AddTab => self.open_add_tab_menu(write_half, reader).await?,
+            Action::CycleTabForward => self.cycle_tab(true, write_half, reader).await?,
+            Action::CycleTabBackward => self.cycle_tab(false, write_half, reader).await?,
             Action::FocusLeft | Action::FocusUp => self.move_focus(false),
             Action::FocusRight | Action::FocusDown => self.move_focus(true),
             Action::PassThrough => {
@@ -1845,7 +1928,7 @@ mod tests {
     use uuid::Uuid;
 
     fn leaf(id: ClientPaneId) -> SplitTree {
-        SplitTree::Leaf(ClientPane { id, name: None, bound: None })
+        SplitTree::Leaf(ClientPane { id, name: None, tabs: vec![], active_tab: 0 })
     }
 
     fn split(dir: SplitDir, a: SplitTree, b: SplitTree) -> SplitTree {
@@ -2217,7 +2300,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None }),
+            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None, adding_tab: false }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
@@ -2244,7 +2327,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 3, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None }),
+            attach_menu: Some(AttachMenu { servers, selected: 3, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None, adding_tab: false }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
@@ -2266,7 +2349,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 3, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None }),
+            attach_menu: Some(AttachMenu { servers, selected: 3, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None, adding_tab: false }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
@@ -2288,7 +2371,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 1, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None }),
+            attach_menu: Some(AttachMenu { servers, selected: 1, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None, adding_tab: false }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
@@ -2307,7 +2390,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None }),
+            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None, adding_tab: false }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
@@ -2335,6 +2418,7 @@ mod tests {
                 rename: None,
                 previously_bound: None,
                 spawn_in_group: None,
+                adding_tab: false,
             }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
@@ -2435,7 +2519,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 1, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None }),
+            attach_menu: Some(AttachMenu { servers, selected: 1, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None, adding_tab: false }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
@@ -2457,7 +2541,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None }),
+            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None, adding_tab: false }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
             collapsed_groups: HashSet::new(),
@@ -2485,6 +2569,7 @@ mod tests {
                 rename: None,
                 previously_bound: None,
                 spawn_in_group: None,
+                adding_tab: false,
             }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
@@ -2596,6 +2681,7 @@ mod tests {
             rename: None,
             previously_bound: None,
             spawn_in_group: None,
+            adding_tab: false,
         });
     }
 
@@ -2655,7 +2741,7 @@ mod tests {
             panic!("expected ClientPaneList");
         };
         let bound_pane = panes.iter().find(|p| p.id == pane).expect("pane should still exist");
-        let new_server_pane = bound_pane.bound.expect("Enter should have bound the newly spawned pane");
+        let new_server_pane = bound_pane.active_bound().expect("Enter should have bound the newly spawned pane");
         assert_ne!(new_server_pane, existing_id, "should bind the NEW pane, not the pre-existing one");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -2733,7 +2819,7 @@ mod tests {
             panic!("expected ClientPaneList");
         };
         let bound_pane = panes.iter().find(|p| p.id == pane).expect("pane should still exist");
-        assert_eq!(bound_pane.bound, None, "Shift+Enter must not bind the new pane into the focused client-pane");
+        assert_eq!(bound_pane.active_bound(), None, "Shift+Enter must not bind the new pane into the focused client-pane");
 
         // The command should still have been sent to *some* new pane --
         // find it by listing server-panes and reading whichever one
@@ -2964,6 +3050,7 @@ mod tests {
             rename: None,
             previously_bound: None,
             spawn_in_group: None,
+            adding_tab: false,
         });
         // Before pinning: alphabetically-earlier `resolved_a` sorts
         // first (both dirs share the same "dmx-am-pin-" prefix, so
