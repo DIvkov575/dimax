@@ -77,7 +77,7 @@ pub enum Cli {
 /// `dimux` (no subcommand at all) parses successfully instead of
 /// erroring -- `main` then defaults it to [`Cli::Attach`].
 #[derive(clap::Parser)]
-#[command(name = "dimux")]
+#[command(name = "dimux", about = "A terminal multiplexer. With no subcommand, attaches to the TUI.")]
 pub struct Args {
     #[command(subcommand)]
     pub command: Option<Cli>,
