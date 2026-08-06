@@ -31,7 +31,19 @@ pub enum SplitDir {
 pub struct ClientPane {
     pub id: ClientPaneId,
     pub name: Option<String>,
-    pub bound: Option<ServerPaneId>,
+    /// Server-panes this leaf can cycle between. Empty = unbound
+    /// placeholder (design doc "Error handling").
+    pub tabs: Vec<ServerPaneId>,
+    /// Index into `tabs` of the one currently displayed. Out of range
+    /// whenever `tabs` is empty, so read it through [`ClientPane::active_bound`]
+    /// rather than indexing directly.
+    pub active_tab: usize,
+}
+
+impl ClientPane {
+    pub fn active_bound(&self) -> Option<ServerPaneId> {
+        self.tabs.get(self.active_tab).copied()
+    }
 }
 
 /// A binary split tree of client-panes within one workspace.
@@ -339,6 +351,29 @@ pub enum Request {
     ClientList {
         workspace: Option<String>,
     },
+    /// Bind another server-pane into `pane` as an additional tab and
+    /// make it active. `target` uses the same name-or-id addressing as
+    /// `ClientBind`.
+    ClientAddTab {
+        workspace: String,
+        pane: ClientPaneId,
+        target: String,
+    },
+    /// Move `pane`'s active tab one step forward (`forward`) or back,
+    /// wrapping at either end. A no-op on a pane with fewer than two
+    /// tabs.
+    ClientCycleTab {
+        workspace: String,
+        pane: ClientPaneId,
+        forward: bool,
+    },
+    /// Drop `pane`'s active tab, leaving the pane's other tabs (and the
+    /// dropped tab's server-pane, which keeps running) intact. Closing
+    /// the last tab leaves `pane` unbound rather than removing the pane.
+    ClientCloseTab {
+        workspace: String,
+        pane: ClientPaneId,
+    },
 
     /// Frontend-only: begin receiving `Event`s for this workspace and
     /// register this connection as a viewer of every server-pane
@@ -508,7 +543,7 @@ mod tests {
     use super::*;
 
     fn pane(id: ClientPaneId) -> ClientPane {
-        ClientPane { id, name: None, bound: None }
+        ClientPane { id, name: None, tabs: vec![], active_tab: 0 }
     }
 
     #[test]
