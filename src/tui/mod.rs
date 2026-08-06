@@ -576,24 +576,33 @@ impl App {
     /// server-pane (which keeps running — see `state::client_unbind`) and
     /// open the attach menu so a replacement can be picked. A no-op if
     /// nothing is focused (empty workspace).
+    ///
+    /// On a leaf with more than one tab, this deliberately skips sending
+    /// `ClientUnbind`: unbinding now *removes* the active tab from the
+    /// list rather than just blanking a slot, so on a multi-tab leaf it
+    /// would shift every later tab's index down by one before the
+    /// picker's eventual `ClientBind` replaces "the active tab" -- which
+    /// would then land in the wrong slot and silently drop a sibling tab
+    /// (see design doc "TUI": "the user never loses tabs 2 and 3 by
+    /// re-picking tab 1's binding"). `ClientBind` already replaces the
+    /// active tab in place, so nothing needs to be pre-cleared for it.
     async fn detach_and_open_menu(
         &mut self,
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
         let Some(pane) = self.focused else { return Ok(()) };
+        let leaf = self.workspace.tree.as_ref().and_then(|tree| tree.find(pane));
         // Read the current binding from local workspace state *before*
         // unbinding -- see `AttachMenu.previously_bound`'s doc comment
         // for why this has to happen here, not after `ClientUnbind`
         // lands (the binding is gone server-side by then too).
-        let previously_bound = self
-            .workspace
-            .tree
-            .as_ref()
-            .and_then(|tree| tree.find(pane))
-            .and_then(|leaf| leaf.active_bound());
-        let req = Request::ClientUnbind { workspace: self.workspace.id.to_string(), pane };
-        let _ = self.request(write_half, reader, req).await?;
+        let previously_bound = leaf.and_then(|leaf| leaf.active_bound());
+        let has_multiple_tabs = leaf.is_some_and(|leaf| leaf.tabs.len() > 1);
+        if !has_multiple_tabs {
+            let req = Request::ClientUnbind { workspace: self.workspace.id.to_string(), pane };
+            let _ = self.request(write_half, reader, req).await?;
+        }
         if let Response::PinnedDirsList(pinned) =
             self.request(write_half, reader, Request::PinnedDirsList).await?
         {
@@ -2683,6 +2692,112 @@ mod tests {
             spawn_in_group: None,
             adding_tab: false,
         });
+    }
+
+    /// `cmd-shift-z` on a multi-tab leaf must not drop a sibling tab.
+    /// Regression test: `detach_and_open_menu` used to always send
+    /// `ClientUnbind` before opening the picker, but `ClientUnbind` now
+    /// *removes* the active tab from `tabs` rather than blanking a slot
+    /// -- on a 2-tab leaf that shifts the surviving tab down to index 0,
+    /// so the picker's `ClientBind` (which replaces "the active tab",
+    /// now the wrong one) silently overwrote the sibling instead of the
+    /// tab the user meant to replace.
+    #[tokio::test]
+    async fn detach_and_reattach_on_a_multi_tab_leaf_preserves_the_other_tab() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+
+        let Response::ServerPane(sp1) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        let Response::ServerPane(sp2) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        let Response::ServerPane(sp3) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+
+        let Response::ClientPaneCreated { pane, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientSpawn {
+                    workspace: "1".to_string(),
+                    split_of: None,
+                    dir: None,
+                    bind: Some(sp1.id.to_string()),
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneCreated");
+        };
+        app.focused = Some(pane);
+        let _ = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientAddTab { workspace: "1".to_string(), pane, target: sp2.id.to_string() },
+            )
+            .await
+            .unwrap();
+        // Sync local workspace state so `detach_and_open_menu` sees the
+        // real (2-tab, active = sp2) leaf rather than the stale
+        // single-tab snapshot from bootstrap.
+        if let Response::Snapshot { workspace, .. } =
+            app.request(&mut write_half, &mut reader, Request::Subscribe { workspace: "1".to_string() }).await.unwrap()
+        {
+            app.workspace = workspace;
+        }
+
+        app.detach_and_open_menu(&mut write_half, &mut reader).await.unwrap();
+        assert!(app.attach_menu.is_some(), "the picker should open");
+
+        // Pick sp3 to replace the active tab (sp2). Row 0 is the
+        // "Unknown" group's header (a no-op row for `confirm_attach_menu`),
+        // row 1 is sp3's own `Server` row.
+        let sp3_id = sp3.id;
+        app.attach_menu.as_mut().unwrap().servers = vec![("Unknown".to_string(), sp3)];
+        app.attach_menu.as_mut().unwrap().selected = 1;
+        app.confirm_attach_menu(&mut write_half, &mut reader).await.unwrap();
+
+        let Response::ClientPaneList { panes, .. } = app
+            .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneList");
+        };
+        let leaf = panes.iter().find(|p| p.id == pane).expect("pane should still exist");
+        assert_eq!(
+            leaf.tabs,
+            vec![sp1.id, sp3_id],
+            "sp1 (the untouched sibling tab) must survive; sp2 (the active tab) should have been replaced by sp3"
+        );
     }
 
     /// Plain Enter on a group's spawn field: spawns a new server-pane in
