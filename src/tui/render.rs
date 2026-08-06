@@ -290,11 +290,15 @@ fn draw_leaf(
     grids: &HashMap<ServerPaneId, GridSnapshot>,
     focused: Option<crate::protocol::ClientPaneId>,
 ) {
-    let snapshot = pane.bound.and_then(|server_pane_id| grids.get(&server_pane_id));
+    let active = pane.active_bound();
+    let snapshot = active.and_then(|server_pane_id| grids.get(&server_pane_id));
     let mut title = pane
         .name
         .clone()
         .unwrap_or_else(|| short_id(pane.id));
+    if pane.tabs.len() > 1 {
+        title.push_str(&format!(" ({}/{})", pane.active_tab + 1, pane.tabs.len()));
+    }
     if snapshot.is_some_and(|s| s.scroll_offset > 0) {
         title.push_str(" [scrollback]");
     }
@@ -311,7 +315,7 @@ fn draw_leaf(
         .title(title)
         .border_style(border_style);
 
-    match pane.bound {
+    match active {
         None => {
             let placeholder =
                 Paragraph::new("(unbound — bind via `dimux client bind`)").block(block);
@@ -721,7 +725,8 @@ mod tests {
         ClientPane {
             id: Uuid::new_v4(),
             name: None,
-            bound,
+            tabs: bound.into_iter().collect(),
+            active_tab: 0,
         }
     }
 
@@ -813,7 +818,7 @@ mod tests {
     fn draw_leaf_shows_scrollback_indicator_when_scrolled() {
         let pane_id = Uuid::new_v4();
         let server_id = Uuid::new_v4();
-        let pane = ClientPane { id: pane_id, name: Some("shell".to_string()), bound: Some(server_id) };
+        let pane = ClientPane { id: pane_id, name: Some("shell".to_string()), tabs: vec![server_id], active_tab: 0 };
         let mut grids = HashMap::new();
         grids.insert(
             server_id,
@@ -839,7 +844,7 @@ mod tests {
     fn draw_leaf_shows_no_scrollback_indicator_when_live() {
         let pane_id = Uuid::new_v4();
         let server_id = Uuid::new_v4();
-        let pane = ClientPane { id: pane_id, name: Some("shell".to_string()), bound: Some(server_id) };
+        let pane = ClientPane { id: pane_id, name: Some("shell".to_string()), tabs: vec![server_id], active_tab: 0 };
         let mut grids = HashMap::new();
         grids.insert(
             server_id,
@@ -862,11 +867,51 @@ mod tests {
     }
 
     #[test]
+    fn draw_leaf_shows_tab_count_only_when_multiple_tabs() {
+        let pane_id = Uuid::new_v4();
+        let sp1 = Uuid::new_v4();
+        let sp2 = Uuid::new_v4();
+        let pane = ClientPane {
+            id: pane_id,
+            name: Some("editor".to_string()),
+            tabs: vec![sp1, sp2],
+            active_tab: 0,
+        };
+        let grids = HashMap::new();
+        let backend = TestBackend::new(40, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_leaf(frame, &pane, frame.area(), &grids, None))
+            .unwrap();
+        assert!(buffer_contains(&terminal, "(1/2)"));
+    }
+
+    #[test]
+    fn draw_leaf_hides_tab_count_for_single_tab() {
+        let pane_id = Uuid::new_v4();
+        let sp = Uuid::new_v4();
+        let pane = ClientPane {
+            id: pane_id,
+            name: Some("shell".to_string()),
+            tabs: vec![sp],
+            active_tab: 0,
+        };
+        let grids = HashMap::new();
+        let backend = TestBackend::new(40, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_leaf(frame, &pane, frame.area(), &grids, None))
+            .unwrap();
+        assert!(!buffer_contains(&terminal, "(1/1)"));
+        assert!(buffer_contains(&terminal, "shell"));
+    }
+
+    #[test]
     fn draw_split_produces_no_panic_and_both_leaves_render() {
         let left_id = Uuid::new_v4();
         let right_id = Uuid::new_v4();
-        let left = ClientPane { id: Uuid::new_v4(), name: Some("left".into()), bound: Some(left_id) };
-        let right = ClientPane { id: Uuid::new_v4(), name: Some("right".into()), bound: Some(right_id) };
+        let left = ClientPane { id: Uuid::new_v4(), name: Some("left".into()), tabs: vec![left_id], active_tab: 0 };
+        let right = ClientPane { id: Uuid::new_v4(), name: Some("right".into()), tabs: vec![right_id], active_tab: 0 };
         let tree = SplitTree::Split {
             id: Uuid::new_v4(),
             dir: SplitDir::Vertical,
@@ -939,8 +984,8 @@ mod tests {
         // A vertical split (side-by-side panes) reserves exactly one
         // divider column between the two children -- not two (one from
         // each pane's own border), per module doc "Bezels".
-        let left = ClientPane { id: Uuid::new_v4(), name: None, bound: None };
-        let right = ClientPane { id: Uuid::new_v4(), name: None, bound: None };
+        let left = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0 };
+        let right = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0 };
         let tree = SplitTree::Split {
             id: Uuid::new_v4(),
             dir: SplitDir::Vertical,
@@ -968,7 +1013,7 @@ mod tests {
     fn leaf_uses_top_only_border_not_a_full_box() {
         // A single leaf should not draw side/bottom border glyphs -- only
         // the top title-bar row, per module doc "Bezels".
-        let pane = ClientPane { id: Uuid::new_v4(), name: Some("solo".into()), bound: None };
+        let pane = ClientPane { id: Uuid::new_v4(), name: Some("solo".into()), tabs: vec![], active_tab: 0 };
         let workspace = workspace_with_tree(SplitTree::Leaf(pane));
         let grids = HashMap::new();
         let backend = TestBackend::new(20, 6);
@@ -987,8 +1032,8 @@ mod tests {
 
     #[test]
     fn divider_rects_finds_vertical_split_at_reserved_column() {
-        let left = ClientPane { id: Uuid::new_v4(), name: None, bound: None };
-        let right = ClientPane { id: Uuid::new_v4(), name: None, bound: None };
+        let left = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0 };
+        let right = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0 };
         let split_id = Uuid::new_v4();
         let tree = SplitTree::Split {
             id: split_id,
@@ -1012,8 +1057,8 @@ mod tests {
 
     #[test]
     fn divider_rects_finds_horizontal_split_at_lower_titlebar_row() {
-        let top = ClientPane { id: Uuid::new_v4(), name: None, bound: None };
-        let bottom = ClientPane { id: Uuid::new_v4(), name: None, bound: None };
+        let top = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0 };
+        let bottom = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0 };
         let split_id = Uuid::new_v4();
         let tree = SplitTree::Split {
             id: split_id,
@@ -1076,6 +1121,7 @@ mod tests {
             rename: None,
             previously_bound: None,
             spawn_in_group: None,
+            adding_tab: false,
         };
         // Wide enough that the popup (85% of frame width, see
         // draw_attach_menu) comfortably fits every column's full width
@@ -1109,6 +1155,7 @@ mod tests {
             rename: None,
             previously_bound: None,
             spawn_in_group: None,
+            adding_tab: false,
         };
         let preview = (selected_id, "some live pane output".to_string());
         let backend = TestBackend::new(100, 30);
@@ -1139,6 +1186,7 @@ mod tests {
             rename: None,
             previously_bound: None,
             spawn_in_group: None,
+            adding_tab: false,
         };
         // Stale preview from some other (now-unselected) pane -- must
         // not be shown for a pane it wasn't fetched for.
@@ -1172,6 +1220,7 @@ mod tests {
             rename: None,
             previously_bound: None,
             spawn_in_group: None,
+            adding_tab: false,
         };
         let preview = (server_id, "should not appear while a header is selected".to_string());
         let backend = TestBackend::new(100, 30);
@@ -1202,6 +1251,7 @@ mod tests {
             rename: None,
             previously_bound: None,
             spawn_in_group: None,
+            adding_tab: false,
         };
 
         let backend_empty = TestBackend::new(100, 30);
@@ -1240,6 +1290,7 @@ mod tests {
             rename: None,
             previously_bound: None,
             spawn_in_group: None,
+            adding_tab: false,
         };
         // More lines than the preview panel's interior can hold
         // (PREVIEW_PANEL_HEIGHT is 8, i.e. 6 interior rows) -- a naive
@@ -1288,6 +1339,7 @@ mod tests {
             rename: None,
             previously_bound: None,
             spawn_in_group: None,
+            adding_tab: false,
         };
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1312,6 +1364,7 @@ mod tests {
             rename: None,
             previously_bound: None,
             spawn_in_group: None,
+            adding_tab: false,
         };
         let backend = TestBackend::new(60, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1350,6 +1403,7 @@ mod tests {
             rename: None,
             previously_bound: None,
             spawn_in_group: None,
+            adding_tab: false,
         };
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1390,6 +1444,7 @@ mod tests {
             rename: None,
             previously_bound: None,
             spawn_in_group: None,
+            adding_tab: false,
         };
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1429,6 +1484,7 @@ mod tests {
             rename: None,
             previously_bound: None,
             spawn_in_group: None,
+            adding_tab: false,
         };
         let mut collapsed = HashSet::new();
         collapsed.insert("/home/dev/api".to_string());
@@ -1466,6 +1522,7 @@ mod tests {
             rename: None,
             previously_bound: None,
             spawn_in_group: None,
+            adding_tab: false,
         };
 
         let backend = TestBackend::new(100, 30);
@@ -1500,6 +1557,7 @@ mod tests {
             rename: None,
             previously_bound: None,
             spawn_in_group: None,
+            adding_tab: false,
         };
 
         let backend = TestBackend::new(100, 30);
@@ -1530,6 +1588,7 @@ mod tests {
             rename: None,
             previously_bound: None,
             spawn_in_group: None,
+            adding_tab: false,
         };
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1565,6 +1624,7 @@ mod tests {
             rename: None,
             previously_bound: Some(detached_from),
             spawn_in_group: None,
+            adding_tab: false,
         };
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1591,6 +1651,7 @@ mod tests {
             rename: None,
             previously_bound: None,
             spawn_in_group: None,
+            adding_tab: false,
         };
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1620,6 +1681,7 @@ mod tests {
             }),
             previously_bound: None,
             spawn_in_group: None,
+            adding_tab: false,
         };
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1631,7 +1693,7 @@ mod tests {
     #[test]
     fn leaf_rects_single_leaf_returns_the_whole_area() {
         let id = Uuid::new_v4();
-        let tree = SplitTree::Leaf(ClientPane { id, name: None, bound: None });
+        let tree = SplitTree::Leaf(ClientPane { id, name: None, tabs: vec![], active_tab: 0 });
         let area = Rect { x: 0, y: 0, width: 80, height: 24 };
         let rects = leaf_rects(&tree, area);
         assert_eq!(rects, vec![(id, area)]);
@@ -1645,8 +1707,8 @@ mod tests {
             id: Uuid::new_v4(),
             dir: SplitDir::Vertical,
             ratio: 0.5,
-            a: Box::new(SplitTree::Leaf(ClientPane { id: a, name: None, bound: None })),
-            b: Box::new(SplitTree::Leaf(ClientPane { id: b, name: None, bound: None })),
+            a: Box::new(SplitTree::Leaf(ClientPane { id: a, name: None, tabs: vec![], active_tab: 0 })),
+            b: Box::new(SplitTree::Leaf(ClientPane { id: b, name: None, tabs: vec![], active_tab: 0 })),
         };
         let area = Rect { x: 0, y: 0, width: 81, height: 24 };
         let rects = leaf_rects(&tree, area);
@@ -1668,8 +1730,8 @@ mod tests {
             id: Uuid::new_v4(),
             dir: SplitDir::Horizontal,
             ratio: 0.5,
-            a: Box::new(SplitTree::Leaf(ClientPane { id: a, name: None, bound: None })),
-            b: Box::new(SplitTree::Leaf(ClientPane { id: b, name: None, bound: None })),
+            a: Box::new(SplitTree::Leaf(ClientPane { id: a, name: None, tabs: vec![], active_tab: 0 })),
+            b: Box::new(SplitTree::Leaf(ClientPane { id: b, name: None, tabs: vec![], active_tab: 0 })),
         };
         let area = Rect { x: 0, y: 0, width: 80, height: 24 };
         let rects = leaf_rects(&tree, area);
