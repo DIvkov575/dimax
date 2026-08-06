@@ -48,10 +48,10 @@ impl Client {
     }
 }
 
-/// Top-level CLI argument tree. `main.rs` parses into this with `clap`
-/// and dispatches to [`run`].
-#[derive(clap::Parser)]
-#[command(name = "dimux")]
+/// Top-level CLI argument tree. `main.rs` parses [`Args`] (whose
+/// `command` defaults to [`Cli::Attach`] when omitted) and dispatches
+/// to [`run`].
+#[derive(clap::Subcommand)]
 pub enum Cli {
     /// Launch the TUI, attaching to (and auto-starting) the daemon.
     Attach,
@@ -68,6 +68,19 @@ pub enum Cli {
     /// Run the daemon in the foreground (used internally by the
     /// auto-spawn path; also useful for debugging).
     Daemon,
+    /// Regenerate `dimux.conf` (Kitty chord mappings) if needed, then
+    /// open it in `$EDITOR`/`$VISUAL`.
+    Config,
+}
+
+/// `main.rs`'s actual clap entry point. `command` is `Option` so bare
+/// `dimux` (no subcommand at all) parses successfully instead of
+/// erroring -- `main` then defaults it to [`Cli::Attach`].
+#[derive(clap::Parser)]
+#[command(name = "dimux")]
+pub struct Args {
+    #[command(subcommand)]
+    pub command: Option<Cli>,
 }
 
 #[derive(clap::Subcommand)]
@@ -201,13 +214,17 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli {
         Cli::Server { cmd } => run_server(cmd).await,
         Cli::Client { cmd } => run_client(cmd).await,
-        // `main.rs` handles `Attach`/`Daemon` itself and never calls
-        // `run` with them; a caller doing so anyway is a `main.rs` bug,
-        // not something to service here.
-        Cli::Attach | Cli::Daemon => {
-            anyhow::bail!("cli::run called with Attach/Daemon, which main.rs should handle directly")
+        // `main.rs` handles `Attach`/`Daemon`/`Config` itself and never
+        // calls `run` with them; a caller doing so anyway is a
+        // `main.rs` bug, not something to service here.
+        Cli::Attach | Cli::Daemon | Cli::Config => {
+            anyhow::bail!("cli::run called with Attach/Daemon/Config, which main.rs should handle directly")
         }
     }
+}
+
+pub async fn run_config() -> anyhow::Result<()> {
+    unimplemented!("filled in by Task 2")
 }
 
 async fn run_server(cmd: ServerCmd) -> anyhow::Result<()> {
@@ -368,7 +385,20 @@ async fn run_client(cmd: ClientCmd) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::protocol::{ClientPane, ForegroundProcessInfo, ServerPaneStatus, Size};
+    use clap::Parser;
     use uuid::Uuid;
+
+    #[test]
+    fn bare_invocation_defaults_to_attach() {
+        let args = Args::try_parse_from(["dimux"]).unwrap();
+        assert!(matches!(args.command, Some(Cli::Attach) | None));
+    }
+
+    #[test]
+    fn config_subcommand_parses() {
+        let args = Args::try_parse_from(["dimux", "config"]).unwrap();
+        assert!(matches!(args.command, Some(Cli::Config)));
+    }
 
     #[test]
     fn parse_pane_addr_valid() {
