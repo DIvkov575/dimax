@@ -2800,6 +2800,95 @@ mod tests {
         );
     }
 
+    /// `cmd-t` end to end: `open_add_tab_menu` sets `adding_tab: true`,
+    /// and `confirm_attach_menu`'s eventual bind must branch on that to
+    /// send `ClientAddTab` (append) rather than `ClientBind` (replace) --
+    /// this is the one path that exercises `adding_tab: true` at all
+    /// (every other test in this module opens the menu via
+    /// `detach_and_open_menu`/`open_menu_with_one_group`, both of which
+    /// use `false`).
+    #[tokio::test]
+    async fn open_add_tab_menu_then_confirm_appends_rather_than_replaces() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+
+        let Response::ServerPane(sp1) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        let Response::ServerPane(sp2) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        let sp2_id = sp2.id;
+
+        let Response::ClientPaneCreated { pane, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientSpawn {
+                    workspace: "1".to_string(),
+                    split_of: None,
+                    dir: None,
+                    bind: Some(sp1.id.to_string()),
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneCreated");
+        };
+        app.focused = Some(pane);
+
+        app.open_add_tab_menu(&mut write_half, &mut reader).await.unwrap();
+        assert!(app.attach_menu.is_some(), "cmd-t should open the picker");
+        assert!(
+            app.attach_menu.as_ref().unwrap().adding_tab,
+            "cmd-t's menu must be in add-tab mode"
+        );
+        assert_eq!(
+            app.attach_menu.as_ref().unwrap().previously_bound,
+            None,
+            "cmd-t must not unbind/detach anything -- nothing was previously bound from this menu's point of view"
+        );
+
+        // Pick sp2. Row 0 is the "Unknown" group's header, row 1 is
+        // sp2's own Server row (sp1 isn't listed here since this test
+        // builds the menu's row list directly rather than fetching the
+        // real, both-panes-included ServerList).
+        app.attach_menu.as_mut().unwrap().servers = vec![("Unknown".to_string(), sp2)];
+        app.attach_menu.as_mut().unwrap().selected = 1;
+        app.confirm_attach_menu(&mut write_half, &mut reader).await.unwrap();
+
+        let Response::ClientPaneList { panes, .. } = app
+            .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneList");
+        };
+        let leaf = panes.iter().find(|p| p.id == pane).expect("pane should still exist");
+        assert_eq!(
+            leaf.tabs,
+            vec![sp1.id, sp2_id],
+            "add-tab mode must append sp2 as a new tab, not replace sp1"
+        );
+        assert_eq!(leaf.active_tab, 1, "the newly-added tab should become active");
+    }
+
     /// Plain Enter on a group's spawn field: spawns a new server-pane in
     /// that cwd, binds it into the focused client-pane, and sends the
     /// typed command. Exercises `confirm_spawn_in_group(bind: true, ..)`
