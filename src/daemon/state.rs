@@ -32,6 +32,15 @@ use uuid::Uuid;
 /// stable key for "this viewer" across subscribe/unsubscribe/broadcast.
 pub type SubscriberId = u64;
 
+/// What [`State::client_close_tab`] actually did: dropped one of several
+/// tabs, or ran out of tabs and closed the client-pane itself. Callers
+/// broadcast a different layout delta for each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseTabResult {
+    TabRemoved,
+    LeafClosed,
+}
+
 /// Size a freshly spawned server-pane's PTY starts at, before any
 /// frontend reports the on-screen size of a client-pane bound to it
 /// (design doc "PTY sizing" only defines sizing *once* there are
@@ -378,7 +387,8 @@ impl State {
         let pane = ClientPane {
             id: ClientPaneId::new_v4(),
             name: None,
-            bound: bind,
+            tabs: bind.into_iter().collect(),
+            active_tab: 0,
         };
         let id = pane.id;
         match split_of {
@@ -420,7 +430,7 @@ impl State {
         let bound = tree
             .find(pane)
             .ok_or_else(|| anyhow::anyhow!("client-pane {pane} not found in workspace {workspace}"))?
-            .bound;
+            .active_bound();
         let owned = ws.tree.take().expect("tree presence checked above");
         ws.tree = owned.remove_leaf(pane)?;
         self.client_pane_sizes.remove(&pane);
@@ -451,8 +461,13 @@ impl State {
             anyhow::bail!("unknown server-pane {target}");
         }
         let leaf = self.client_pane_mut(workspace, pane)?;
-        let previous = leaf.bound;
-        leaf.bound = Some(target);
+        let previous = leaf.active_bound();
+        if leaf.tabs.is_empty() {
+            leaf.tabs.push(target);
+            leaf.active_tab = 0;
+        } else {
+            leaf.tabs[leaf.active_tab] = target;
+        }
         if let Some(previous) = previous.filter(|p| *p != target) {
             self.apply_pty_size(previous);
         }
@@ -467,11 +482,109 @@ impl State {
     /// A no-op if `pane` was already unbound.
     pub fn client_unbind(&mut self, workspace: WorkspaceId, pane: ClientPaneId) -> anyhow::Result<()> {
         let leaf = self.client_pane_mut(workspace, pane)?;
-        let Some(previous) = leaf.bound.take() else {
+        let Some(previous) = leaf.active_bound() else {
             return Ok(());
         };
+        if leaf.tabs.len() <= 1 {
+            leaf.tabs.clear();
+            leaf.active_tab = 0;
+        } else {
+            leaf.tabs.remove(leaf.active_tab);
+            if leaf.active_tab >= leaf.tabs.len() {
+                leaf.active_tab = leaf.tabs.len() - 1;
+            }
+        }
         self.apply_pty_size(previous);
         Ok(())
+    }
+
+    /// Bind `target` as an *additional* tab of `pane`, made active, leaving
+    /// the pane's existing tabs in place (contrast `client_bind`, which
+    /// replaces the active tab).
+    pub fn client_add_tab(
+        &mut self,
+        workspace: WorkspaceId,
+        pane: ClientPaneId,
+        target: ServerPaneId,
+    ) -> anyhow::Result<()> {
+        if !self.server_panes.contains_key(&target) {
+            anyhow::bail!("unknown server-pane {target}");
+        }
+        let leaf = self.client_pane_mut(workspace, pane)?;
+        leaf.tabs.push(target);
+        leaf.active_tab = leaf.tabs.len() - 1;
+        self.apply_pty_size(target);
+        Ok(())
+    }
+
+    /// Move `pane`'s active tab one step (wrapping). A no-op when the pane
+    /// has fewer than two tabs.
+    pub fn client_cycle_tab(
+        &mut self,
+        workspace: WorkspaceId,
+        pane: ClientPaneId,
+        forward: bool,
+    ) -> anyhow::Result<()> {
+        // Scoped so the `&mut` leaf borrow ends before `apply_pty_size`.
+        let (old_active, new_active) = {
+            let leaf = self.client_pane_mut(workspace, pane)?;
+            let len = leaf.tabs.len();
+            if len <= 1 {
+                return Ok(());
+            }
+            let old = leaf.active_bound();
+            leaf.active_tab = if forward {
+                (leaf.active_tab + 1) % len
+            } else {
+                (leaf.active_tab + len - 1) % len
+            };
+            let new = leaf.active_bound();
+            (old, new)
+        };
+        if let Some(old) = old_active {
+            self.apply_pty_size(old);
+        }
+        if let Some(new) = new_active {
+            self.apply_pty_size(new);
+        }
+        Ok(())
+    }
+
+    /// Drop `pane`'s active tab. Closes the whole client-pane when that was
+    /// its last tab (or it had none), which the caller must know about to
+    /// broadcast the right layout delta — hence [`CloseTabResult`].
+    pub fn client_close_tab(
+        &mut self,
+        workspace: WorkspaceId,
+        pane: ClientPaneId,
+    ) -> anyhow::Result<CloseTabResult> {
+        // Scoped so the `&mut` leaf borrow ends before `client_close`.
+        let (removed, remaining_empty) = {
+            let leaf = self.client_pane_mut(workspace, pane)?;
+            if leaf.tabs.is_empty() {
+                // Already unbound — treat as "close the leaf".
+                return self
+                    .client_close(workspace, pane)
+                    .map(|()| CloseTabResult::LeafClosed);
+            }
+            let removed = leaf.tabs.remove(leaf.active_tab);
+            let empty = leaf.tabs.is_empty();
+            if !empty && leaf.active_tab >= leaf.tabs.len() {
+                leaf.active_tab = leaf.tabs.len() - 1;
+            }
+            (removed, empty)
+        };
+        if remaining_empty {
+            return self
+                .client_close(workspace, pane)
+                .map(|()| CloseTabResult::LeafClosed);
+        }
+        let new_active = self.bound_server_pane(pane);
+        self.apply_pty_size(removed);
+        if let Some(new) = new_active {
+            self.apply_pty_size(new);
+        }
+        Ok(CloseTabResult::TabRemoved)
     }
 
     /// Set a split's ratio directly (mouse-drag resizing, design doc
@@ -535,7 +648,7 @@ impl State {
             .values()
             .filter_map(|ws| ws.tree.as_ref())
             .find_map(|tree| tree.find(pane))
-            .and_then(|leaf| leaf.bound)
+            .and_then(|leaf| leaf.active_bound())
     }
 
     fn lowest_free_number(&self) -> u8 {
@@ -650,7 +763,7 @@ impl State {
             }
             let Some(tree) = &ws.tree else { continue };
             for leaf in tree.leaves() {
-                if leaf.bound != Some(server_pane) {
+                if leaf.active_bound() != Some(server_pane) {
                     continue;
                 }
                 let Some(size) = self.client_pane_sizes.get(&leaf.id) else {
@@ -694,7 +807,7 @@ impl State {
         let Some(tree) = &ws.tree else { return };
         let mut seen: Vec<ServerPaneId> = Vec::new();
         for leaf in tree.leaves() {
-            if let Some(server_pane) = leaf.bound
+            if let Some(server_pane) = leaf.active_bound()
                 && !seen.contains(&server_pane)
             {
                 seen.push(server_pane);
@@ -727,7 +840,9 @@ impl State {
         let mut out: Vec<SubscriberId> = Vec::new();
         for (ws_id, ws) in &self.workspaces {
             let binds = ws.tree.as_ref().is_some_and(|tree| {
-                tree.leaves().iter().any(|leaf| leaf.bound == Some(server_pane))
+                tree.leaves()
+                    .iter()
+                    .any(|leaf| leaf.active_bound() == Some(server_pane))
             });
             if !binds {
                 continue;
@@ -757,8 +872,11 @@ fn chord_number(target: &str) -> Option<u8> {
 fn unbind_all(tree: &mut SplitTree, server_pane: ServerPaneId) {
     match tree {
         SplitTree::Leaf(pane) => {
-            if pane.bound == Some(server_pane) {
-                pane.bound = None;
+            // Background tabs bind the killed pane just as much as the
+            // active one does, so this drops every occurrence, not one.
+            pane.tabs.retain(|&id| id != server_pane);
+            if pane.active_tab >= pane.tabs.len() && !pane.tabs.is_empty() {
+                pane.active_tab = pane.tabs.len() - 1;
             }
         }
         SplitTree::Split { a, b, .. } => {
@@ -901,7 +1019,7 @@ mod tests {
         // Design doc: the client-panes survive as unbound placeholders.
         for (ws, pane) in [(ws_a, pane_a), (ws_b, pane_b)] {
             let tree = state.workspace_info(ws).unwrap().tree.unwrap();
-            assert_eq!(tree.find(pane).unwrap().bound, None);
+            assert_eq!(tree.find(pane).unwrap().active_bound(), None);
         }
     }
 
@@ -1093,7 +1211,7 @@ mod tests {
         let pane = state.client_spawn(ws, None, None, None).unwrap();
         let tree = state.workspace_info(ws).unwrap().tree.unwrap();
         assert_eq!(tree.leaves().len(), 1);
-        assert_eq!(tree.find(pane).unwrap().bound, None);
+        assert_eq!(tree.find(pane).unwrap().active_bound(), None);
     }
 
     #[test]
@@ -1281,12 +1399,12 @@ mod tests {
 
         state.client_bind(ws, pane, second).unwrap();
         let tree = state.workspace_info(ws).unwrap().tree.unwrap();
-        assert_eq!(tree.find(pane).unwrap().bound, Some(second));
+        assert_eq!(tree.find(pane).unwrap().active_bound(), Some(second));
 
         assert!(state.client_bind(ws, pane, Uuid::new_v4()).is_err());
         assert!(state.client_bind(ws, Uuid::new_v4(), second).is_err());
         let tree = state.workspace_info(ws).unwrap().tree.unwrap();
-        assert_eq!(tree.find(pane).unwrap().bound, Some(second));
+        assert_eq!(tree.find(pane).unwrap().active_bound(), Some(second));
     }
 
     #[test]
@@ -1297,7 +1415,7 @@ mod tests {
 
         state.client_unbind(ws, pane).unwrap();
         let tree = state.workspace_info(ws).unwrap().tree.unwrap();
-        assert_eq!(tree.find(pane).unwrap().bound, None);
+        assert_eq!(tree.find(pane).unwrap().active_bound(), None);
         // Detaching isn't killing: the server-pane is still in the pool.
         assert!(state.server_list().iter().any(|p| p.id == server));
 
@@ -1306,6 +1424,175 @@ mod tests {
 
         assert!(state.client_unbind(ws, Uuid::new_v4()).is_err());
         assert!(state.client_unbind(Uuid::new_v4(), pane).is_err());
+    }
+
+    // -- client-pane tabs ------------------------------------------------
+
+    /// The leaf `pane` currently is, cloned so assertions don't hold a
+    /// borrow of `state`.
+    fn leaf_of(state: &State, workspace: WorkspaceId, pane: ClientPaneId) -> ClientPane {
+        state
+            .workspace_info(workspace)
+            .unwrap()
+            .tree
+            .unwrap()
+            .find(pane)
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn client_add_tab_appends_and_activates() {
+        let mut state = State::new();
+        let sp1 = spawn_pane(&mut state, "a");
+        let sp2 = spawn_pane(&mut state, "b");
+        let (ws, pane) = workspace_with_bound_pane(&mut state, "1", sp1);
+
+        state.client_add_tab(ws, pane, sp2).unwrap();
+
+        let leaf = leaf_of(&state, ws, pane);
+        assert_eq!(leaf.tabs, vec![sp1, sp2]);
+        assert_eq!(leaf.active_tab, 1);
+    }
+
+    #[test]
+    fn client_add_tab_unknown_target_errors() {
+        let mut state = State::new();
+        let sp = spawn_pane(&mut state, "a");
+        let (ws, pane) = workspace_with_bound_pane(&mut state, "1", sp);
+
+        assert!(state.client_add_tab(ws, pane, Uuid::new_v4()).is_err());
+        assert!(state.client_add_tab(ws, Uuid::new_v4(), sp).is_err());
+        // Rejected adds leave the tab list untouched.
+        assert_eq!(leaf_of(&state, ws, pane).tabs, vec![sp]);
+    }
+
+    #[test]
+    fn client_bind_replaces_only_the_active_tab() {
+        let mut state = State::new();
+        let sp1 = spawn_pane(&mut state, "a");
+        let sp2 = spawn_pane(&mut state, "b");
+        let sp3 = spawn_pane(&mut state, "c");
+        let (ws, pane) = workspace_with_bound_pane(&mut state, "1", sp1);
+        state.client_add_tab(ws, pane, sp2).unwrap();
+
+        // active_tab is 1 (sp2); binding swaps that slot, not sp1's.
+        state.client_bind(ws, pane, sp3).unwrap();
+
+        let leaf = leaf_of(&state, ws, pane);
+        assert_eq!(leaf.tabs, vec![sp1, sp3]);
+        assert_eq!(leaf.active_tab, 1);
+    }
+
+    #[test]
+    fn client_unbind_drops_only_the_active_tab_when_others_remain() {
+        let mut state = State::new();
+        let sp1 = spawn_pane(&mut state, "a");
+        let sp2 = spawn_pane(&mut state, "b");
+        let (ws, pane) = workspace_with_bound_pane(&mut state, "1", sp1);
+        state.client_add_tab(ws, pane, sp2).unwrap();
+
+        state.client_unbind(ws, pane).unwrap();
+
+        let leaf = leaf_of(&state, ws, pane);
+        assert_eq!(leaf.tabs, vec![sp1]);
+        assert_eq!(leaf.active_tab, 0);
+    }
+
+    #[test]
+    fn client_cycle_tab_wraps_forward_and_backward() {
+        let mut state = State::new();
+        let sp1 = spawn_pane(&mut state, "a");
+        let sp2 = spawn_pane(&mut state, "b");
+        let sp3 = spawn_pane(&mut state, "c");
+        let (ws, pane) = workspace_with_bound_pane(&mut state, "1", sp1);
+        state.client_add_tab(ws, pane, sp2).unwrap();
+        state.client_add_tab(ws, pane, sp3).unwrap();
+        assert_eq!(leaf_of(&state, ws, pane).active_tab, 2);
+
+        // Forward off the end wraps to the first tab...
+        state.client_cycle_tab(ws, pane, true).unwrap();
+        assert_eq!(leaf_of(&state, ws, pane).active_tab, 0);
+        // ...and backward off the front wraps to the last.
+        state.client_cycle_tab(ws, pane, false).unwrap();
+        assert_eq!(leaf_of(&state, ws, pane).active_tab, 2);
+    }
+
+    #[test]
+    fn client_cycle_tab_noop_on_single_tab() {
+        let mut state = State::new();
+        let sp = spawn_pane(&mut state, "a");
+        let (ws, pane) = workspace_with_bound_pane(&mut state, "1", sp);
+
+        state.client_cycle_tab(ws, pane, true).unwrap();
+
+        assert_eq!(leaf_of(&state, ws, pane).active_tab, 0);
+        assert!(state.client_cycle_tab(ws, Uuid::new_v4(), true).is_err());
+    }
+
+    #[test]
+    fn client_close_tab_removes_active_and_clamps() {
+        let mut state = State::new();
+        let sp1 = spawn_pane(&mut state, "a");
+        let sp2 = spawn_pane(&mut state, "b");
+        let (ws, pane) = workspace_with_bound_pane(&mut state, "1", sp1);
+        state.client_add_tab(ws, pane, sp2).unwrap();
+
+        // active_tab is the last tab (sp2), so closing it must clamp.
+        assert_eq!(
+            state.client_close_tab(ws, pane).unwrap(),
+            CloseTabResult::TabRemoved
+        );
+
+        let leaf = leaf_of(&state, ws, pane);
+        assert_eq!(leaf.tabs, vec![sp1]);
+        assert_eq!(leaf.active_tab, 0);
+        // Closing a tab isn't killing: sp2 keeps running.
+        assert!(state.server_list().iter().any(|p| p.id == sp2));
+    }
+
+    #[test]
+    fn client_close_tab_last_tab_closes_the_leaf() {
+        let mut state = State::new();
+        let sp = spawn_pane(&mut state, "a");
+        let (ws, pane) = workspace_with_bound_pane(&mut state, "1", sp);
+
+        assert_eq!(
+            state.client_close_tab(ws, pane).unwrap(),
+            CloseTabResult::LeafClosed
+        );
+
+        assert_eq!(state.workspace_info(ws).unwrap().tree, None);
+    }
+
+    #[test]
+    fn client_close_tab_on_unbound_pane_closes_the_leaf() {
+        let mut state = State::new();
+        let ws = state.resolve_or_create_workspace("1").unwrap();
+        let pane = state.client_spawn(ws, None, None, None).unwrap();
+
+        assert_eq!(
+            state.client_close_tab(ws, pane).unwrap(),
+            CloseTabResult::LeafClosed
+        );
+
+        assert_eq!(state.workspace_info(ws).unwrap().tree, None);
+    }
+
+    #[test]
+    fn unbind_all_removes_killed_server_pane_from_background_tabs() {
+        let mut state = State::new();
+        let sp1 = spawn_pane(&mut state, "a");
+        let sp2 = spawn_pane(&mut state, "b");
+        let (ws, pane) = workspace_with_bound_pane(&mut state, "1", sp1);
+        state.client_add_tab(ws, pane, sp2).unwrap();
+
+        // active_tab is 1 (sp2); sp1 is a *background* tab.
+        state.server_kill("a").unwrap();
+
+        let leaf = leaf_of(&state, ws, pane);
+        assert_eq!(leaf.tabs, vec![sp2]);
+        assert_eq!(leaf.active_tab, 0);
     }
 
     #[test]
