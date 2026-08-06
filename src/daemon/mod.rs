@@ -1493,7 +1493,7 @@ mod tests {
         let mut subscriber = TestConn::connect(&guard.0).await;
 
         async fn spawn_printing_pane(conn: &mut TestConn, text: &str) -> ServerPaneId {
-            match conn
+            let id = match conn
                 .request(Request::ServerSpawn {
                     name: None,
                     cmd: Some(format!("printf {text}")),
@@ -1503,7 +1503,25 @@ mod tests {
             {
                 Response::ServerPane(info) => info.id,
                 other => panic!("expected ServerPane, got {other:?}"),
+            };
+            // Wait for the pane's own output to actually land before
+            // moving on -- under heavy parallel test load, `printf`'s
+            // process may not even be scheduled yet a fixed number of ms
+            // later, and this test needs the pane's content to be
+            // present and *stable* before the tab-add/cycle push it's
+            // checking for happens, or the assertion below can't tell
+            // "still starting up" from "the fix didn't work".
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                match conn.request(Request::ServerRead { target: id.to_string() }).await {
+                    Response::ServerReadOutput { text: seen } if seen.contains(text) => break,
+                    Response::ServerReadOutput { .. } => {}
+                    other => panic!("expected ServerReadOutput, got {other:?}"),
+                }
+                assert!(std::time::Instant::now() < deadline, "pane never printed {text:?}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
+            id
         }
         let first = spawn_printing_pane(&mut conn, "first-output").await;
 
@@ -1533,7 +1551,6 @@ mod tests {
         // adding or cycling to it should depend on it producing anything
         // new.
         let second = spawn_printing_pane(&mut conn, "second-output").await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
         while conn.read_event(Duration::from_millis(50)).await.is_some() {}
 
         match conn
