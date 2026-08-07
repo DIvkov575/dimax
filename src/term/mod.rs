@@ -14,7 +14,9 @@
 
 pub mod session_name;
 
-use crate::protocol::{Cell, ForegroundProcessInfo, GridSnapshot, ServerPaneId, ServerPaneStatus, Size};
+use crate::protocol::{
+    Cell, ForegroundProcessInfo, GridSnapshot, ServerPaneId, ServerPaneStatus, Size, WorkspaceId,
+};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtyPair, PtySize};
 use std::io::{Read, Write};
 use std::os::fd::RawFd;
@@ -83,6 +85,9 @@ struct Inner {
 pub struct ServerPane {
     id: ServerPaneId,
     name: Option<String>,
+    /// See `protocol::ServerPaneInfo::owner_workspace`'s doc comment --
+    /// set once at construction, never mutated afterward.
+    owner_workspace: Option<WorkspaceId>,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -100,6 +105,7 @@ impl ServerPane {
         cwd: Option<String>,
         size: Size,
         events: UnboundedSender<ServerPaneEvent>,
+        owner_workspace: Option<WorkspaceId>,
     ) -> anyhow::Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -258,7 +264,7 @@ impl ServerPane {
             let _ = events.send(ServerPaneEvent::Died(id));
         });
 
-        Ok(Self { id, name, inner })
+        Ok(Self { id, name, owner_workspace, inner })
     }
 
     pub fn id(&self) -> ServerPaneId {
@@ -267,6 +273,10 @@ impl ServerPane {
 
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
+    }
+
+    pub fn owner_workspace(&self) -> Option<WorkspaceId> {
+        self.owner_workspace
     }
 
     pub fn set_name(&mut self, name: Option<String>) {
@@ -620,6 +630,7 @@ mod tests {
             None,
             Size { rows: 24, cols: 80 },
             tx,
+            None,
         )
         .unwrap();
 
@@ -647,6 +658,7 @@ mod tests {
             None,
             Size { rows: 24, cols: 80 },
             tx,
+            None,
         )
         .unwrap();
 
@@ -670,6 +682,7 @@ mod tests {
             None,
             Size { rows: 24, cols: 80 },
             tx,
+            None,
         )
         .unwrap();
 
@@ -696,7 +709,7 @@ mod tests {
     fn flooding_pane_batches_changed_events_instead_of_firing_per_read() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let id = Uuid::new_v4();
-        let pane = ServerPane::spawn(id, None, Some("yes".to_string()), None, Size { rows: 24, cols: 80 }, tx)
+        let pane = ServerPane::spawn(id, None, Some("yes".to_string()), None, Size { rows: 24, cols: 80 }, tx, None)
             .unwrap();
 
         // Let `yes` actually get its output flowing before measuring, so
@@ -732,7 +745,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let id = Uuid::new_v4();
         let pane =
-            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx).unwrap();
+            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx, None).unwrap();
 
         for line in ["alpha", "bravo", "charlie"] {
             pane.write_input(format!("{line}\n").as_bytes()).unwrap();
@@ -769,6 +782,7 @@ mod tests {
             None,
             Size { rows: 24, cols: 80 },
             tx,
+            None,
         )
         .unwrap();
 
@@ -792,6 +806,7 @@ mod tests {
             Some("/tmp".to_string()),
             Size { rows: 24, cols: 80 },
             tx,
+            None,
         )
         .unwrap();
 
@@ -809,7 +824,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let id = Uuid::new_v4();
         let pane =
-            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx).unwrap();
+            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx, None).unwrap();
         assert_eq!(pane.scrollback_rows(), 0);
     }
 
@@ -820,7 +835,7 @@ mod tests {
         // A small 5-row pane makes it easy to scroll content off the
         // top with a modest number of printed lines.
         let pane =
-            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 5, cols: 80 }, tx).unwrap();
+            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 5, cols: 80 }, tx, None).unwrap();
 
         // Write enough lines to scroll "first-line" off the top of a
         // 5-row screen and into scrollback.
@@ -868,7 +883,7 @@ mod tests {
     fn foreground_info_reports_the_running_shell_command() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let id = Uuid::new_v4();
-        let pane = ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx)
+        let pane = ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx, None)
             .unwrap();
 
         // Wait for the shell to actually exec `cat` (there's a brief
@@ -902,7 +917,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let id = Uuid::new_v4();
         let mut pane =
-            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx).unwrap();
+            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx, None).unwrap();
         pane.kill().unwrap();
         // The process group leader is gone once killed; there's nothing
         // left to query.
