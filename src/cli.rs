@@ -243,7 +243,7 @@ async fn run_server(cmd: ServerCmd) -> anyhow::Result<()> {
     let mut client = Client::connect().await?;
     match cmd {
         ServerCmd::Spawn { name, cmd, cwd } => {
-            let req = Request::ServerSpawn { name: Some(name), cmd, cwd };
+            let req = Request::ServerSpawn { name: Some(name), cmd, cwd, workspace: None };
             match client.request(req).await? {
                 Response::ServerPane(info) => {
                     let label = info.name.as_deref().unwrap_or("-");
@@ -458,6 +458,7 @@ mod tests {
                 process_name: "vim".to_string(),
                 cwd: Some("/home/dev".to_string()),
             }),
+            owner_workspace: None,
         };
         let line = format_server_pane_line(&info);
         assert_eq!(
@@ -474,6 +475,7 @@ mod tests {
             size: Size { rows: 10, cols: 20 },
             status: ServerPaneStatus::Dead,
             foreground: None,
+            owner_workspace: None,
         };
         let line = format_server_pane_line(&info);
         assert_eq!(line, format!("{}\t-\tdead\t10x20\t-\t-", Uuid::nil()));

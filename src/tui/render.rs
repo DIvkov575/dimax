@@ -1112,7 +1112,8 @@ mod tests {
                 process_name: "vim".to_string(),
                 cwd: Some("/home/dev/project".to_string()),
             }),
-        };
+        owner_workspace: None,
+            };
         let servers = vec![("/home/dev/project".to_string(), server)];
         let menu = super::super::AttachMenu {
             servers,
@@ -1145,7 +1146,8 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-        };
+        owner_workspace: None,
+            };
         let selected_id = server.id;
         // Row 0 is the "Unknown" group header; row 1 is the server row.
         let menu = super::super::AttachMenu {
@@ -1173,7 +1175,8 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-        };
+        owner_workspace: None,
+            };
         // Row 0 is the "Unknown" group header; row 1 is the server row
         // -- selecting the server row itself is what makes this a real
         // test of "selection is on a Server row, but the cached
@@ -1210,7 +1213,8 @@ mod tests {
                 process_name: "vim".to_string(),
                 cwd: Some("/home/dev/project".to_string()),
             }),
-        };
+        owner_workspace: None,
+            };
         let server_id = server.id;
         let menu = super::super::AttachMenu {
             servers: vec![("/home/dev/project".to_string(), server)],
@@ -1242,7 +1246,8 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-        };
+        owner_workspace: None,
+            };
         let server_id = server.id;
         let menu = super::super::AttachMenu {
             servers: vec![("Unknown".to_string(), server)],
@@ -1281,7 +1286,8 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-        };
+        owner_workspace: None,
+            };
         let selected_id = server.id;
         let menu = super::super::AttachMenu {
             servers: vec![("Unknown".to_string(), server)],
@@ -1330,7 +1336,8 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Dead,
             foreground: None,
-        };
+        owner_workspace: None,
+            };
         let servers = vec![("Unknown".to_string(), server)];
         let menu = super::super::AttachMenu {
             servers,
@@ -1383,7 +1390,8 @@ mod tests {
                 process_name: "bash".to_string(),
                 cwd: Some("/home/dev/api".to_string()),
             }),
-        };
+        owner_workspace: None,
+            };
         let b = ServerPaneInfo {
             id: Uuid::new_v4(),
             name: Some("web-shell".to_string()),
@@ -1393,7 +1401,8 @@ mod tests {
                 process_name: "bash".to_string(),
                 cwd: Some("/home/dev/web".to_string()),
             }),
-        };
+        owner_workspace: None,
+            };
         let servers =
             vec![("/home/dev/api".to_string(), a), ("/home/dev/web".to_string(), b)];
         let menu = super::super::AttachMenu {
@@ -1425,14 +1434,16 @@ mod tests {
                 process_name: "bash".to_string(),
                 cwd: Some("/home/dev/api".to_string()),
             }),
-        };
+        owner_workspace: None,
+            };
         let dead = ServerPaneInfo {
             id: Uuid::new_v4(),
             name: Some("dead-pane".to_string()),
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Dead,
             foreground: None,
-        };
+        owner_workspace: None,
+            };
         let servers = vec![
             ("/home/dev/api".to_string(), a),
             ("Unknown".to_string(), dead),
@@ -1464,7 +1475,8 @@ mod tests {
                 process_name: "bash".to_string(),
                 cwd: Some("/home/dev/api".to_string()),
             }),
-        };
+        owner_workspace: None,
+            };
         let b = ServerPaneInfo {
             id: Uuid::new_v4(),
             name: Some("web-shell".to_string()),
@@ -1474,7 +1486,8 @@ mod tests {
                 process_name: "bash".to_string(),
                 cwd: Some("/home/dev/web".to_string()),
             }),
-        };
+        owner_workspace: None,
+            };
         let servers =
             vec![("/home/dev/api".to_string(), a), ("/home/dev/web".to_string(), b)];
         let menu = super::super::AttachMenu {
@@ -1514,7 +1527,8 @@ mod tests {
                 process_name: "bash".to_string(),
                 cwd: Some("/home/dev/api".to_string()),
             }),
-        };
+        owner_workspace: None,
+            };
         let menu = super::super::AttachMenu {
             servers: vec![("/home/dev/api".to_string(), a)],
             selected: 0,
@@ -1549,7 +1563,8 @@ mod tests {
                 process_name: "bash".to_string(),
                 cwd: Some("/home/dev/api".to_string()),
             }),
-        };
+        owner_workspace: None,
+            };
         let menu = super::super::AttachMenu {
             servers: vec![("/home/dev/api".to_string(), a)],
             selected: 0,
@@ -1580,7 +1595,8 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-        };
+        owner_workspace: None,
+            };
         let menu = super::super::AttachMenu {
             servers: vec![("Unknown".to_string(), server)],
             selected: 0,
@@ -1606,14 +1622,16 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-        };
+        owner_workspace: None,
+            };
         let server_b = ServerPaneInfo {
             id: other,
             name: Some("other-pane".to_string()),
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-        };
+        owner_workspace: None,
+            };
         let menu = super::super::AttachMenu {
             servers: vec![
                 ("Unknown".to_string(), server_a),
@@ -1643,7 +1661,8 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-        };
+        owner_workspace: None,
+            };
         let menu = super::super::AttachMenu {
             servers: vec![("Unknown".to_string(), server)],
             selected: 0,
@@ -1668,7 +1687,8 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-        };
+        owner_workspace: None,
+            };
         let menu = super::super::AttachMenu {
             servers: vec![("Unknown".to_string(), server)],
             selected: 0,

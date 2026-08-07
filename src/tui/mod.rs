@@ -390,6 +390,14 @@ struct App {
     /// wherever the menu's grouping gets rebuilt, same as
     /// `collapsed_groups`.
     pinned_dirs: Vec<String>,
+    /// Whether the attach menu should show every workspace's server-panes
+    /// (`true`) or only this workspace's own panes plus orphaned ones
+    /// with no `owner_workspace` at all (`false`, the default). A purely
+    /// local UI preference like `collapsed_groups` -- not persisted, not
+    /// server state -- toggled by `AttachMenuAction::ToggleShowAllWorkspaces`
+    /// (`a` on any row) and applied by `filter_servers_for_menu` every
+    /// time the menu's server list is (re)built.
+    show_all_workspaces: bool,
 }
 
 impl App {
@@ -424,6 +432,7 @@ impl App {
                         collapsed_groups: HashSet::new(),
                         attach_menu_preview: None,
                         pinned_dirs: Vec::new(),
+                        show_all_workspaces: false,
                     };
                     if is_empty {
                         app.bootstrap_empty_workspace(write_half, reader).await?;
@@ -459,7 +468,16 @@ impl App {
         };
         if available {
             let Response::ServerPane(server) = self
-                .request(write_half, reader, Request::ServerSpawn { name: None, cmd: None, cwd: None })
+                .request(
+                    write_half,
+                    reader,
+                    Request::ServerSpawn {
+                        name: None,
+                        cmd: None,
+                        cwd: None,
+                        workspace: Some(self.workspace.id.to_string()),
+                    },
+                )
                 .await?
             else {
                 return Ok(());
@@ -597,7 +615,16 @@ impl App {
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
         let Response::ServerPane(server) = self
-            .request(write_half, reader, Request::ServerSpawn { name: None, cmd: None, cwd: None })
+            .request(
+                write_half,
+                reader,
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: None,
+                    cwd: None,
+                    workspace: Some(self.workspace.id.to_string()),
+                },
+            )
             .await?
         else {
             return Ok(());
@@ -1141,7 +1168,16 @@ impl App {
         let target = match row {
             AttachMenuRow::Server(server_index) => menu.servers[server_index].1.id.to_string(),
             AttachMenuRow::SpawnNew => match self
-                .request(write_half, reader, Request::ServerSpawn { name: None, cmd: None, cwd: None })
+                .request(
+                    write_half,
+                    reader,
+                    Request::ServerSpawn {
+                        name: None,
+                        cmd: None,
+                        cwd: None,
+                        workspace: Some(self.workspace.id.to_string()),
+                    },
+                )
                 .await?
             {
                 Response::ServerPane(info) => info.id.to_string(),
@@ -1153,7 +1189,12 @@ impl App {
                     .request(
                         write_half,
                         reader,
-                        Request::ServerSpawn { name: None, cmd: None, cwd: Some(cwd) },
+                        Request::ServerSpawn {
+                            name: None,
+                            cmd: None,
+                            cwd: Some(cwd),
+                            workspace: Some(self.workspace.id.to_string()),
+                        },
                     )
                     .await?
                 {
@@ -1220,7 +1261,16 @@ impl App {
         let text = spawn.text.clone();
 
         let server_pane = match self
-            .request(write_half, reader, Request::ServerSpawn { name: None, cmd: None, cwd: Some(cwd) })
+            .request(
+                write_half,
+                reader,
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: None,
+                    cwd: Some(cwd),
+                    workspace: Some(self.workspace.id.to_string()),
+                },
+            )
             .await?
         {
             Response::ServerPane(info) => info.id,
@@ -2223,6 +2273,7 @@ mod tests {
                 process_name: "bash".to_string(),
                 cwd: Some(c.to_string()),
             }),
+            owner_workspace: None,
         }
     }
 
@@ -2393,6 +2444,7 @@ mod tests {
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
+            show_all_workspaces: false,
         };
         app.toggle_group_collapse(0);
         assert!(app.collapsed_groups.contains("/a"));
@@ -2420,6 +2472,7 @@ mod tests {
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
+            show_all_workspaces: false,
         };
         app.toggle_group_collapse(0);
         assert_eq!(app.attach_menu.unwrap().selected, 1, "should clamp onto the new last row (global spawn-new)");
@@ -2442,6 +2495,7 @@ mod tests {
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
+            show_all_workspaces: false,
         };
         app.move_attach_menu_selection(true);
         assert_eq!(app.attach_menu.as_ref().unwrap().selected, 0);
@@ -2464,6 +2518,7 @@ mod tests {
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
+            show_all_workspaces: false,
         };
         app.arm_delete();
         assert_eq!(app.attach_menu.unwrap().pending_delete, Some(0));
@@ -2483,6 +2538,7 @@ mod tests {
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
+            show_all_workspaces: false,
         };
         app.arm_delete();
         assert_eq!(app.attach_menu.unwrap().pending_delete, None);
@@ -2512,6 +2568,7 @@ mod tests {
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
+            show_all_workspaces: false,
         };
         app.arm_delete();
         assert_eq!(app.attach_menu.unwrap().pending_delete, None);
@@ -2612,6 +2669,7 @@ mod tests {
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
+            show_all_workspaces: false,
         };
         app.start_rename();
         let rename = app.attach_menu.unwrap().rename.unwrap();
@@ -2634,6 +2692,7 @@ mod tests {
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
+            show_all_workspaces: false,
         };
         app.start_rename();
         assert!(app.attach_menu.unwrap().rename.is_none());
@@ -2663,6 +2722,7 @@ mod tests {
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
+            show_all_workspaces: false,
         };
         app.start_rename();
         assert!(app.attach_menu.unwrap().rename.is_none());
@@ -2858,7 +2918,7 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None },
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None , workspace: None},
             )
             .await
             .unwrap()
@@ -2932,7 +2992,7 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None },
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None , workspace: None},
             )
             .await
             .unwrap()
@@ -2943,7 +3003,7 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None },
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None , workspace: None},
             )
             .await
             .unwrap()
@@ -2954,7 +3014,7 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None },
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None , workspace: None},
             )
             .await
             .unwrap()
@@ -3037,7 +3097,7 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None },
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None , workspace: None},
             )
             .await
             .unwrap()
@@ -3048,7 +3108,7 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None },
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None , workspace: None},
             )
             .await
             .unwrap()
@@ -3139,7 +3199,7 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) },
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) , workspace: None},
             )
             .await
             .unwrap()
@@ -3215,7 +3275,7 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) },
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) , workspace: None},
             )
             .await
             .unwrap()
@@ -3295,7 +3355,7 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) },
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) , workspace: None},
             )
             .await
             .unwrap()
@@ -3333,7 +3393,7 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) },
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) , workspace: None},
             )
             .await
             .unwrap()
@@ -3378,7 +3438,7 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) },
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) , workspace: None},
             )
             .await
             .unwrap()
@@ -3440,7 +3500,7 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some(dir_a_str) },
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some(dir_a_str) , workspace: None},
             )
             .await
             .unwrap()
@@ -3451,7 +3511,7 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some(dir_z_str) },
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some(dir_z_str) , workspace: None},
             )
             .await
             .unwrap()
@@ -3529,7 +3589,7 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) },
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) , workspace: None},
             )
             .await
             .unwrap()
