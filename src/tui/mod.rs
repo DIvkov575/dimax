@@ -54,15 +54,12 @@
 //!   didn't make — flagged here for it to be revisited/formalized
 //!   (e.g. promoted to a proper Kitty-forwarded chord) rather than staying
 //!   a hardcoded raw byte.
-//! - **Focus movement (`FocusLeft/Right/Up/Down`) is leaf-cycling, not
-//!   2D adjacency.** `SplitTree` stores only `dir`/`ratio` per split, no
-//!   rendered rect — so "the pane geometrically to the left" isn't
-//!   computable without that information. `cycle_focus` below instead
-//!   walks `leaves()` in tree order and treats Left/Up as "previous leaf"
-//!   and Right/Down as "next leaf" (wrapping). This is an intentionally
-//!   honest v1 stand-in, not a geometrically correct implementation; doing
-//!   the real thing needs the render layer to hand back computed rects
-//!   per leaf, which it doesn't currently do.
+//! - **Focus movement (`FocusLeft/Right/Up/Down`) uses real screen
+//!   adjacency.** `nearest_leaf_in_direction` computes each leaf's
+//!   actual on-screen `Rect` via `render::leaf_rects` (the same data
+//!   mouse hit-testing already uses) and picks whichever leaf lies in
+//!   the requested direction, nearest first. No wraparound: if nothing
+//!   is in that direction, the chord is a no-op.
 //! - **Requests are sent through an `Event`-tolerant helper
 //!   (`App::request`), not `Client::request`.** Once subscribed, the
 //!   daemon can push an `Event` frame at any point on the same connection,
@@ -204,6 +201,20 @@ pub enum Action {
     /// Not a dimux chord — forward these raw bytes to the focused
     /// client-pane's bound server-pane as keyboard input.
     PassThrough,
+}
+
+/// A screen-relative direction for [`nearest_leaf_in_direction`]. Not
+/// `SplitDir` (which names a divider's orientation) or
+/// `ratatui::layout::Direction` (which names a layout axis) — both
+/// already mean something else in this codebase; see `render.rs`
+/// module doc "SplitDir -> ratatui::Direction mapping" for why a third,
+/// unambiguous name is worth it here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 /// State for the `cmd-shift-z` attach menu: pick an existing server-pane,
@@ -1274,9 +1285,11 @@ impl App {
         Ok(())
     }
 
-    fn move_focus(&mut self, forward: bool) {
-        if let Some(tree) = &self.workspace.tree {
-            self.focused = cycle_focus(tree, self.focused, forward);
+    fn move_focus(&mut self, direction: Direction) {
+        if let Some(tree) = &self.workspace.tree
+            && let Some(next) = nearest_leaf_in_direction(tree, self.frame_area, self.focused, direction)
+        {
+            self.focused = Some(next);
         }
     }
 
@@ -1388,8 +1401,10 @@ impl App {
             Action::AddTab => self.open_add_tab_menu(write_half, reader).await?,
             Action::CycleTabForward => self.cycle_tab(true, write_half, reader).await?,
             Action::CycleTabBackward => self.cycle_tab(false, write_half, reader).await?,
-            Action::FocusLeft | Action::FocusUp => self.move_focus(false),
-            Action::FocusRight | Action::FocusDown => self.move_focus(true),
+            Action::FocusLeft => self.move_focus(Direction::Left),
+            Action::FocusRight => self.move_focus(Direction::Right),
+            Action::FocusUp => self.move_focus(Direction::Up),
+            Action::FocusDown => self.move_focus(Direction::Down),
             Action::PassThrough => {
                 if let Some(pane) = self.focused {
                     let req = Request::Input { pane, bytes: raw.to_vec() };
@@ -1408,31 +1423,85 @@ fn first_leaf(workspace: &WorkspaceInfo) -> Option<ClientPaneId> {
     workspace.tree.as_ref().and_then(|t| t.leaves().first().map(|p| p.id))
 }
 
-/// Pick the next leaf to focus, cycling through `tree.leaves()` in tree
-/// order. See module doc "Focus movement is leaf-cycling, not 2D
-/// adjacency" for why this isn't real geometric adjacency: `SplitTree`
-/// carries no rect information, only split ratios, so there is nothing to
-/// compute real "left of"/"above" against. `forward = true` is
-/// Right/Down (next leaf); `forward = false` is Left/Up (previous leaf).
-/// Wraps at either end. Returns `None` only if the tree has zero leaves,
-/// which cannot happen for a real `SplitTree` (every node is `Leaf` or a
-/// `Split` of two subtrees, never empty) but is handled defensively
-/// anyway.
-fn cycle_focus(tree: &SplitTree, current: Option<ClientPaneId>, forward: bool) -> Option<ClientPaneId> {
-    let leaves = tree.leaves();
-    if leaves.is_empty() {
+/// Find whichever leaf is nearest to `current` in the given screen
+/// `direction`, using each leaf's actual on-screen `Rect` (via
+/// `render::leaf_rects`) rather than tree order — see design doc
+/// "Directional Focus Navigation" for why this now works where the
+/// old tree-order `cycle_focus` was an intentional stand-in. `None` if
+/// there is no leaf in that direction at all (no wraparound) or the
+/// tree has zero leaves (cannot happen for a real `SplitTree`, but
+/// handled defensively). If `current` is `None` or no longer names a
+/// leaf in this tree (e.g. it was just closed elsewhere), lands on the
+/// first leaf in `leaf_rects`' own order, matching `cycle_focus`'s old
+/// fallback behavior for the same edge case.
+fn nearest_leaf_in_direction(
+    tree: &SplitTree,
+    area: ratatui::layout::Rect,
+    current: Option<ClientPaneId>,
+    direction: Direction,
+) -> Option<ClientPaneId> {
+    let rects = render::leaf_rects(tree, area);
+    if rects.is_empty() {
         return None;
     }
-    let idx = current.and_then(|id| leaves.iter().position(|p| p.id == id));
-    let next_idx = match idx {
-        Some(i) if forward => (i + 1) % leaves.len(),
-        Some(i) => (i + leaves.len() - 1) % leaves.len(),
-        // Focused pane not found among the current leaves (e.g. it was
-        // just closed elsewhere) -- land on the first leaf rather than
-        // picking an arbitrary direction-dependent index.
-        None => 0,
+    let focused_rect = current.and_then(|id| rects.iter().find(|(pane, _)| *pane == id).map(|(_, r)| *r));
+    let Some(focused_rect) = focused_rect else {
+        return Some(rects[0].0);
     };
-    Some(leaves[next_idx].id)
+    rects
+        .iter()
+        .filter(|(_, rect)| is_in_direction(focused_rect, *rect, direction))
+        .min_by_key(|(_, rect)| {
+            let gap = axis_gap(focused_rect, *rect, direction);
+            let overlap = perpendicular_overlap(focused_rect, *rect, direction);
+            // Smallest gap wins; among equal gaps, the largest
+            // perpendicular overlap wins (favors a pane actually
+            // beside/above/below the focused one over a diagonal
+            // neighbor that happens to be marginally closer). Negating
+            // overlap turns "largest wins" into the same ascending
+            // `min_by_key` comparison as the gap.
+            (gap, i32::from(overlap).saturating_neg())
+        })
+        .map(|(pane, _)| *pane)
+}
+
+/// Whether `other` is positioned in `direction` relative to `focused`
+/// -- strictly on that side, not overlapping it on the movement axis.
+fn is_in_direction(focused: ratatui::layout::Rect, other: ratatui::layout::Rect, direction: Direction) -> bool {
+    match direction {
+        Direction::Left => other.x + other.width <= focused.x,
+        Direction::Right => other.x >= focused.x + focused.width,
+        Direction::Up => other.y + other.height <= focused.y,
+        Direction::Down => other.y >= focused.y + focused.height,
+    }
+}
+
+/// The gap between `focused` and `other` along the movement axis --
+/// smaller means nearer. Only meaningful for a pair `is_in_direction`
+/// already confirmed, so this never underflows.
+fn axis_gap(focused: ratatui::layout::Rect, other: ratatui::layout::Rect, direction: Direction) -> u16 {
+    match direction {
+        Direction::Left => focused.x - (other.x + other.width),
+        Direction::Right => other.x - (focused.x + focused.width),
+        Direction::Up => focused.y - (other.y + other.height),
+        Direction::Down => other.y - (focused.y + focused.height),
+    }
+}
+
+/// How much `focused` and `other` overlap along the axis perpendicular
+/// to `direction` -- larger means "more directly across from" rather
+/// than a diagonal neighbor. Zero if they don't overlap on that axis
+/// at all.
+fn perpendicular_overlap(focused: ratatui::layout::Rect, other: ratatui::layout::Rect, direction: Direction) -> u16 {
+    let (focused_start, focused_end, other_start, other_end) = match direction {
+        Direction::Left | Direction::Right => {
+            (focused.y, focused.y + focused.height, other.y, other.y + other.height)
+        }
+        Direction::Up | Direction::Down => {
+            (focused.x, focused.x + focused.width, other.x, other.x + other.width)
+        }
+    };
+    focused_end.min(other_end).saturating_sub(focused_start.max(other_start))
 }
 
 /// Find whichever divider's grab zone contains `(col, row)`, if any. Pure
@@ -2022,54 +2091,90 @@ mod tests {
         SplitTree::Split { id: Uuid::new_v4(), dir, ratio: 0.5, a: Box::new(a), b: Box::new(b) }
     }
 
+    fn rect(x: u16, y: u16, width: u16, height: u16) -> ratatui::layout::Rect {
+        ratatui::layout::Rect { x, y, width, height }
+    }
+
     #[test]
-    fn cycle_focus_single_leaf_stays_put() {
+    fn nearest_leaf_single_leaf_has_no_neighbors() {
         let id = Uuid::new_v4();
         let tree = leaf(id);
-        assert_eq!(cycle_focus(&tree, Some(id), true), Some(id));
-        assert_eq!(cycle_focus(&tree, Some(id), false), Some(id));
+        let area = rect(0, 0, 80, 24);
+        for dir in [Direction::Left, Direction::Right, Direction::Up, Direction::Down] {
+            assert_eq!(nearest_leaf_in_direction(&tree, area, Some(id), dir), None);
+        }
     }
 
     #[test]
-    fn cycle_focus_no_current_focus_lands_on_first_leaf() {
+    fn nearest_leaf_no_current_focus_lands_on_first_leaf() {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let tree = split(SplitDir::Vertical, leaf(a), leaf(b));
-        assert_eq!(cycle_focus(&tree, None, true), Some(a));
-        assert_eq!(cycle_focus(&tree, None, false), Some(a));
+        let area = rect(0, 0, 80, 24);
+        assert_eq!(nearest_leaf_in_direction(&tree, area, None, Direction::Right), Some(a));
     }
 
     #[test]
-    fn cycle_focus_forward_moves_to_next_leaf_and_wraps() {
-        let a = Uuid::new_v4();
-        let b = Uuid::new_v4();
-        let c = Uuid::new_v4();
-        // ((a, b), c) -- leaves() order is a, b, c.
-        let tree = split(SplitDir::Vertical, split(SplitDir::Horizontal, leaf(a), leaf(b)), leaf(c));
-        assert_eq!(cycle_focus(&tree, Some(a), true), Some(b));
-        assert_eq!(cycle_focus(&tree, Some(b), true), Some(c));
-        assert_eq!(cycle_focus(&tree, Some(c), true), Some(a), "forward wraps past the last leaf");
-    }
-
-    #[test]
-    fn cycle_focus_backward_moves_to_previous_leaf_and_wraps() {
-        let a = Uuid::new_v4();
-        let b = Uuid::new_v4();
-        let c = Uuid::new_v4();
-        let tree = split(SplitDir::Vertical, split(SplitDir::Horizontal, leaf(a), leaf(b)), leaf(c));
-        assert_eq!(cycle_focus(&tree, Some(c), false), Some(b));
-        assert_eq!(cycle_focus(&tree, Some(b), false), Some(a));
-        assert_eq!(cycle_focus(&tree, Some(a), false), Some(c), "backward wraps past the first leaf");
-    }
-
-    #[test]
-    fn cycle_focus_unknown_current_id_lands_on_first_leaf() {
+    fn nearest_leaf_unknown_current_id_lands_on_first_leaf() {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let tree = split(SplitDir::Vertical, leaf(a), leaf(b));
+        let area = rect(0, 0, 80, 24);
         let stale = Uuid::new_v4();
-        assert_eq!(cycle_focus(&tree, Some(stale), true), Some(a));
-        assert_eq!(cycle_focus(&tree, Some(stale), false), Some(a));
+        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(stale), Direction::Left), Some(a));
+    }
+
+    #[test]
+    fn nearest_leaf_left_right_split_moves_horizontally_only() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        // Vertical split = side-by-side panes (see render.rs module doc
+        // "SplitDir -> ratatui::Direction mapping").
+        let tree = split(SplitDir::Vertical, leaf(a), leaf(b));
+        let area = rect(0, 0, 80, 24);
+        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(a), Direction::Right), Some(b));
+        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(b), Direction::Left), Some(a));
+        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(a), Direction::Up), None);
+        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(a), Direction::Down), None);
+        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(b), Direction::Right), None, "no wraparound");
+    }
+
+    #[test]
+    fn nearest_leaf_top_bottom_split_moves_vertically_only() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        // Horizontal split = stacked panes.
+        let tree = split(SplitDir::Horizontal, leaf(a), leaf(b));
+        let area = rect(0, 0, 80, 24);
+        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(a), Direction::Down), Some(b));
+        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(b), Direction::Up), Some(a));
+        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(a), Direction::Left), None);
+        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(a), Direction::Right), None);
+    }
+
+    #[test]
+    fn nearest_leaf_picks_the_directly_adjacent_pane_over_a_diagonal_one() {
+        // Three panes: `top` spans the full width across the top half;
+        // `bottom_left`/`bottom_right` split the bottom half side by side.
+        // From `bottom_left`, Up must land on `top` (directly above),
+        // not skip past it -- and there is only one candidate "above" here
+        // by construction, so this also confirms the direction filter
+        // itself (not just tie-breaking) is doing the right thing.
+        let top = Uuid::new_v4();
+        let bottom_left = Uuid::new_v4();
+        let bottom_right = Uuid::new_v4();
+        let tree = split(
+            SplitDir::Horizontal,
+            leaf(top),
+            split(SplitDir::Vertical, leaf(bottom_left), leaf(bottom_right)),
+        );
+        let area = rect(0, 0, 80, 24);
+        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(bottom_left), Direction::Up), Some(top));
+        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(bottom_right), Direction::Up), Some(top));
+        assert_eq!(
+            nearest_leaf_in_direction(&tree, area, Some(bottom_left), Direction::Right),
+            Some(bottom_right)
+        );
     }
 
     fn divider_hit(split: crate::protocol::SplitId, zone: ratatui::layout::Rect) -> render::DividerHit {
