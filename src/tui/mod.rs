@@ -131,7 +131,7 @@ pub mod render;
 use crate::cli::Client;
 use crate::protocol::{
     self, ClientPaneId, Event, GridSnapshot, Request, Response, ServerMessage, ServerPaneId,
-    ServerPaneInfo, Size, SplitDir, SplitTree, WorkspaceInfo,
+    ServerPaneInfo, Size, SplitDir, SplitTree, WorkspaceId, WorkspaceInfo,
 };
 use std::collections::{HashMap, HashSet};
 use tokio::io::AsyncReadExt;
@@ -502,7 +502,10 @@ impl App {
             self.request(write_half, reader, Request::ServerList).await?
         {
             self.attach_menu = Some(AttachMenu {
-                servers: group_servers_by_cwd(servers, &self.pinned_dirs),
+                servers: group_servers_by_cwd(
+                filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
+                &self.pinned_dirs,
+            ),
                 selected: 0,
                 pending_delete: None,
                 rename: None,
@@ -699,7 +702,10 @@ impl App {
             self.request(write_half, reader, Request::ServerList).await?
         {
             self.attach_menu = Some(AttachMenu {
-                servers: group_servers_by_cwd(servers, &self.pinned_dirs),
+                servers: group_servers_by_cwd(
+                filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
+                &self.pinned_dirs,
+            ),
                 selected: 0,
                 pending_delete: None,
                 rename: None,
@@ -731,7 +737,10 @@ impl App {
             self.request(write_half, reader, Request::ServerList).await?
         {
             self.attach_menu = Some(AttachMenu {
-                servers: group_servers_by_cwd(servers, &self.pinned_dirs),
+                servers: group_servers_by_cwd(
+                filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
+                &self.pinned_dirs,
+            ),
                 selected: 0,
                 pending_delete: None,
                 rename: None,
@@ -760,23 +769,41 @@ impl App {
         Ok(())
     }
 
-    /// `cmd-w`: drop the focused client-pane's active tab. Its
-    /// server-pane keeps running. When that was the pane's only tab the
-    /// daemon closes the whole leaf instead (see `state::client_close_tab`),
-    /// so this degrades to the old close-the-pane behavior on a
-    /// single-tab leaf rather than needing a separate chord. In that
-    /// leaf-closing case focus reassignment happens via
-    /// `reconcile_focus` once the resulting `LayoutDelta` lands, rather
-    /// than being computed here from a tree this function doesn't have
-    /// an up-to-date copy of yet.
+    /// `cmd-w`: drop the focused client-pane's active tab AND kill its
+    /// bound server-pane -- unlike `dimux client close`/`ClientCloseTab`
+    /// alone (which deliberately leaves the server-pane running for
+    /// scripted callers), this chord is meant to fully clean up what it
+    /// was looking at, the same way `cmd-shift-w` kills on demand. A
+    /// no-op kill if the tab was already unbound. When that was the
+    /// pane's only tab the daemon closes the whole leaf instead (see
+    /// `state::client_close_tab`), so this degrades to the old
+    /// close-the-pane behavior on a single-tab leaf rather than needing
+    /// a separate chord. In that leaf-closing case focus reassignment
+    /// happens via `reconcile_focus` once the resulting `LayoutDelta`
+    /// lands, rather than being computed here from a tree this function
+    /// doesn't have an up-to-date copy of yet.
     async fn close_tab(
         &mut self,
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
         let Some(pane) = self.focused else { return Ok(()) };
+        // Read the active tab's binding *before* closing it -- once
+        // `ClientCloseTab` lands, the tab (and, if it was the last one,
+        // the leaf itself) is already gone, so there's no later point
+        // at which this could still be read back (same reasoning as
+        // `AttachMenu.previously_bound`'s doc comment).
+        let bound =
+            self.workspace.tree.as_ref().and_then(|t| t.find(pane)).and_then(|p| p.active_bound());
         let req = Request::ClientCloseTab { workspace: self.workspace.id.to_string(), pane };
         let _ = self.request(write_half, reader, req).await?;
+        // `cmd-w` closes the tab AND kills its server-pane -- an unbound
+        // tab (or an already-unbound placeholder) has nothing to kill,
+        // so this only fires when there was a real binding.
+        if let Some(server_pane) = bound {
+            let req = Request::ServerKill { target: server_pane.to_string() };
+            let _ = self.request(write_half, reader, req).await?;
+        }
         Ok(())
     }
 
@@ -919,6 +946,9 @@ impl App {
             AttachMenuAction::Delete => self.arm_delete(),
             AttachMenuAction::StartRename => self.start_rename(),
             AttachMenuAction::TogglePin => self.toggle_directory_pin(write_half, reader).await?,
+            AttachMenuAction::ToggleShowAllWorkspaces => {
+                self.toggle_show_all_workspaces(write_half, reader).await?
+            }
             AttachMenuAction::Ignore => {}
         }
         Ok(())
@@ -1042,7 +1072,39 @@ impl App {
         if let Response::ServerPaneList(servers) =
             self.request(write_half, reader, Request::ServerList).await?
         {
-            let grouped = group_servers_by_cwd(servers, &self.pinned_dirs);
+            let grouped = group_servers_by_cwd(
+                filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
+                &self.pinned_dirs,
+            );
+            let collapsed = self.collapsed_groups.clone();
+            let Some(menu) = &mut self.attach_menu else { return Ok(()) };
+            menu.servers = grouped;
+            let len = visible_attach_menu_rows(&menu.servers, &collapsed).len();
+            if menu.selected >= len {
+                menu.selected = len - 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// `a` on any row: flip whether the attach menu shows every
+    /// workspace's server-panes or just this workspace's own (plus
+    /// orphaned) ones -- see `App.show_all_workspaces`'s doc comment.
+    /// Re-fetches and re-groups the server list so the toggle takes
+    /// effect immediately, same as `toggle_directory_pin`.
+    async fn toggle_show_all_workspaces(
+        &mut self,
+        write_half: &mut OwnedWriteHalf,
+        reader: &mut FrameReader,
+    ) -> anyhow::Result<()> {
+        self.show_all_workspaces = !self.show_all_workspaces;
+        if let Response::ServerPaneList(servers) =
+            self.request(write_half, reader, Request::ServerList).await?
+        {
+            let grouped = group_servers_by_cwd(
+                filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
+                &self.pinned_dirs,
+            );
             let collapsed = self.collapsed_groups.clone();
             let Some(menu) = &mut self.attach_menu else { return Ok(()) };
             menu.servers = grouped;
@@ -1082,7 +1144,10 @@ impl App {
         if let Response::ServerPaneList(servers) =
             self.request(write_half, reader, Request::ServerList).await?
         {
-            let grouped = group_servers_by_cwd(servers, &self.pinned_dirs);
+            let grouped = group_servers_by_cwd(
+                filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
+                &self.pinned_dirs,
+            );
             let collapsed = self.collapsed_groups.clone();
             let Some(menu) = &mut self.attach_menu else { return Ok(()) };
             menu.servers = grouped;
@@ -1132,7 +1197,10 @@ impl App {
                 if let Response::ServerPaneList(servers) =
                     self.request(write_half, reader, Request::ServerList).await?
                 {
-                    let grouped = group_servers_by_cwd(servers, &self.pinned_dirs);
+                    let grouped = group_servers_by_cwd(
+                filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
+                &self.pinned_dirs,
+            );
                     let Some(menu) = &mut self.attach_menu else { return Ok(()) };
                     menu.servers = grouped;
                     menu.rename = None;
@@ -1306,7 +1374,10 @@ impl App {
             if let Response::ServerPaneList(servers) =
                 self.request(write_half, reader, Request::ServerList).await?
             {
-                let grouped = group_servers_by_cwd(servers, &self.pinned_dirs);
+                let grouped = group_servers_by_cwd(
+                filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
+                &self.pinned_dirs,
+            );
                 let collapsed = self.collapsed_groups.clone();
                 if let Some(menu) = &mut self.attach_menu {
                     menu.servers = grouped;
@@ -1623,6 +1694,30 @@ fn visible_attach_menu_rows(
     rows
 }
 
+/// Filter `servers` down to what the attach menu should actually show:
+/// every pane owned by `current_workspace` plus every orphaned pane
+/// (`owner_workspace: None`, e.g. spawned via `dimux server spawn` from
+/// the CLI, which has no workspace context) -- unless `show_all` is set,
+/// in which case every pane passes through untouched. This is what makes
+/// "harder to access" real: another workspace's own panes are never
+/// listed by default, though nothing stops picking them once `a` reveals
+/// them, and it never affects the CLI (`dimux server ls` and friends
+/// always see everything, filtering is purely an attach-menu UX
+/// concern).
+fn filter_servers_for_menu(
+    servers: Vec<ServerPaneInfo>,
+    current_workspace: WorkspaceId,
+    show_all: bool,
+) -> Vec<ServerPaneInfo> {
+    if show_all {
+        return servers;
+    }
+    servers
+        .into_iter()
+        .filter(|s| s.owner_workspace.is_none_or(|owner| owner == current_workspace))
+        .collect()
+}
+
 /// Synthetic group key for a server-pane with no resolvable foreground
 /// `cwd` (a `Dead` pane, or a live one whose lookup failed) -- always
 /// sorted last, regardless of pin state: pinning is a directory-level
@@ -1690,6 +1785,10 @@ enum AttachMenuAction {
     /// `App::toggle_directory_pin`). A no-op on any other row -- there's
     /// no directory to pin from a server/spawn/spawn-new row.
     TogglePin,
+    /// `a` on any row: flip `App.show_all_workspaces` (see its doc
+    /// comment) and re-fetch/re-group the server list so the toggle
+    /// takes effect immediately.
+    ToggleShowAllWorkspaces,
     Ignore,
 }
 
@@ -1714,6 +1813,7 @@ fn parse_attach_menu_input(bytes: &[u8]) -> AttachMenuAction {
         b"x" => AttachMenuAction::Delete,
         b"r" => AttachMenuAction::StartRename,
         b"p" => AttachMenuAction::TogglePin,
+        b"a" => AttachMenuAction::ToggleShowAllWorkspaces,
         _ => AttachMenuAction::Ignore,
     }
 }
@@ -2239,6 +2339,11 @@ mod tests {
     }
 
     #[test]
+    fn parse_attach_menu_input_a_is_toggle_show_all_workspaces() {
+        assert_eq!(parse_attach_menu_input(b"a"), AttachMenuAction::ToggleShowAllWorkspaces);
+    }
+
+    #[test]
     fn quit_byte_is_ctrl_q_not_ctrl_c() {
         assert!(is_quit(&[0x11]));
         assert!(!is_quit(&[0x03]), "Ctrl-C must remain a pass-through byte, not the quit key");
@@ -2312,6 +2417,35 @@ mod tests {
         // `ServerPaneInfo` doesn't derive `PartialEq`, so compare lengths
         // rather than the whole `Vec` via `assert_eq!`.
         assert_eq!(group_servers_by_cwd(vec![], &[]).len(), 0);
+    }
+
+    fn server_owned_by(name: &str, owner: Option<WorkspaceId>) -> ServerPaneInfo {
+        let mut s = server_with_cwd(name, None);
+        s.owner_workspace = owner;
+        s
+    }
+
+    #[test]
+    fn filter_servers_for_menu_shows_own_workspace_and_orphans_but_not_others() {
+        let ws_a = Uuid::new_v4();
+        let ws_b = Uuid::new_v4();
+        let servers = vec![
+            server_owned_by("mine", Some(ws_a)),
+            server_owned_by("theirs", Some(ws_b)),
+            server_owned_by("orphan", None),
+        ];
+        let filtered = filter_servers_for_menu(servers, ws_a, false);
+        let names: Vec<&str> = filtered.iter().map(|s| s.name.as_deref().unwrap()).collect();
+        assert_eq!(names, vec!["mine", "orphan"], "another workspace's own pane must be filtered out by default");
+    }
+
+    #[test]
+    fn filter_servers_for_menu_show_all_bypasses_the_filter_entirely() {
+        let ws_a = Uuid::new_v4();
+        let ws_b = Uuid::new_v4();
+        let servers = vec![server_owned_by("mine", Some(ws_a)), server_owned_by("theirs", Some(ws_b))];
+        let filtered = filter_servers_for_menu(servers, ws_a, true);
+        assert_eq!(filtered.len(), 2, "show_all must let every pane through regardless of ownership");
     }
 
     #[test]
@@ -2976,6 +3110,98 @@ mod tests {
         });
     }
 
+    /// `cmd-w` (`close_tab`) must kill the active tab's bound server-pane,
+    /// not just close the tab -- unlike `ClientCloseTab` alone (which
+    /// deliberately leaves the server-pane running for scripted/CLI
+    /// callers), the TUI's own close chord is meant to fully clean up
+    /// what it was looking at.
+    #[tokio::test]
+    async fn close_tab_kills_the_bound_server_pane() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+
+        let Response::ServerPane(server) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None, workspace: None },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        let Response::ClientPaneCreated { pane, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientSpawn {
+                    workspace: "1".to_string(),
+                    split_of: None,
+                    dir: None,
+                    bind: Some(server.id.to_string()),
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneCreated");
+        };
+        app.focused = Some(pane);
+        if let Response::Snapshot { workspace, .. } =
+            app.request(&mut write_half, &mut reader, Request::Subscribe { workspace: "1".to_string() }).await.unwrap()
+        {
+            app.workspace = workspace;
+        }
+
+        app.close_tab(&mut write_half, &mut reader).await.unwrap();
+
+        let Response::ServerPaneList(servers) =
+            app.request(&mut write_half, &mut reader, Request::ServerList).await.unwrap()
+        else {
+            panic!("expected ServerPaneList");
+        };
+        assert!(
+            !servers.iter().any(|s| s.id == server.id),
+            "closing the tab should have killed its bound server-pane"
+        );
+    }
+
+    /// `cmd-w` on an already-unbound tab must not error or try to kill
+    /// anything -- there's nothing bound to kill.
+    #[tokio::test]
+    async fn close_tab_on_an_unbound_pane_is_a_plain_close() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+
+        let Response::ClientPaneCreated { pane, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientSpawn { workspace: "1".to_string(), split_of: None, dir: None, bind: None },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneCreated");
+        };
+        app.focused = Some(pane);
+        if let Response::Snapshot { workspace, .. } =
+            app.request(&mut write_half, &mut reader, Request::Subscribe { workspace: "1".to_string() }).await.unwrap()
+        {
+            app.workspace = workspace;
+        }
+
+        app.close_tab(&mut write_half, &mut reader).await.unwrap();
+
+        let Response::ClientPaneList { panes, .. } = app
+            .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneList");
+        };
+        assert!(!panes.iter().any(|p| p.id == pane), "the unbound leaf should still have been closed");
+    }
+
     /// `cmd-shift-z` on a multi-tab leaf must not drop a sibling tab.
     /// Regression test: `detach_and_open_menu` used to always send
     /// `ClientUnbind` before opening the picker, but `ClientUnbind` now
@@ -3079,6 +3305,81 @@ mod tests {
             leaf.tabs,
             vec![sp1.id, sp3_id],
             "sp1 (the untouched sibling tab) must survive; sp2 (the active tab) should have been replaced by sp3"
+        );
+    }
+
+    /// End-to-end: a server-pane spawned from a *different* workspace
+    /// must not appear in this workspace's `cmd-t` picker by default,
+    /// but must appear once `a` (`AttachMenuAction::ToggleShowAllWorkspaces`)
+    /// reveals it -- exercises the real `ServerSpawn { workspace: Some(..) }`
+    /// -> `owner_workspace` -> `filter_servers_for_menu` pipeline over the
+    /// wire, not just the pure filter function in isolation.
+    #[tokio::test]
+    async fn attach_menu_hides_another_workspaces_pane_until_show_all_is_toggled() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+
+        // A pane owned by workspace "2" -- `app` is attached to "1".
+        let Response::ClientPaneCreated { .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientSpawn { workspace: "2".to_string(), split_of: None, dir: None, bind: None },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneCreated");
+        };
+        let Response::ServerPane(theirs) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: None,
+                    workspace: Some("2".to_string()),
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+
+        // A client-pane in "1" (app's own workspace) to open the picker from.
+        let Response::ClientPaneCreated { pane, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientSpawn { workspace: "1".to_string(), split_of: None, dir: None, bind: None },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneCreated");
+        };
+        app.focused = Some(pane);
+
+        app.open_add_tab_menu(&mut write_half, &mut reader).await.unwrap();
+        let servers_shown = |app: &App| -> Vec<uuid::Uuid> {
+            app.attach_menu.as_ref().unwrap().servers.iter().map(|(_, s)| s.id).collect()
+        };
+        assert!(
+            !servers_shown(&app).contains(&theirs.id),
+            "workspace 2's own pane must not show in workspace 1's picker by default"
+        );
+
+        app.toggle_show_all_workspaces(&mut write_half, &mut reader).await.unwrap();
+        assert!(
+            servers_shown(&app).contains(&theirs.id),
+            "toggling show-all should reveal workspace 2's pane"
+        );
+
+        app.toggle_show_all_workspaces(&mut write_half, &mut reader).await.unwrap();
+        assert!(
+            !servers_shown(&app).contains(&theirs.id),
+            "toggling again should hide it again"
         );
     }
 
