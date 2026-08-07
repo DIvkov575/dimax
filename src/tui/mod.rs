@@ -1293,12 +1293,14 @@ impl App {
         }
     }
 
-    /// Route one parsed [`mouse::MouseEvent`] — divider drag-resizing, per
-    /// user direction: no keybind, drag only. `Down` hit-tests against the
-    /// current layout's divider grab zones (recomputed fresh every call
+    /// Route one parsed [`mouse::MouseEvent`] — divider drag-resizing
+    /// and click-to-focus. `Down` hit-tests against the current
+    /// layout's divider grab zones first (recomputed fresh every call
     /// via `render::divider_rects`, since the layout can change between
-    /// mouse events). `Drag` updates `dragging_split`'s live ratio purely
-    /// locally — no request sent — so the drag renders smoothly without
+    /// mouse events); if that misses, it hit-tests `render::leaf_rects`
+    /// instead and focuses whichever leaf the click landed in. `Drag`
+    /// updates `dragging_split`'s live ratio purely locally — no
+    /// request sent — so the drag renders smoothly without
     /// flooding the daemon (see the field doc on `dragging_split` for why
     /// this replaced the original "send on every move" design). `Up`
     /// commits the final position with exactly one `Request::ResizeSplit`
@@ -1315,12 +1317,19 @@ impl App {
             mouse::MouseEvent::Down { col, row } => {
                 let Some(tree) = &self.workspace.tree else { return Ok(()) };
                 let hits = render::divider_rects(tree, self.frame_area);
-                self.dragging_split = hit_test_dividers(&hits, col, row).map(|split| {
+                if let Some(split) = hit_test_dividers(&hits, col, row) {
                     let hit = hits.iter().find(|h| h.split == split).expect(
                         "hit_test_dividers only returns a split id that came from this exact `hits` list",
                     );
-                    (split, render::ratio_at(hit, col, row))
-                });
+                    self.dragging_split = Some((split, render::ratio_at(hit, col, row)));
+                } else if let Some((pane, _)) = render::leaf_rects(tree, self.frame_area)
+                    .into_iter()
+                    .find(|(_, rect)| {
+                        col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+                    })
+                {
+                    self.focused = Some(pane);
+                }
             }
             mouse::MouseEvent::ScrollUp { col, row } => {
                 self.scroll_pane_under(col, row, SCROLL_ROWS_PER_TICK, write_half, reader).await?;
@@ -3498,6 +3507,56 @@ mod tests {
         app.attach_menu.as_mut().unwrap().selected = 0; // the group header
         app.refresh_attach_menu_preview(&mut write_half, &mut reader).await.unwrap();
         assert!(app.attach_menu_preview.is_none(), "selecting the header should clear the cached preview");
+    }
+
+    /// Install a deterministic two-leaf, side-by-side tree into `app`,
+    /// returning `(left, right)`. The daemon pushes its own tree via an
+    /// async `LayoutDelta` broadcast that `app` only applies while inside
+    /// a `request` call, so a `ClientSpawn`'s response landing does NOT
+    /// mean the spawned leaf is in `app.workspace.tree` yet -- assigning
+    /// the tree directly is what makes these mouse tests' geometry
+    /// deterministic. `SplitTree` is the same type the daemon sends, and
+    /// `render::leaf_rects`/`divider_rects` are pure functions of it, so
+    /// the layout under test is identical either way.
+    fn app_with_two_side_by_side_leaves(app: &mut App) -> (ClientPaneId, ClientPaneId) {
+        let left = Uuid::new_v4();
+        let right = Uuid::new_v4();
+        app.workspace.tree = Some(split(SplitDir::Vertical, leaf(left), leaf(right)));
+        app.focused = Some(left);
+        app.frame_area = rect(0, 0, 80, 24);
+        (left, right)
+    }
+
+    #[tokio::test]
+    async fn click_inside_a_pane_focuses_it() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+        let (_left, right) = app_with_two_side_by_side_leaves(&mut app);
+
+        // `right` occupies the rightmost half, so a click near the right
+        // edge lands inside it regardless of the exact divider position.
+        app.handle_mouse(mouse::MouseEvent::Down { col: 75, row: 5 }, &mut write_half, &mut reader)
+            .await
+            .unwrap();
+
+        assert_eq!(app.focused, Some(right), "clicking inside the right pane should focus it");
+    }
+
+    #[tokio::test]
+    async fn click_on_a_divider_does_not_change_focus() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+        let (left, _right) = app_with_two_side_by_side_leaves(&mut app);
+
+        // Read the divider's real column out of the same layout math
+        // `handle_mouse` hit-tests against, rather than hardcoding it --
+        // a 50/50 split of an 80-wide area lands it at 39, not 40.
+        let divider = render::divider_rects(app.workspace.tree.as_ref().unwrap(), app.frame_area);
+        let [hit] = divider.as_slice() else { panic!("expected exactly one divider, got {divider:?}") };
+        let col = hit.grab_zone.x;
+
+        app.handle_mouse(mouse::MouseEvent::Down { col, row: 5 }, &mut write_half, &mut reader).await.unwrap();
+
+        assert_eq!(app.focused, Some(left), "clicking the divider should start a drag, not change focus");
+        assert!(app.dragging_split.is_some(), "the click should have been recognized as a divider grab");
     }
 
     /// Serializes every test in this module that spawns a real daemon
