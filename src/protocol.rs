@@ -314,6 +314,16 @@ pub enum Request {
     /// alongside `ServerList` (see `Response::PinnedDirsList`) whenever
     /// a client needs to reproduce the attach menu's grouping.
     PinnedDirsList,
+    /// Atomically check-and-consume the "spawn a default shell instead
+    /// of showing the picker" fallback for a fresh empty-workspace
+    /// attach. `Response::ShellFallback { available: true }` the very
+    /// first time this is ever sent to a given daemon instance; `false`
+    /// every time after, for the lifetime of that daemon process (never
+    /// persisted -- a restarted daemon grants the fallback again). See
+    /// `tui::App::bootstrap`'s call site for why this exists: a
+    /// brand-new install should get one pane with zero clicks, but
+    /// every attach after that shows the real picker.
+    ConsumeShellFallback,
 
     /// Create a client-pane in `workspace` (created if it doesn't exist).
     /// `split_of` names an existing leaf to split; if `None`, the
@@ -460,6 +470,8 @@ pub enum Response {
     /// that changed it, with no separate re-fetch needed): the current
     /// pin order, earliest-pinned first.
     PinnedDirsList(Vec<String>),
+    /// Reply to `ConsumeShellFallback`.
+    ShellFallback { available: bool },
     ClientPaneCreated { workspace: WorkspaceId, pane: ClientPaneId },
     ClientPaneList { workspace: WorkspaceId, panes: Vec<ClientPane> },
     /// Full state handed back on `Subscribe`: current layout plus a grid

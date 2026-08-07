@@ -1,9 +1,9 @@
 use clap::Parser;
-use dimux::cli::{self, Cli};
+use dimux::cli::{self, Args, Cli};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let cli = Args::parse().command.unwrap_or(Cli::Attach);
     match cli {
         Cli::Attach => dimux::tui::run().await,
         Cli::Daemon => {
@@ -12,6 +12,7 @@ async fn main() -> anyhow::Result<()> {
             std::future::pending::<()>().await;
             Ok(())
         }
+        Cli::Config => cli::run_config().await,
         other => cli::run(other).await,
     }
 }

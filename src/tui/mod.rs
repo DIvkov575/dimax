@@ -124,7 +124,7 @@
 //!   not live throughout the drag.
 
 pub mod keys;
-mod kitty_setup;
+pub(crate) mod kitty_setup;
 pub mod mouse;
 pub mod render;
 
@@ -412,7 +412,8 @@ impl App {
             match reader.next().await? {
                 ServerMessage::Response(Response::Snapshot { workspace, grids }) => {
                     let focused = first_leaf(&workspace);
-                    return Ok(App {
+                    let is_empty = workspace.tree.is_none();
+                    let mut app = App {
                         workspace,
                         grids: grids.into_iter().map(|g| (g.server_pane, g)).collect(),
                         pane_sizes: HashMap::new(),
@@ -423,7 +424,11 @@ impl App {
                         collapsed_groups: HashSet::new(),
                         attach_menu_preview: None,
                         pinned_dirs: Vec::new(),
-                    });
+                    };
+                    if is_empty {
+                        app.bootstrap_empty_workspace(write_half, reader).await?;
+                    }
+                    return Ok(app);
                 }
                 ServerMessage::Response(other) => {
                     anyhow::bail!("unexpected response to initial Subscribe: {other:?}")
@@ -434,6 +439,61 @@ impl App {
                 ServerMessage::Event(_) => continue,
             }
         }
+    }
+
+    /// Called from [`Self::bootstrap`] exactly when the just-fetched
+    /// workspace has no tree at all -- decides, via
+    /// `Request::ConsumeShellFallback`, whether this is the very first
+    /// such attach against this daemon (spawn a default shell directly,
+    /// matching `cmd-d`'s own spawn args) or a later one (open the
+    /// picker with no leaf yet to bind into, per
+    /// `confirm_attach_menu`'s new no-`focused` branch).
+    async fn bootstrap_empty_workspace(
+        &mut self,
+        write_half: &mut OwnedWriteHalf,
+        reader: &mut FrameReader,
+    ) -> anyhow::Result<()> {
+        let available = match self.request(write_half, reader, Request::ConsumeShellFallback).await? {
+            Response::ShellFallback { available } => available,
+            _ => false,
+        };
+        if available {
+            let Response::ServerPane(server) = self
+                .request(write_half, reader, Request::ServerSpawn { name: None, cmd: None, cwd: None })
+                .await?
+            else {
+                return Ok(());
+            };
+            let req = Request::ClientSpawn {
+                workspace: self.workspace.id.to_string(),
+                split_of: None,
+                dir: None,
+                bind: Some(server.id.to_string()),
+            };
+            if let Response::ClientPaneCreated { pane, .. } = self.request(write_half, reader, req).await? {
+                self.focused = Some(pane);
+            }
+            return Ok(());
+        }
+        if let Response::PinnedDirsList(pinned) =
+            self.request(write_half, reader, Request::PinnedDirsList).await?
+        {
+            self.pinned_dirs = pinned;
+        }
+        if let Response::ServerPaneList(servers) =
+            self.request(write_half, reader, Request::ServerList).await?
+        {
+            self.attach_menu = Some(AttachMenu {
+                servers: group_servers_by_cwd(servers, &self.pinned_dirs),
+                selected: 0,
+                pending_delete: None,
+                rename: None,
+                previously_bound: None,
+                spawn_in_group: None,
+                adding_tab: false,
+            });
+        }
+        Ok(())
     }
 
     /// Send one request, tolerating any number of pushed `Event`s
@@ -1078,7 +1138,6 @@ impl App {
         let Some(row) = self.selected_attach_menu_row() else { return Ok(()) };
         let Some(menu) = self.attach_menu.take() else { return Ok(()) };
         let adding_tab = menu.adding_tab;
-        let Some(pane) = self.focused else { return Ok(()) };
         let target = match row {
             AttachMenuRow::Server(server_index) => menu.servers[server_index].1.id.to_string(),
             AttachMenuRow::SpawnNew => match self
@@ -1104,12 +1163,31 @@ impl App {
             }
             AttachMenuRow::GroupHeader(_) => return Ok(()),
         };
-        let req = if adding_tab {
-            Request::ClientAddTab { workspace: self.workspace.id.to_string(), pane, target }
-        } else {
-            Request::ClientBind { workspace: self.workspace.id.to_string(), pane, target }
-        };
-        let _ = self.request(write_half, reader, req).await?;
+        match self.focused {
+            Some(pane) if adding_tab => {
+                let req = Request::ClientAddTab { workspace: self.workspace.id.to_string(), pane, target };
+                let _ = self.request(write_half, reader, req).await?;
+            }
+            Some(pane) => {
+                let req = Request::ClientBind { workspace: self.workspace.id.to_string(), pane, target };
+                let _ = self.request(write_half, reader, req).await?;
+            }
+            None => {
+                // No leaf exists yet -- this is the startup picker on an
+                // empty workspace (see `bootstrap_empty_workspace`).
+                // `adding_tab` is always `false` here (there's no leaf
+                // to append a tab to), so no branch on it is needed.
+                let req = Request::ClientSpawn {
+                    workspace: self.workspace.id.to_string(),
+                    split_of: None,
+                    dir: None,
+                    bind: Some(target),
+                };
+                if let Response::ClientPaneCreated { pane, .. } = self.request(write_half, reader, req).await? {
+                    self.focused = Some(pane);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2662,6 +2740,23 @@ mod tests {
     /// daemon at workspace `"1"`, for the attach-menu-against-a-live-
     /// daemon tests below. Returns the `App` plus the split connection
     /// halves every `App` method needs.
+    ///
+    /// `bootstrap` now spawns a free default shell into a truly empty
+    /// workspace (the shell fallback -- see `bootstrap_empty_workspace`),
+    /// which every test in this module that predates that feature
+    /// assumes does NOT exist. Two distinct assumptions break otherwise,
+    /// so this undoes *both* halves of the fallback: the client-pane
+    /// (callers send their own `ClientSpawn { workspace: "1", split_of:
+    /// None, .. }`, which errors against a workspace that already has a
+    /// pane) *and* the server-pane it spawned, which `ClientClose` leaves
+    /// alive in the pool where it would show up as an extra
+    /// `ServerList` row -- with the daemon's own cwd as its group key,
+    /// which is enough to change attach-menu group ordering.
+    ///
+    /// `tree`/`focused` are then reset explicitly: the `LayoutDelta`s for
+    /// the spawn and close are pushed asynchronously, so which of them
+    /// this connection has read by now is scheduler-dependent, and only
+    /// an explicit reset makes the returned state deterministic.
     async fn app_against_real_daemon() -> (App, OwnedWriteHalf, FrameReader) {
         // Short filename -- `dimux-test-<full-uuid>.sock` under a long
         // macOS temp dir can exceed `SUN_LEN`; this stays well under it.
@@ -2672,8 +2767,135 @@ mod tests {
         let stream = tokio::net::UnixStream::connect(&socket_path).await.expect("connect to test daemon");
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = FrameReader::spawn(read_half);
-        let app = App::bootstrap(&mut write_half, &mut reader, "1").await.expect("bootstrap workspace 1");
+        let mut app = App::bootstrap(&mut write_half, &mut reader, "1").await.expect("bootstrap workspace 1");
+        if let Some(pane) = app.focused {
+            let req = Request::ClientClose { workspace: app.workspace.id.to_string(), pane };
+            let _ = app.request(&mut write_half, &mut reader, req).await.expect("close the shell-fallback leaf");
+        }
+        let Response::ServerPaneList(servers) =
+            app.request(&mut write_half, &mut reader, Request::ServerList).await.expect("list server-panes")
+        else {
+            panic!("expected ServerPaneList");
+        };
+        for server in servers {
+            let req = Request::ServerKill { target: server.id.to_string() };
+            let _ = app
+                .request(&mut write_half, &mut reader, req)
+                .await
+                .expect("kill the shell-fallback server-pane");
+        }
+        app.workspace.tree = None;
+        app.focused = None;
         (app, write_half, reader)
+    }
+
+    /// Deliberately does NOT use `app_against_real_daemon` -- that helper
+    /// exists to *undo* the shell fallback (see its doc comment), which
+    /// is the very thing under test here.
+    #[tokio::test]
+    async fn bootstrap_on_a_fresh_daemon_with_an_empty_workspace_spawns_a_default_shell() {
+        // Short filename -- see `app_against_real_daemon` for why.
+        let socket_path = std::env::temp_dir().join(format!("dmx-boot1-{}.sock", std::process::id()));
+        crate::daemon::run(socket_path.clone()).await.expect("daemon should bind and start");
+        let stream = tokio::net::UnixStream::connect(&socket_path).await.expect("connect");
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = FrameReader::spawn(read_half);
+        let mut app = App::bootstrap(&mut write_half, &mut reader, "1").await.expect("bootstrap workspace 1");
+
+        assert!(app.attach_menu.is_none(), "the very first attach should not open the picker");
+        assert!(app.focused.is_some(), "a default shell should already be spawned and focused");
+
+        // Assert the *daemon's* view rather than `app.workspace.tree`:
+        // the spawn's `LayoutDelta` is pushed asynchronously, so whether
+        // this connection has read it yet is scheduler-dependent, while
+        // a fresh `ClientList` is authoritative either way.
+        let Response::ClientPaneList { panes, .. } = app
+            .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneList");
+        };
+        assert_eq!(panes.len(), 1, "exactly one default-shell leaf should exist");
+        assert_eq!(Some(panes[0].id), app.focused, "that leaf should be the focused one");
+        assert!(panes[0].active_bound().is_some(), "the default shell should be bound to a server-pane");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_on_a_second_empty_workspace_attach_opens_the_picker_instead() {
+        // Short filename -- mirrors `app_against_real_daemon`'s own naming
+        // scheme (see its doc comment for why this stays short).
+        let socket_path = std::env::temp_dir().join(format!("dmx-boot2-{}.sock", std::process::id()));
+        crate::daemon::run(socket_path.clone()).await.expect("daemon should bind and start");
+
+        // First attach: consumes the fallback, spawns a shell in workspace "1".
+        let stream = tokio::net::UnixStream::connect(&socket_path).await.expect("connect");
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = FrameReader::spawn(read_half);
+        let _first = App::bootstrap(&mut write_half, &mut reader, "1").await.expect("bootstrap workspace 1");
+
+        // Second attach, to a *different* (still-empty) workspace: the
+        // fallback has already been consumed, so this should get the
+        // picker instead, not another free shell.
+        let stream2 = tokio::net::UnixStream::connect(&socket_path).await.expect("connect");
+        let (read_half2, mut write_half2) = stream2.into_split();
+        let mut reader2 = FrameReader::spawn(read_half2);
+        let second = App::bootstrap(&mut write_half2, &mut reader2, "2").await.expect("bootstrap workspace 2");
+
+        assert!(second.attach_menu.is_some(), "the second empty-workspace attach should open the picker");
+        assert_eq!(second.focused, None, "no leaf exists yet, so nothing should be focused");
+        assert!(second.workspace.tree.is_none(), "the picker path must not itself create a leaf");
+    }
+
+    #[tokio::test]
+    async fn confirm_attach_menu_with_no_focused_pane_spawns_the_first_leaf() {
+        // `app_against_real_daemon` already consumed and undid the shell
+        // fallback, leaving exactly the empty, unfocused workspace this
+        // test needs -- no second daemon required.
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+        assert_eq!(app.focused, None, "helper should hand back a leaf-less workspace");
+        let Response::ServerPane(existing) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        let existing_id = existing.id;
+        app.attach_menu = Some(AttachMenu {
+            servers: vec![("Unknown".to_string(), existing)],
+            // Rows: 0 = "Unknown" header, 1 = the server row. Row 0 would
+            // be intercepted as a group-header toggle, never reaching the
+            // no-`focused` branch this test is about.
+            selected: 1,
+            pending_delete: None,
+            rename: None,
+            previously_bound: None,
+            spawn_in_group: None,
+            adding_tab: false,
+        });
+        assert_eq!(
+            app.selected_attach_menu_row(),
+            Some(AttachMenuRow::Server(0)),
+            "row 1 should be the existing server-pane's own row"
+        );
+
+        app.confirm_attach_menu(&mut write_half, &mut reader).await.unwrap();
+
+        assert!(app.focused.is_some(), "confirming on a leaf-less workspace should focus the newly created leaf");
+        let Response::ClientPaneList { panes, .. } = app
+            .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneList");
+        };
+        let pane = panes.iter().find(|p| Some(p.id) == app.focused).expect("focused pane should exist");
+        assert_eq!(pane.active_bound(), Some(existing_id));
     }
 
     /// Open the attach menu directly (bypassing `detach_and_open_menu`,

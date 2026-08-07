@@ -80,6 +80,13 @@ pub struct State {
     /// Loaded once in `State::new`; every mutation
     /// (`toggle_pinned_dir`) re-saves immediately.
     pinned_dirs: Vec<String>,
+    /// Whether the very first empty-workspace attach against this
+    /// daemon instance has already consumed its "just spawn a default
+    /// shell, skip the picker" fallback -- see
+    /// `consume_shell_fallback`'s doc comment. Ephemeral like every
+    /// other piece of `State` except `pinned_dirs`: a fresh daemon
+    /// always starts with this `false`.
+    used_shell_fallback: bool,
 }
 
 struct Workspace {
@@ -106,6 +113,7 @@ impl State {
             pane_events,
             pane_events_rx: Some(pane_events_rx),
             pinned_dirs: super::pinned_dirs::load(),
+            used_shell_fallback: false,
         }
     }
 
@@ -290,6 +298,16 @@ impl State {
             self.pinned_dirs.push(dir);
         }
         super::pinned_dirs::save(&self.pinned_dirs);
+    }
+
+    /// Atomically check-and-set the shell fallback. Returns `true` the
+    /// first time this is ever called on this `State` (the caller
+    /// should spawn a default shell), `false` every time after (the
+    /// caller should show the picker instead).
+    pub fn consume_shell_fallback(&mut self) -> bool {
+        let available = !self.used_shell_fallback;
+        self.used_shell_fallback = true;
+        available
     }
 
     fn find_server_pane_by_name(&self, name: &str) -> Option<ServerPaneId> {
@@ -1154,6 +1172,16 @@ mod tests {
             assert_eq!(reloaded.pinned_dirs(), &["/home/dev/api".to_string()]);
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- shell fallback --------------------------------------------------
+
+    #[test]
+    fn consume_shell_fallback_returns_true_once_then_false() {
+        let mut state = State::new();
+        assert!(state.consume_shell_fallback(), "first call should grant the fallback");
+        assert!(!state.consume_shell_fallback(), "second call should not");
+        assert!(!state.consume_shell_fallback(), "third call should not");
     }
 
     // -- workspace resolution ------------------------------------------
