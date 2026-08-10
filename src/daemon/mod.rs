@@ -275,9 +275,16 @@ async fn dispatch(
 ) -> Response {
     let _ = subscriber_id;
     match request {
-        Request::ServerSpawn { name, cmd, cwd } => {
+        Request::ServerSpawn { name, cmd, cwd, workspace } => {
             let mut state = state.lock().await;
-            ok_or_err(state.server_spawn(name, cmd, cwd), Response::ServerPane)
+            let owner = match workspace {
+                Some(target) => match state.resolve_workspace(&target) {
+                    Ok(id) => Some(id),
+                    Err(err) => return Response::Error { message: err.to_string() },
+                },
+                None => None,
+            };
+            ok_or_err(state.server_spawn(name, cmd, cwd, owner), Response::ServerPane)
         }
 
         Request::ServerKill { target } => {
@@ -926,6 +933,7 @@ mod tests {
                 name: None,
                 cmd: Some("printf hello".to_string()),
                 cwd: None,
+            workspace: None,
             })
             .await
         {
@@ -1064,6 +1072,7 @@ mod tests {
                 name: None,
                 cmd: Some("cat".to_string()),
                 cwd: None,
+            workspace: None,
             })
             .await
         {
@@ -1142,7 +1151,7 @@ mod tests {
         let mut conn = TestConn::connect(&guard.0).await;
 
         let server_pane = match conn
-            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None })
+            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None , workspace: None})
             .await
         {
             Response::ServerPane(info) => info.id,
@@ -1200,7 +1209,7 @@ mod tests {
         let mut conn = TestConn::connect(&guard.0).await;
 
         let server_pane = match conn
-            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None })
+            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None , workspace: None})
             .await
         {
             Response::ServerPane(info) => info.id,
@@ -1251,6 +1260,7 @@ mod tests {
                 name: None,
                 cmd: Some("pwd".to_string()),
                 cwd: Some("/tmp".to_string()),
+            workspace: None,
             })
             .await
         {
@@ -1308,7 +1318,7 @@ mod tests {
         let mut conn = TestConn::connect(&guard.0).await;
 
         let server_pane = match conn
-            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None })
+            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None , workspace: None})
             .await
         {
             Response::ServerPane(info) => info.id,
@@ -1372,7 +1382,8 @@ mod tests {
                     name: None,
                     cmd: Some("cat".to_string()),
                     cwd: None,
-                })
+                workspace: None,
+            })
                 .await
             {
                 Response::ServerPane(info) => info.id,
@@ -1518,7 +1529,8 @@ mod tests {
                     name: None,
                     cmd: Some(format!("printf {text}")),
                     cwd: None,
-                })
+                workspace: None,
+            })
                 .await
             {
                 Response::ServerPane(info) => info.id,
@@ -1750,7 +1762,7 @@ mod tests {
         }
 
         let server_pane = match conn
-            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None })
+            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None , workspace: None})
             .await
         {
             Response::ServerPane(info) => info.id,
@@ -1792,7 +1804,7 @@ mod tests {
 
         let mut owner = TestConn::connect(&guard.0).await;
         let server_pane = match owner
-            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None })
+            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None , workspace: None})
             .await
         {
             Response::ServerPane(info) => info.id,
@@ -1900,7 +1912,7 @@ mod tests {
         // already-cheap "nobody's watching" early-out.
         let mut busy_conn = TestConn::connect(&guard.0).await;
         let busy_server = match busy_conn
-            .request(Request::ServerSpawn { name: None, cmd: Some("yes".to_string()), cwd: None })
+            .request(Request::ServerSpawn { name: None, cmd: Some("yes".to_string()), cwd: None , workspace: None})
             .await
         {
             Response::ServerPane(info) => info.id,
@@ -1937,7 +1949,7 @@ mod tests {
         let start = std::time::Instant::now();
         for i in 0..10 {
             match other_conn
-                .request(Request::ServerSpawn { name: Some(format!("unrelated-{i}")), cmd: None, cwd: None })
+                .request(Request::ServerSpawn { name: Some(format!("unrelated-{i}")), cmd: None, cwd: None , workspace: None})
                 .await
             {
                 Response::ServerPane(_) => {}
