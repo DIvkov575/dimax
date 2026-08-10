@@ -237,6 +237,17 @@ pub struct ServerPaneInfo {
     /// every workspace's attach menu regardless of the
     /// same-workspace-only filter (see `tui::filter_servers_for_menu`).
     pub owner_workspace: Option<WorkspaceId>,
+    /// A short, human-friendly display label assigned once at spawn time
+    /// from a per-daemon sequential counter (see `daemon::state::encode_short_id`):
+    /// `"aa"`, `"ab"`, ..., `"az"`, `"ba"`, ..., `"zz"`, `"Aa"`, ...,
+    /// `"AA"`, ..., `"ZZ"`, `"aaa"`, ... -- replaces the truncated-UUID
+    /// fallback previously shown wherever a pane has no user-assigned
+    /// `name`. Display-only: this is never accepted as an address by
+    /// `resolve_server_pane` or anywhere else, only the full id or a
+    /// real `name` are. Ephemeral like everything except `pinned_dirs`
+    /// -- resets to `"aa"` on every daemon restart, so it is not stable
+    /// across restarts the way a real name is.
+    pub short_id: String,
 }
 
 /// See [`ServerPaneInfo::foreground`].

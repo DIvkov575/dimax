@@ -712,12 +712,14 @@ impl App {
         if let Response::ServerPaneList(servers) =
             self.request(write_half, reader, Request::ServerList).await?
         {
-            self.attach_menu = Some(AttachMenu {
-                servers: group_servers_by_cwd(
+            let grouped = group_servers_by_cwd(
                 filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
                 &self.pinned_dirs,
-            ),
-                selected: 0,
+            );
+            let selected = initial_selection_for(&grouped, &self.collapsed_groups, previously_bound);
+            self.attach_menu = Some(AttachMenu {
+                servers: grouped,
+                selected,
                 pending_delete: None,
                 rename: None,
                 previously_bound,
@@ -1772,6 +1774,41 @@ fn visible_attach_menu_rows(
     rows
 }
 
+/// Pick where the attach menu's cursor should start when it opens right
+/// after detaching from `previously_bound` -- makes reattaching the same
+/// pane a single Enter press instead of having to hunt for it. Finds the
+/// row in `visible_attach_menu_rows(servers, collapsed)` for the
+/// `Server` entry whose id matches `previously_bound`, if any; if that
+/// pane's group happens to be collapsed (so its `Server` row isn't
+/// currently visible at all), lands on the group's header instead --
+/// one Enter to expand gets there, still closer than starting at row 0.
+/// Falls back to `0` (the plan `selected: 0` default) when there's
+/// nothing to preselect: `previously_bound` is `None` (the leaf was
+/// already unbound) or the pane no longer exists in the fresh
+/// `servers` list (e.g. killed by another connection in the gap between
+/// detaching and this menu's `ServerList` fetch).
+fn initial_selection_for(
+    servers: &[(String, ServerPaneInfo)],
+    collapsed: &HashSet<String>,
+    previously_bound: Option<ServerPaneId>,
+) -> usize {
+    let Some(previously_bound) = previously_bound else { return 0 };
+    let Some(server_index) = servers.iter().position(|(_, s)| s.id == previously_bound) else {
+        return 0;
+    };
+    let rows = visible_attach_menu_rows(servers, collapsed);
+    if let Some(row_index) = rows.iter().position(|row| *row == AttachMenuRow::Server(server_index)) {
+        return row_index;
+    }
+    // The group is collapsed -- its Server row is hidden, but its header
+    // (which carries the same first-member index the group started at,
+    // not necessarily `server_index` itself) is still selectable.
+    let group_key = &servers[server_index].0;
+    rows.iter()
+        .position(|row| matches!(row, AttachMenuRow::GroupHeader(i) if &servers[*i].0 == group_key))
+        .unwrap_or(0)
+}
+
 /// Filter `servers` down to what the attach menu should actually show:
 /// every pane owned by `current_workspace` plus every orphaned pane
 /// (`owner_workspace: None`, e.g. spawned via `dimux server spawn` from
@@ -2493,6 +2530,7 @@ mod tests {
                 cwd: Some(c.to_string()),
             }),
             owner_workspace: None,
+            short_id: "aa".to_string(),
         }
     }
 
@@ -2676,6 +2714,39 @@ mod tests {
             rows,
             vec![AttachMenuRow::GroupHeader(0), AttachMenuRow::Server(0), AttachMenuRow::SpawnNew]
         );
+    }
+
+    #[test]
+    fn initial_selection_for_lands_on_the_previously_bound_servers_row() {
+        let a = server_with_cwd("a", Some("/x"));
+        let b = server_with_cwd("b", Some("/x"));
+        let b_id = b.id;
+        let servers = vec![("/x".to_string(), a), ("/x".to_string(), b)];
+        // Rows: 0 = header, 1 = a's Server row, 2 = b's Server row, 3 = spawn-in-group.
+        assert_eq!(initial_selection_for(&servers, &HashSet::new(), Some(b_id)), 2);
+    }
+
+    #[test]
+    fn initial_selection_for_falls_back_to_zero_when_nothing_was_previously_bound() {
+        let servers = vec![("/x".to_string(), server_with_cwd("a", Some("/x")))];
+        assert_eq!(initial_selection_for(&servers, &HashSet::new(), None), 0);
+    }
+
+    #[test]
+    fn initial_selection_for_falls_back_to_zero_when_the_pane_no_longer_exists() {
+        let servers = vec![("/x".to_string(), server_with_cwd("a", Some("/x")))];
+        assert_eq!(initial_selection_for(&servers, &HashSet::new(), Some(Uuid::new_v4())), 0);
+    }
+
+    #[test]
+    fn initial_selection_for_lands_on_the_group_header_when_that_group_is_collapsed() {
+        let a = server_with_cwd("a", Some("/x"));
+        let a_id = a.id;
+        let servers = vec![("/x".to_string(), a)];
+        let mut collapsed = HashSet::new();
+        collapsed.insert("/x".to_string());
+        // Rows when collapsed: 0 = header only (Server(0) is hidden).
+        assert_eq!(initial_selection_for(&servers, &collapsed, Some(a_id)), 0);
     }
 
     #[test]
@@ -3314,6 +3385,78 @@ mod tests {
             panic!("expected ClientPaneList");
         };
         assert!(!panes.iter().any(|p| p.id == pane), "the unbound leaf should still have been closed");
+    }
+
+    /// `cmd-shift-z` end to end: the picker it opens must already have
+    /// the just-detached pane's own row selected, so reattaching to the
+    /// same pane is a single Enter press rather than having to hunt for
+    /// it -- this exercises the real `ServerSpawn`/`ClientSpawn`/
+    /// `ServerList` round trip feeding `initial_selection_for`, not just
+    /// the pure function in isolation.
+    #[tokio::test]
+    async fn detach_and_open_menu_preselects_the_just_detached_pane() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+
+        let Response::ServerPane(existing) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None, workspace: None },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        let existing_id = existing.id;
+        let Response::ClientPaneCreated { pane, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientSpawn {
+                    workspace: "1".to_string(),
+                    split_of: None,
+                    dir: None,
+                    bind: Some(existing_id.to_string()),
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneCreated");
+        };
+        app.focused = Some(pane);
+        if let Response::Snapshot { workspace, .. } =
+            app.request(&mut write_half, &mut reader, Request::Subscribe { workspace: "1".to_string() }).await.unwrap()
+        {
+            app.workspace = workspace;
+        }
+
+        app.detach_and_open_menu(&mut write_half, &mut reader).await.unwrap();
+
+        let menu = app.attach_menu.as_ref().unwrap();
+        match app.selected_attach_menu_row() {
+            Some(AttachMenuRow::Server(server_index)) => {
+                assert_eq!(
+                    menu.servers[server_index].1.id, existing_id,
+                    "the picker should open with the just-detached pane's own row already selected"
+                );
+            }
+            other => panic!("expected the picker to open on a Server row, got {other:?}"),
+        }
+
+        // Confirming immediately (no navigation) should reattach to the
+        // exact same pane -- the whole point of preselecting it.
+        app.confirm_attach_menu(&mut write_half, &mut reader).await.unwrap();
+        let Response::ClientPaneList { panes, .. } = app
+            .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneList");
+        };
+        let leaf = panes.iter().find(|p| p.id == pane).expect("pane should still exist");
+        assert_eq!(leaf.active_bound(), Some(existing_id));
     }
 
     /// `cmd-shift-z` on a multi-tab leaf must not drop a sibling tab.

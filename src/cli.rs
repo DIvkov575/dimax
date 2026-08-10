@@ -459,6 +459,7 @@ mod tests {
                 cwd: Some("/home/dev".to_string()),
             }),
             owner_workspace: None,
+            short_id: "aa".to_string(),
         };
         let line = format_server_pane_line(&info);
         assert_eq!(
@@ -476,6 +477,7 @@ mod tests {
             status: ServerPaneStatus::Dead,
             foreground: None,
             owner_workspace: None,
+            short_id: "aa".to_string(),
         };
         let line = format_server_pane_line(&info);
         assert_eq!(line, format!("{}\t-\tdead\t10x20\t-\t-", Uuid::nil()));
