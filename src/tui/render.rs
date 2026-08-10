@@ -559,10 +559,11 @@ fn spawn_new_in_group_line(group: &str, selected: bool, spawning: Option<&super:
 /// Column widths for the attach menu's server-pane rows: `name | process
 /// | id | status` (a `cwd` column existed here before rows were grouped
 /// under per-cwd header lines — see `draw_attach_menu` — at which point
-/// showing it a second time per row became redundant). `id` is fixed at
-/// 8 (the same `short_id` prefix used elsewhere) since a full UUID would
-/// dominate the row for no benefit — the attach menu is for picking a
-/// pane by eye, not by exact id.
+/// showing it a second time per row became redundant). `id` here is
+/// `ServerPaneInfo::short_id` (`"aa"`, `"ab"`, ...), a sequential
+/// two-plus-character label assigned once at spawn time — not the full
+/// UUID, which would dominate the row for no benefit; the attach menu
+/// is for picking a pane by eye, not by exact id.
 const NAME_COL_WIDTH: usize = 12;
 const PROCESS_COL_WIDTH: usize = 10;
 
@@ -591,19 +592,19 @@ fn attach_menu_line(
             "  {just_detached_marker}{marker} [{}] {:<process_w$} {} {}",
             rename.text,
             truncate_end(process, PROCESS_COL_WIDTH),
-            short_id(server.id),
+            server.short_id,
             status,
             process_w = PROCESS_COL_WIDTH,
         );
         return Line::styled(text, Style::new().add_modifier(Modifier::REVERSED));
     }
 
-    let name = server.name.clone().unwrap_or_else(|| short_id(server.id));
+    let name = server.name.clone().unwrap_or_else(|| server.short_id.clone());
     let text = format!(
         "  {just_detached_marker}{marker} {:<name_w$} {:<process_w$} {} {}{}",
         truncate_end(&name, NAME_COL_WIDTH),
         truncate_end(process, PROCESS_COL_WIDTH),
-        short_id(server.id),
+        server.short_id,
         status,
         if delete_armed { "  [x/Enter: confirm delete]" } else { "" },
         name_w = NAME_COL_WIDTH,
@@ -1113,6 +1114,7 @@ mod tests {
                 cwd: Some("/home/dev/project".to_string()),
             }),
         owner_workspace: None,
+            short_id: "aa".to_string(),
             };
         let servers = vec![("/home/dev/project".to_string(), server)];
         let menu = super::super::AttachMenu {
@@ -1147,6 +1149,7 @@ mod tests {
             status: ServerPaneStatus::Running,
             foreground: None,
         owner_workspace: None,
+            short_id: "aa".to_string(),
             };
         let selected_id = server.id;
         // Row 0 is the "Unknown" group header; row 1 is the server row.
@@ -1176,6 +1179,7 @@ mod tests {
             status: ServerPaneStatus::Running,
             foreground: None,
         owner_workspace: None,
+            short_id: "aa".to_string(),
             };
         // Row 0 is the "Unknown" group header; row 1 is the server row
         // -- selecting the server row itself is what makes this a real
@@ -1214,6 +1218,7 @@ mod tests {
                 cwd: Some("/home/dev/project".to_string()),
             }),
         owner_workspace: None,
+            short_id: "aa".to_string(),
             };
         let server_id = server.id;
         let menu = super::super::AttachMenu {
@@ -1247,6 +1252,7 @@ mod tests {
             status: ServerPaneStatus::Running,
             foreground: None,
         owner_workspace: None,
+            short_id: "aa".to_string(),
             };
         let server_id = server.id;
         let menu = super::super::AttachMenu {
@@ -1287,6 +1293,7 @@ mod tests {
             status: ServerPaneStatus::Running,
             foreground: None,
         owner_workspace: None,
+            short_id: "aa".to_string(),
             };
         let selected_id = server.id;
         let menu = super::super::AttachMenu {
@@ -1337,6 +1344,7 @@ mod tests {
             status: ServerPaneStatus::Dead,
             foreground: None,
         owner_workspace: None,
+            short_id: "aa".to_string(),
             };
         let servers = vec![("Unknown".to_string(), server)];
         let menu = super::super::AttachMenu {
@@ -1391,6 +1399,7 @@ mod tests {
                 cwd: Some("/home/dev/api".to_string()),
             }),
         owner_workspace: None,
+            short_id: "aa".to_string(),
             };
         let b = ServerPaneInfo {
             id: Uuid::new_v4(),
@@ -1402,6 +1411,7 @@ mod tests {
                 cwd: Some("/home/dev/web".to_string()),
             }),
         owner_workspace: None,
+            short_id: "aa".to_string(),
             };
         let servers =
             vec![("/home/dev/api".to_string(), a), ("/home/dev/web".to_string(), b)];
@@ -1435,6 +1445,7 @@ mod tests {
                 cwd: Some("/home/dev/api".to_string()),
             }),
         owner_workspace: None,
+            short_id: "aa".to_string(),
             };
         let dead = ServerPaneInfo {
             id: Uuid::new_v4(),
@@ -1443,6 +1454,7 @@ mod tests {
             status: ServerPaneStatus::Dead,
             foreground: None,
         owner_workspace: None,
+            short_id: "aa".to_string(),
             };
         let servers = vec![
             ("/home/dev/api".to_string(), a),
@@ -1476,6 +1488,7 @@ mod tests {
                 cwd: Some("/home/dev/api".to_string()),
             }),
         owner_workspace: None,
+            short_id: "aa".to_string(),
             };
         let b = ServerPaneInfo {
             id: Uuid::new_v4(),
@@ -1487,6 +1500,7 @@ mod tests {
                 cwd: Some("/home/dev/web".to_string()),
             }),
         owner_workspace: None,
+            short_id: "aa".to_string(),
             };
         let servers =
             vec![("/home/dev/api".to_string(), a), ("/home/dev/web".to_string(), b)];
@@ -1528,6 +1542,7 @@ mod tests {
                 cwd: Some("/home/dev/api".to_string()),
             }),
         owner_workspace: None,
+            short_id: "aa".to_string(),
             };
         let menu = super::super::AttachMenu {
             servers: vec![("/home/dev/api".to_string(), a)],
@@ -1564,6 +1579,7 @@ mod tests {
                 cwd: Some("/home/dev/api".to_string()),
             }),
         owner_workspace: None,
+            short_id: "aa".to_string(),
             };
         let menu = super::super::AttachMenu {
             servers: vec![("/home/dev/api".to_string(), a)],
@@ -1596,6 +1612,7 @@ mod tests {
             status: ServerPaneStatus::Running,
             foreground: None,
         owner_workspace: None,
+            short_id: "aa".to_string(),
             };
         let menu = super::super::AttachMenu {
             servers: vec![("Unknown".to_string(), server)],
@@ -1623,6 +1640,7 @@ mod tests {
             status: ServerPaneStatus::Running,
             foreground: None,
         owner_workspace: None,
+            short_id: "aa".to_string(),
             };
         let server_b = ServerPaneInfo {
             id: other,
@@ -1631,6 +1649,7 @@ mod tests {
             status: ServerPaneStatus::Running,
             foreground: None,
         owner_workspace: None,
+            short_id: "aa".to_string(),
             };
         let menu = super::super::AttachMenu {
             servers: vec![
@@ -1662,6 +1681,7 @@ mod tests {
             status: ServerPaneStatus::Running,
             foreground: None,
         owner_workspace: None,
+            short_id: "aa".to_string(),
             };
         let menu = super::super::AttachMenu {
             servers: vec![("Unknown".to_string(), server)],
@@ -1688,6 +1708,7 @@ mod tests {
             status: ServerPaneStatus::Running,
             foreground: None,
         owner_workspace: None,
+            short_id: "aa".to_string(),
             };
         let menu = super::super::AttachMenu {
             servers: vec![("Unknown".to_string(), server)],

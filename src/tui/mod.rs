@@ -2493,6 +2493,7 @@ mod tests {
                 cwd: Some(c.to_string()),
             }),
             owner_workspace: None,
+            short_id: "aa".to_string(),
         }
     }
 

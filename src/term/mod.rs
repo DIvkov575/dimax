@@ -88,6 +88,10 @@ pub struct ServerPane {
     /// See `protocol::ServerPaneInfo::owner_workspace`'s doc comment --
     /// set once at construction, never mutated afterward.
     owner_workspace: Option<WorkspaceId>,
+    /// See `protocol::ServerPaneInfo::short_id`'s doc comment -- set once
+    /// at construction from the daemon's sequential counter, never
+    /// mutated afterward.
+    short_id: String,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -98,6 +102,7 @@ impl ServerPane {
     /// a `Changed`/`Died` notification from the background reader thread
     /// whenever this pane's displayed content changes or its process
     /// exits.
+    #[allow(clippy::too_many_arguments)] // one call site (State::server_spawn); a params struct would only add indirection
     pub fn spawn(
         id: ServerPaneId,
         name: Option<String>,
@@ -106,6 +111,7 @@ impl ServerPane {
         size: Size,
         events: UnboundedSender<ServerPaneEvent>,
         owner_workspace: Option<WorkspaceId>,
+        short_id: String,
     ) -> anyhow::Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -264,7 +270,7 @@ impl ServerPane {
             let _ = events.send(ServerPaneEvent::Died(id));
         });
 
-        Ok(Self { id, name, owner_workspace, inner })
+        Ok(Self { id, name, owner_workspace, short_id, inner })
     }
 
     pub fn id(&self) -> ServerPaneId {
@@ -277,6 +283,10 @@ impl ServerPane {
 
     pub fn owner_workspace(&self) -> Option<WorkspaceId> {
         self.owner_workspace
+    }
+
+    pub fn short_id(&self) -> &str {
+        &self.short_id
     }
 
     pub fn set_name(&mut self, name: Option<String>) {
@@ -631,6 +641,7 @@ mod tests {
             Size { rows: 24, cols: 80 },
             tx,
             None,
+            "test-short-id".to_string(),
         )
         .unwrap();
 
@@ -659,6 +670,7 @@ mod tests {
             Size { rows: 24, cols: 80 },
             tx,
             None,
+            "test-short-id".to_string(),
         )
         .unwrap();
 
@@ -683,6 +695,7 @@ mod tests {
             Size { rows: 24, cols: 80 },
             tx,
             None,
+            "test-short-id".to_string(),
         )
         .unwrap();
 
@@ -709,7 +722,7 @@ mod tests {
     fn flooding_pane_batches_changed_events_instead_of_firing_per_read() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let id = Uuid::new_v4();
-        let pane = ServerPane::spawn(id, None, Some("yes".to_string()), None, Size { rows: 24, cols: 80 }, tx, None)
+        let pane = ServerPane::spawn(id, None, Some("yes".to_string()), None, Size { rows: 24, cols: 80 }, tx, None, "test-short-id".to_string())
             .unwrap();
 
         // Let `yes` actually get its output flowing before measuring, so
@@ -745,7 +758,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let id = Uuid::new_v4();
         let pane =
-            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx, None).unwrap();
+            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx, None, "test-short-id".to_string()).unwrap();
 
         for line in ["alpha", "bravo", "charlie"] {
             pane.write_input(format!("{line}\n").as_bytes()).unwrap();
@@ -783,6 +796,7 @@ mod tests {
             Size { rows: 24, cols: 80 },
             tx,
             None,
+            "test-short-id".to_string(),
         )
         .unwrap();
 
@@ -807,6 +821,7 @@ mod tests {
             Size { rows: 24, cols: 80 },
             tx,
             None,
+            "test-short-id".to_string(),
         )
         .unwrap();
 
@@ -824,7 +839,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let id = Uuid::new_v4();
         let pane =
-            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx, None).unwrap();
+            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx, None, "test-short-id".to_string()).unwrap();
         assert_eq!(pane.scrollback_rows(), 0);
     }
 
@@ -835,7 +850,7 @@ mod tests {
         // A small 5-row pane makes it easy to scroll content off the
         // top with a modest number of printed lines.
         let pane =
-            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 5, cols: 80 }, tx, None).unwrap();
+            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 5, cols: 80 }, tx, None, "test-short-id".to_string()).unwrap();
 
         // Write enough lines to scroll "first-line" off the top of a
         // 5-row screen and into scrollback.
@@ -883,7 +898,7 @@ mod tests {
     fn foreground_info_reports_the_running_shell_command() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let id = Uuid::new_v4();
-        let pane = ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx, None)
+        let pane = ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx, None, "test-short-id".to_string())
             .unwrap();
 
         // Wait for the shell to actually exec `cat` (there's a brief
@@ -917,7 +932,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let id = Uuid::new_v4();
         let mut pane =
-            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx, None).unwrap();
+            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx, None, "test-short-id".to_string()).unwrap();
         pane.kill().unwrap();
         // The process group leader is gone once killed; there's nothing
         // left to query.

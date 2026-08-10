@@ -47,6 +47,44 @@ pub enum CloseTabResult {
 /// viewers). The conventional 80x24 default.
 const DEFAULT_PTY_SIZE: Size = Size { rows: 24, cols: 80 };
 
+/// Charset for [`encode_short_id`], in the exact per-character order that
+/// counter value `0` (`'0'`) sorts before `9`, which sorts before `'a'`,
+/// which sorts before `'z'`, which sorts before `'A'`, which sorts before
+/// `'Z'`.
+const SHORT_ID_CHARSET: &[u8; 62] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+/// Encode a per-daemon sequential counter value as a short, fixed-width
+/// (per magnitude) base-62 label: `0` -> `"00"`, `1` -> `"01"`, ...,
+/// `9` -> `"09"`, `10` -> `"0a"`, ..., `61` -> `"0Z"`, `62` -> `"10"`,
+/// ..., `3843` -> `"ZZ"`, `3844` -> `"100"`, and so on -- each of the two
+/// (or more, once the two-character space of 3,844 values is exhausted)
+/// positions independently cycles through [`SHORT_ID_CHARSET`], most
+/// significant digit first, widening to an extra character only once
+/// the current width's entire space is used up. Pure and infallible:
+/// there is no upper bound on `n`, so this never needs to reset or
+/// error, unlike a fixed-width scheme would once panes outlive two
+/// characters' worth of ids.
+fn encode_short_id(n: u64) -> String {
+    let base = SHORT_ID_CHARSET.len() as u64;
+    let mut width = 2u32;
+    let mut remaining = n;
+    loop {
+        let capacity = base.pow(width);
+        if remaining < capacity {
+            break;
+        }
+        remaining -= capacity;
+        width += 1;
+    }
+    let mut digits = vec![0u8; width as usize];
+    let mut x = remaining;
+    for slot in digits.iter_mut().rev() {
+        *slot = SHORT_ID_CHARSET[(x % base) as usize];
+        x /= base;
+    }
+    String::from_utf8(digits).expect("SHORT_ID_CHARSET is pure ASCII")
+}
+
 pub struct State {
     server_panes: HashMap<ServerPaneId, ServerPane>,
     workspaces: HashMap<WorkspaceId, Workspace>,
@@ -87,6 +125,11 @@ pub struct State {
     /// other piece of `State` except `pinned_dirs`: a fresh daemon
     /// always starts with this `false`.
     used_shell_fallback: bool,
+    /// Next value [`encode_short_id`] will be called with -- incremented
+    /// on every `server_spawn`, never decremented (a killed pane's short
+    /// id is never reused while this daemon keeps running). Ephemeral
+    /// like `used_shell_fallback`: resets to `0` on every restart.
+    next_short_id: u64,
 }
 
 struct Workspace {
@@ -114,6 +157,7 @@ impl State {
             pane_events_rx: Some(pane_events_rx),
             pinned_dirs: super::pinned_dirs::load(),
             used_shell_fallback: false,
+            next_short_id: 0,
         }
     }
 
@@ -140,6 +184,8 @@ impl State {
             anyhow::bail!("server-pane named {name:?} already exists");
         }
         let id = ServerPaneId::new_v4();
+        let short_id = encode_short_id(self.next_short_id);
+        self.next_short_id += 1;
         let pane = ServerPane::spawn(
             id,
             name.clone(),
@@ -148,6 +194,7 @@ impl State {
             DEFAULT_PTY_SIZE,
             self.pane_events.clone(),
             workspace,
+            short_id.clone(),
         )?;
         let info = ServerPaneInfo {
             id,
@@ -156,6 +203,7 @@ impl State {
             status: pane.status(),
             foreground: pane.foreground_info(),
             owner_workspace: pane.owner_workspace(),
+            short_id,
         };
         self.server_panes.insert(id, pane);
         Ok(info)
@@ -258,6 +306,7 @@ impl State {
                 status: p.status(),
                 foreground: p.foreground_info(),
                 owner_workspace: p.owner_workspace(),
+                short_id: p.short_id().to_string(),
             })
             .collect();
         // HashMap order is unspecified; sort so `dimux server ls` output
@@ -925,6 +974,54 @@ fn unbind_all(tree: &mut SplitTree, server_pane: ServerPaneId) {
 mod tests {
     use super::*;
     use crate::protocol::ServerPaneStatus;
+
+    #[test]
+    fn encode_short_id_covers_the_documented_progression() {
+        assert_eq!(encode_short_id(0), "00");
+        assert_eq!(encode_short_id(1), "01");
+        assert_eq!(encode_short_id(9), "09");
+        assert_eq!(encode_short_id(10), "0a");
+        assert_eq!(encode_short_id(35), "0z");
+        assert_eq!(encode_short_id(36), "0A");
+        assert_eq!(encode_short_id(61), "0Z");
+        assert_eq!(encode_short_id(62), "10");
+    }
+
+    #[test]
+    fn encode_short_id_widens_past_two_characters_with_no_upper_bound() {
+        // 62^2 = 3844 two-character codes (00..ZZ); the next value must
+        // widen to three characters rather than erroring or wrapping.
+        assert_eq!(encode_short_id(3843), "ZZ");
+        assert_eq!(encode_short_id(3844), "000");
+        assert_eq!(encode_short_id(3845), "001");
+    }
+
+    #[test]
+    fn encode_short_id_never_repeats_across_a_wide_range() {
+        let mut seen = std::collections::HashSet::new();
+        for n in 0..10_000 {
+            assert!(seen.insert(encode_short_id(n)), "duplicate short id at n={n}");
+        }
+    }
+
+    #[test]
+    fn server_spawn_assigns_sequential_short_ids_starting_at_00() {
+        let mut state = State::new();
+        let a = state.server_spawn(None, Some("cat".to_string()), None, None).unwrap();
+        let b = state.server_spawn(None, Some("cat".to_string()), None, None).unwrap();
+        let c = state.server_spawn(None, Some("cat".to_string()), None, None).unwrap();
+        assert_eq!(a.short_id, "00");
+        assert_eq!(b.short_id, "01");
+        assert_eq!(c.short_id, "02");
+    }
+
+    #[test]
+    fn short_id_survives_into_server_list() {
+        let mut state = State::new();
+        state.server_spawn(Some("shell".to_string()), Some("cat".to_string()), None, None).unwrap();
+        let listed = state.server_list();
+        assert_eq!(listed[0].short_id, "00");
+    }
 
     /// Every server-pane in these tests runs `cat`: it stays alive with no
     /// output until its PTY master is dropped, so pane bookkeeping is
