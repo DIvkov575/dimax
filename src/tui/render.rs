@@ -315,7 +315,11 @@ fn draw_leaf(
         Some(_) => match snapshot {
             Some(snapshot) => {
                 let text = grid_to_text(snapshot);
+                let inner = block.inner(area);
                 frame.render_widget(Paragraph::new(text).block(block), area);
+                if is_focused {
+                    place_cursor(frame, snapshot, inner);
+                }
             }
             None => {
                 let placeholder = Paragraph::new("(server-pane closed)").block(block);
@@ -323,6 +327,35 @@ fn draw_leaf(
             }
         },
     }
+}
+
+/// Position the terminal's real cursor at `snapshot`'s reported
+/// `(col, row)`, translated into screen coordinates within `inner`
+/// (the leaf's content rect, i.e. `area` minus its title-bar border) --
+/// without this, `ratatui` never calls `Frame::set_cursor_position` for
+/// anything, so the cursor stays wherever it was last drawn system-wide
+/// (or hidden), regardless of which cell the foreground process
+/// actually considers "current". This is what makes e.g. nvim's cursor
+/// visible at all, distinct from and in addition to whatever cell-level
+/// `reverse`/highlight attributes the app itself paints around it (a
+/// `cursorline` full-row highlight is real cell content already handled
+/// by `cell_to_span`; this is the separate blinking caret glyph).
+///
+/// Skipped (falls through to whatever `Frame::render_widget` already
+/// left, i.e. hidden) when the pane is scrolled back -- the PTY's
+/// cursor position is only meaningful against the *live* screen, and
+/// would otherwise point at an arbitrary cell in history -- or when the
+/// reported position has scrolled outside `inner`'s bounds (a
+/// momentarily stale snapshot from just before a resize).
+fn place_cursor(frame: &mut Frame, snapshot: &GridSnapshot, inner: Rect) {
+    if snapshot.scroll_offset > 0 {
+        return;
+    }
+    let (col, row) = snapshot.cursor;
+    if col >= inner.width || row >= inner.height {
+        return;
+    }
+    frame.set_cursor_position((inner.x + col, inner.y + row));
 }
 
 /// Convert a `GridSnapshot`'s row-major cell grid into a `ratatui::Text`,
@@ -825,6 +858,103 @@ mod tests {
             .draw(|frame| draw(frame, &workspace, &grids, None))
             .unwrap();
         assert!(buffer_contains(&terminal, "hi"));
+    }
+
+    #[test]
+    fn draw_places_the_real_cursor_at_the_snapshots_reported_position_when_focused() {
+        let pane_id = Uuid::new_v4();
+        let server_pane_id = Uuid::new_v4();
+        let pane = ClientPane {
+            id: pane_id,
+            name: None,
+            tabs: vec![server_pane_id],
+            active_tab: 0,
+            short_id: "aa".to_string(),
+        };
+        let workspace = workspace_with_tree(SplitTree::Leaf(pane));
+        let mut grids = HashMap::new();
+        grids.insert(
+            server_pane_id,
+            GridSnapshot {
+                server_pane: server_pane_id,
+                size: Size { rows: 3, cols: 10 },
+                cursor: (4, 1),
+                lines: vec![vec![simple_cell(" "); 10]; 3],
+                scroll_offset: 0,
+            },
+        );
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &workspace, &grids, Some(pane_id)))
+            .unwrap();
+        // area starts at (0, 0); the leaf's top-border title bar occupies
+        // row 0, so the content rect's origin is row 1 -- cursor (4, 1)
+        // within it lands at absolute (4, 2).
+        assert_eq!(terminal.get_cursor_position().unwrap(), ratatui::layout::Position { x: 4, y: 2 });
+        assert!(terminal.backend().cursor_visible());
+    }
+
+    #[test]
+    fn draw_does_not_place_the_cursor_when_the_leaf_is_not_focused() {
+        let pane_id = Uuid::new_v4();
+        let server_pane_id = Uuid::new_v4();
+        let pane = ClientPane {
+            id: pane_id,
+            name: None,
+            tabs: vec![server_pane_id],
+            active_tab: 0,
+            short_id: "aa".to_string(),
+        };
+        let workspace = workspace_with_tree(SplitTree::Leaf(pane));
+        let mut grids = HashMap::new();
+        grids.insert(
+            server_pane_id,
+            GridSnapshot {
+                server_pane: server_pane_id,
+                size: Size { rows: 3, cols: 10 },
+                cursor: (4, 1),
+                lines: vec![vec![simple_cell(" "); 10]; 3],
+                scroll_offset: 0,
+            },
+        );
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &workspace, &grids, None))
+            .unwrap();
+        assert!(!terminal.backend().cursor_visible(), "cursor should stay hidden when unfocused");
+    }
+
+    #[test]
+    fn draw_does_not_place_the_cursor_when_the_leaf_is_scrolled_back() {
+        let pane_id = Uuid::new_v4();
+        let server_pane_id = Uuid::new_v4();
+        let pane = ClientPane {
+            id: pane_id,
+            name: None,
+            tabs: vec![server_pane_id],
+            active_tab: 0,
+            short_id: "aa".to_string(),
+        };
+        let workspace = workspace_with_tree(SplitTree::Leaf(pane));
+        let mut grids = HashMap::new();
+        grids.insert(
+            server_pane_id,
+            GridSnapshot {
+                server_pane: server_pane_id,
+                size: Size { rows: 3, cols: 10 },
+                cursor: (4, 1),
+                lines: vec![vec![simple_cell(" "); 10]; 3],
+                scroll_offset: 2,
+            },
+        );
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &workspace, &grids, Some(pane_id)))
+            .unwrap();
+        assert!(!terminal.backend().cursor_visible(), "cursor should stay hidden while scrolled back");
     }
 
     #[test]
