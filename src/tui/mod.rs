@@ -954,7 +954,7 @@ impl App {
         match action {
             AttachMenuAction::Up => self.move_attach_menu_selection(false),
             AttachMenuAction::Down => self.move_attach_menu_selection(true),
-            AttachMenuAction::Cancel => self.attach_menu = None,
+            AttachMenuAction::Cancel => self.cancel_and_restore_previous_binding(write_half, reader).await?,
             AttachMenuAction::Confirm => self.confirm_or_toggle_attach_menu(write_half, reader).await?,
             AttachMenuAction::Delete => self.arm_delete(),
             AttachMenuAction::StartRename => self.start_rename(),
@@ -962,6 +962,7 @@ impl App {
             AttachMenuAction::ToggleShowAllWorkspaces => {
                 self.toggle_show_all_workspaces(write_half, reader).await?
             }
+            AttachMenuAction::DetachAll => self.detach_all_and_close_menu(write_half, reader).await?,
             AttachMenuAction::Ignore => {}
         }
         Ok(())
@@ -1125,6 +1126,58 @@ impl App {
             if menu.selected >= len {
                 menu.selected = len - 1;
             }
+        }
+        Ok(())
+    }
+
+    /// `Esc`: cancel the pick and close the menu. If the leaf that
+    /// opened this menu was actually detached to get here (the
+    /// single-tab `cmd-shift-z` case -- see `AttachMenu.previously_bound`'s
+    /// doc comment), rebind it so cancelling is a true no-op rather than
+    /// leaving the leaf unbound. `previously_bound` is `None` for every
+    /// other way the menu can open (a multi-tab `cmd-shift-z`, which
+    /// deliberately skips the unbind; `cmd-t`'s add-tab mode, which never
+    /// unbinds at all; or the startup picker on an empty workspace, which
+    /// has no leaf to restore) -- in all of those, this is just a plain
+    /// close.
+    async fn cancel_and_restore_previous_binding(
+        &mut self,
+        write_half: &mut OwnedWriteHalf,
+        reader: &mut FrameReader,
+    ) -> anyhow::Result<()> {
+        let previously_bound = self.attach_menu.take().and_then(|menu| menu.previously_bound);
+        let (Some(pane), Some(target)) = (self.focused, previously_bound) else { return Ok(()) };
+        let req = Request::ClientBind { workspace: self.workspace.id.to_string(), pane, target: target.to_string() };
+        let _ = self.request(write_half, reader, req).await?;
+        Ok(())
+    }
+
+    /// `d`: detach every tab from the leaf that opened this menu, then
+    /// close the menu -- the escape hatch for "I don't want anything
+    /// bound here anymore", distinct from `Esc`'s "restore what was
+    /// there". `ClientUnbind` only ever removes the *active* tab, so
+    /// this repeats it until the leaf reports no tabs left (or a bound
+    /// number of iterations elapses, as a defensive backstop against an
+    /// unexpected daemon response looping forever).
+    async fn detach_all_and_close_menu(
+        &mut self,
+        write_half: &mut OwnedWriteHalf,
+        reader: &mut FrameReader,
+    ) -> anyhow::Result<()> {
+        self.attach_menu = None;
+        let Some(pane) = self.focused else { return Ok(()) };
+        for _ in 0..64 {
+            let still_bound = self
+                .workspace
+                .tree
+                .as_ref()
+                .and_then(|tree| tree.find(pane))
+                .is_some_and(|leaf| !leaf.tabs.is_empty());
+            if !still_bound {
+                break;
+            }
+            let req = Request::ClientUnbind { workspace: self.workspace.id.to_string(), pane };
+            let _ = self.request(write_half, reader, req).await?;
         }
         Ok(())
     }
@@ -1904,6 +1957,11 @@ enum AttachMenuAction {
     /// comment) and re-fetch/re-group the server list so the toggle
     /// takes effect immediately.
     ToggleShowAllWorkspaces,
+    /// `d` on any row: detach every tab from the leaf that opened this
+    /// menu (see `App::detach_all_and_close_menu`), then close the
+    /// menu -- distinct from `Cancel` (`Esc`), which restores whatever
+    /// was bound before the menu opened rather than clearing it.
+    DetachAll,
     Ignore,
 }
 
@@ -1929,6 +1987,7 @@ fn parse_attach_menu_input(bytes: &[u8]) -> AttachMenuAction {
         b"r" => AttachMenuAction::StartRename,
         b"p" => AttachMenuAction::TogglePin,
         b"a" => AttachMenuAction::ToggleShowAllWorkspaces,
+        b"d" => AttachMenuAction::DetachAll,
         _ => AttachMenuAction::Ignore,
     }
 }
@@ -2492,6 +2551,11 @@ mod tests {
     #[test]
     fn parse_attach_menu_input_a_is_toggle_show_all_workspaces() {
         assert_eq!(parse_attach_menu_input(b"a"), AttachMenuAction::ToggleShowAllWorkspaces);
+    }
+
+    #[test]
+    fn parse_attach_menu_input_d_is_detach_all() {
+        assert_eq!(parse_attach_menu_input(b"d"), AttachMenuAction::DetachAll);
     }
 
     #[test]
@@ -3457,6 +3521,196 @@ mod tests {
         };
         let leaf = panes.iter().find(|p| p.id == pane).expect("pane should still exist");
         assert_eq!(leaf.active_bound(), Some(existing_id));
+    }
+
+    /// `Esc` on the picker `cmd-shift-z` opened must restore the leaf's
+    /// original binding rather than leaving it unbound -- cancelling the
+    /// pick should be a true no-op, not a silent detach.
+    #[tokio::test]
+    async fn escape_from_the_picker_restores_the_previous_binding() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+
+        let Response::ServerPane(existing) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None, workspace: None },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        let existing_id = existing.id;
+        let Response::ClientPaneCreated { pane, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientSpawn {
+                    workspace: "1".to_string(),
+                    split_of: None,
+                    dir: None,
+                    bind: Some(existing_id.to_string()),
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneCreated");
+        };
+        app.focused = Some(pane);
+        if let Response::Snapshot { workspace, .. } =
+            app.request(&mut write_half, &mut reader, Request::Subscribe { workspace: "1".to_string() }).await.unwrap()
+        {
+            app.workspace = workspace;
+        }
+
+        app.detach_and_open_menu(&mut write_half, &mut reader).await.unwrap();
+        assert!(app.attach_menu.is_some(), "the picker should be open before Escape");
+
+        app.dispatch_attach_menu_action(AttachMenuAction::Cancel, &mut write_half, &mut reader).await.unwrap();
+
+        assert!(app.attach_menu.is_none(), "Escape should close the menu");
+        let Response::ClientPaneList { panes, .. } = app
+            .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneList");
+        };
+        let leaf = panes.iter().find(|p| p.id == pane).expect("pane should still exist");
+        assert_eq!(
+            leaf.active_bound(),
+            Some(existing_id),
+            "Escape should have restored the original binding rather than leaving the leaf unbound"
+        );
+    }
+
+    /// `Esc` when nothing was previously bound (e.g. the leaf was already
+    /// unbound before `cmd-shift-z`) must be a plain close -- no
+    /// `ClientBind` with a nonsensical target should be sent.
+    #[tokio::test]
+    async fn escape_from_the_picker_with_nothing_previously_bound_is_a_plain_close() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+
+        let Response::ClientPaneCreated { pane, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientSpawn { workspace: "1".to_string(), split_of: None, dir: None, bind: None },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneCreated");
+        };
+        app.focused = Some(pane);
+        if let Response::Snapshot { workspace, .. } =
+            app.request(&mut write_half, &mut reader, Request::Subscribe { workspace: "1".to_string() }).await.unwrap()
+        {
+            app.workspace = workspace;
+        }
+
+        app.detach_and_open_menu(&mut write_half, &mut reader).await.unwrap();
+        app.dispatch_attach_menu_action(AttachMenuAction::Cancel, &mut write_half, &mut reader).await.unwrap();
+
+        assert!(app.attach_menu.is_none());
+        let Response::ClientPaneList { panes, .. } = app
+            .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneList");
+        };
+        let leaf = panes.iter().find(|p| p.id == pane).expect("pane should still exist");
+        assert_eq!(leaf.active_bound(), None);
+    }
+
+    /// `d` from within the picker detaches every tab from the leaf that
+    /// opened it, leaving it unbound, and closes the menu -- exercised
+    /// on a multi-tab leaf specifically, since that's the case a single
+    /// `ClientUnbind` can't finish in one call.
+    #[tokio::test]
+    async fn detach_all_clears_every_tab_on_the_leaf() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+
+        let Response::ServerPane(sp1) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None, workspace: None },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        let Response::ServerPane(sp2) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None, workspace: None },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        let Response::ClientPaneCreated { pane, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientSpawn {
+                    workspace: "1".to_string(),
+                    split_of: None,
+                    dir: None,
+                    bind: Some(sp1.id.to_string()),
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneCreated");
+        };
+        let _ = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientAddTab { workspace: "1".to_string(), pane, target: sp2.id.to_string() },
+            )
+            .await
+            .unwrap();
+        app.focused = Some(pane);
+        if let Response::Snapshot { workspace, .. } =
+            app.request(&mut write_half, &mut reader, Request::Subscribe { workspace: "1".to_string() }).await.unwrap()
+        {
+            app.workspace = workspace;
+        }
+
+        app.detach_and_open_menu(&mut write_half, &mut reader).await.unwrap();
+        assert!(app.attach_menu.is_some());
+
+        app.dispatch_attach_menu_action(AttachMenuAction::DetachAll, &mut write_half, &mut reader).await.unwrap();
+
+        assert!(app.attach_menu.is_none(), "detach-all should close the menu");
+        let Response::ClientPaneList { panes, .. } = app
+            .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneList");
+        };
+        let leaf = panes.iter().find(|p| p.id == pane).expect("pane should still exist");
+        assert!(leaf.tabs.is_empty(), "every tab should have been detached, leaf.tabs = {:?}", leaf.tabs);
+
+        // Both server-panes must still be running -- detaching is not killing.
+        let Response::ServerPaneList(servers) =
+            app.request(&mut write_half, &mut reader, Request::ServerList).await.unwrap()
+        else {
+            panic!("expected ServerPaneList");
+        };
+        assert!(servers.iter().any(|s| s.id == sp1.id));
+        assert!(servers.iter().any(|s| s.id == sp2.id));
     }
 
     /// `cmd-shift-z` on a multi-tab leaf must not drop a sibling tab.
