@@ -2339,7 +2339,7 @@ mod tests {
     use uuid::Uuid;
 
     fn leaf(id: ClientPaneId) -> SplitTree {
-        SplitTree::Leaf(ClientPane { id, name: None, tabs: vec![], active_tab: 0 })
+        SplitTree::Leaf(ClientPane { id, name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() })
     }
 
     fn split(dir: SplitDir, a: SplitTree, b: SplitTree) -> SplitTree {

@@ -38,6 +38,15 @@ pub struct ClientPane {
     /// whenever `tabs` is empty, so read it through [`ClientPane::active_bound`]
     /// rather than indexing directly.
     pub active_tab: usize,
+    /// A short, sequential, human-readable label (`"aa"`, `"ab"`, ...)
+    /// assigned once at `client_spawn` time -- the same base-62 scheme
+    /// `ServerPaneInfo::short_id` uses, just from an independent counter
+    /// (a client-pane and a server-pane are different kinds of thing, so
+    /// their sequences don't need to be related). Ephemeral like the
+    /// server-pane version: resets to `"aa"` on daemon restart. Purely a
+    /// nicer fallback title than a raw UUID prefix when the pane has no
+    /// custom `name` -- never used for addressing.
+    pub short_id: String,
 }
 
 impl ClientPane {
@@ -587,7 +596,7 @@ mod tests {
     use super::*;
 
     fn pane(id: ClientPaneId) -> ClientPane {
-        ClientPane { id, name: None, tabs: vec![], active_tab: 0 }
+        ClientPane { id, name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() }
     }
 
     #[test]

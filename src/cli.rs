@@ -491,6 +491,7 @@ mod tests {
             name: Some("shell".to_string()),
             tabs: vec![server_pane],
             active_tab: 0,
+            short_id: "aa".to_string(),
         };
         let line = format_client_pane_line(&pane);
         assert_eq!(
@@ -508,6 +509,7 @@ mod tests {
             name: Some("editor".to_string()),
             tabs: vec![sp1, sp2],
             active_tab: 1,
+            short_id: "aa".to_string(),
         };
         let line = format_client_pane_line(&pane);
         assert_eq!(
@@ -518,7 +520,7 @@ mod tests {
 
     #[test]
     fn format_client_pane_line_unbound_unnamed() {
-        let pane = ClientPane { id: Uuid::nil(), name: None, tabs: vec![], active_tab: 0 };
+        let pane = ClientPane { id: Uuid::nil(), name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() };
         let line = format_client_pane_line(&pane);
         assert_eq!(line, format!("{}\t-\t-\t-", Uuid::nil()));
     }
