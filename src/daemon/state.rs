@@ -125,11 +125,20 @@ pub struct State {
     /// other piece of `State` except `pinned_dirs`: a fresh daemon
     /// always starts with this `false`.
     used_shell_fallback: bool,
-    /// Next value [`encode_short_id`] will be called with -- incremented
-    /// on every `server_spawn`, never decremented (a killed pane's short
-    /// id is never reused while this daemon keeps running). Ephemeral
-    /// like `used_shell_fallback`: resets to `0` on every restart.
-    next_short_id: u64,
+    /// Next value [`encode_short_id`] will be called with for a
+    /// server-pane -- incremented on every `server_spawn`, never
+    /// decremented (a killed pane's short id is never reused while this
+    /// daemon keeps running). Ephemeral like `used_shell_fallback`:
+    /// resets to `0` on every restart.
+    next_server_short_id: u64,
+    /// Same idea as [`Self::next_server_short_id`], but for client-panes
+    /// (`client_spawn`) -- a separate counter/sequence rather than a
+    /// shared one, so a client-pane and a server-pane can display the
+    /// same short id (e.g. both `"aa"`) without it meaning anything: the
+    /// two are different kinds of thing shown in different places, never
+    /// side by side in a context where a collision could be confused for
+    /// the same object.
+    next_client_short_id: u64,
 }
 
 struct Workspace {
@@ -157,7 +166,8 @@ impl State {
             pane_events_rx: Some(pane_events_rx),
             pinned_dirs: super::pinned_dirs::load(),
             used_shell_fallback: false,
-            next_short_id: 0,
+            next_server_short_id: 0,
+            next_client_short_id: 0,
         }
     }
 
@@ -184,8 +194,8 @@ impl State {
             anyhow::bail!("server-pane named {name:?} already exists");
         }
         let id = ServerPaneId::new_v4();
-        let short_id = encode_short_id(self.next_short_id);
-        self.next_short_id += 1;
+        let short_id = encode_short_id(self.next_server_short_id);
+        self.next_server_short_id += 1;
         let pane = ServerPane::spawn(
             id,
             name.clone(),
@@ -455,11 +465,14 @@ impl State {
             .workspaces
             .get_mut(&workspace)
             .ok_or_else(|| anyhow::anyhow!("unknown workspace {workspace}"))?;
+        let short_id = encode_short_id(self.next_client_short_id);
+        self.next_client_short_id += 1;
         let pane = ClientPane {
             id: ClientPaneId::new_v4(),
             name: None,
             tabs: bind.into_iter().collect(),
             active_tab: 0,
+            short_id,
         };
         let id = pane.id;
         match split_of {
@@ -1354,6 +1367,28 @@ mod tests {
         let tree = state.workspace_info(ws).unwrap().tree.unwrap();
         assert_eq!(tree.leaves().len(), 1);
         assert_eq!(tree.find(pane).unwrap().active_bound(), None);
+    }
+
+    #[test]
+    fn client_spawn_assigns_sequential_short_ids_starting_at_00() {
+        let mut state = State::new();
+        let ws1 = state.resolve_or_create_workspace("1").unwrap();
+        let a = state.client_spawn(ws1, None, None, None).unwrap();
+        let ws2 = state.resolve_or_create_workspace("2").unwrap();
+        let b = state.client_spawn(ws2, None, None, None).unwrap();
+        assert_eq!(state.workspace_info(ws1).unwrap().tree.unwrap().find(a).unwrap().short_id, "00");
+        assert_eq!(state.workspace_info(ws2).unwrap().tree.unwrap().find(b).unwrap().short_id, "01");
+    }
+
+    #[test]
+    fn client_and_server_short_ids_are_independent_sequences() {
+        let mut state = State::new();
+        state.server_spawn(None, Some("cat".to_string()), None, None).unwrap();
+        let ws = state.resolve_or_create_workspace("1").unwrap();
+        let pane = state.client_spawn(ws, None, None, None).unwrap();
+        // The server-pane already consumed "00" from its own counter --
+        // the client-pane's counter is unaffected and still starts fresh.
+        assert_eq!(state.workspace_info(ws).unwrap().tree.unwrap().find(pane).unwrap().short_id, "00");
     }
 
     #[test]

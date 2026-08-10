@@ -277,12 +277,6 @@ pub fn ratio_at(hit: &DividerHit, col: u16, row: u16) -> f32 {
     }
 }
 
-/// Short id prefix used as a fallback title/label when a pane/server-pane
-/// has no human-assigned name.
-fn short_id(id: uuid::Uuid) -> String {
-    id.to_string()[..8].to_string()
-}
-
 fn draw_leaf(
     frame: &mut Frame,
     pane: &ClientPane,
@@ -292,10 +286,7 @@ fn draw_leaf(
 ) {
     let active = pane.active_bound();
     let snapshot = active.and_then(|server_pane_id| grids.get(&server_pane_id));
-    let mut title = pane
-        .name
-        .clone()
-        .unwrap_or_else(|| short_id(pane.id));
+    let mut title = pane.name.clone().unwrap_or_else(|| pane.short_id.clone());
     if pane.tabs.len() > 1 {
         title.push_str(&format!(" ({}/{})", pane.active_tab + 1, pane.tabs.len()));
     }
@@ -381,6 +372,12 @@ fn cell_to_span(cell: &Cell) -> Span<'static> {
 /// pane's most recent lines at a glance without the popup growing tall
 /// enough to crowd out the row list above it.
 const PREVIEW_PANEL_HEIGHT: u16 = 10;
+
+/// Rendered along the row-list block's bottom border -- must stay in sync
+/// with `parse_attach_menu_input`'s actual byte matches (`tui/mod.rs`),
+/// which is the source of truth this is only a display of.
+const ATTACH_MENU_KEY_HINTS: &str =
+    "↑↓ move · Enter attach · x del · r rename · p pin · a all-ws · d detach · Esc cancel";
 
 /// Overlay for `cmd-shift-z`'s attach menu: lists every server-pane
 /// (grouped under selectable per-cwd headers) plus a trailing "spawn
@@ -474,7 +471,9 @@ pub(super) fn draw_attach_menu(
         }
     }
 
-    let block = Block::bordered().title("Attach server-pane");
+    let block = Block::bordered()
+        .title("Attach server-pane")
+        .title_bottom(Line::from(ATTACH_MENU_KEY_HINTS).right_aligned());
     frame.render_widget(Paragraph::new(lines).block(block), rows_area);
 
     let selected_server_id = match rows.get(menu.selected) {
@@ -728,6 +727,7 @@ mod tests {
             name: None,
             tabs: bound.into_iter().collect(),
             active_tab: 0,
+            short_id: "aa".to_string(),
         }
     }
 
@@ -778,6 +778,18 @@ mod tests {
     }
 
     #[test]
+    fn draw_leaf_falls_back_to_short_id_when_unnamed() {
+        let pane = leaf_pane(None);
+        let backend = TestBackend::new(40, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let grids = HashMap::new();
+        terminal
+            .draw(|frame| draw_leaf(frame, &pane, frame.area(), &grids, None))
+            .unwrap();
+        assert!(buffer_contains(&terminal, &pane.short_id));
+    }
+
+    #[test]
     fn draw_bound_leaf_with_missing_snapshot_shows_closed_placeholder() {
         let server_pane_id = Uuid::new_v4();
         let pane = leaf_pane(Some(server_pane_id));
@@ -819,7 +831,7 @@ mod tests {
     fn draw_leaf_shows_scrollback_indicator_when_scrolled() {
         let pane_id = Uuid::new_v4();
         let server_id = Uuid::new_v4();
-        let pane = ClientPane { id: pane_id, name: Some("shell".to_string()), tabs: vec![server_id], active_tab: 0 };
+        let pane = ClientPane { id: pane_id, name: Some("shell".to_string()), tabs: vec![server_id], active_tab: 0, short_id: "aa".to_string() };
         let mut grids = HashMap::new();
         grids.insert(
             server_id,
@@ -845,7 +857,7 @@ mod tests {
     fn draw_leaf_shows_no_scrollback_indicator_when_live() {
         let pane_id = Uuid::new_v4();
         let server_id = Uuid::new_v4();
-        let pane = ClientPane { id: pane_id, name: Some("shell".to_string()), tabs: vec![server_id], active_tab: 0 };
+        let pane = ClientPane { id: pane_id, name: Some("shell".to_string()), tabs: vec![server_id], active_tab: 0, short_id: "aa".to_string() };
         let mut grids = HashMap::new();
         grids.insert(
             server_id,
@@ -877,6 +889,7 @@ mod tests {
             name: Some("editor".to_string()),
             tabs: vec![sp1, sp2],
             active_tab: 0,
+            short_id: "aa".to_string(),
         };
         let grids = HashMap::new();
         let backend = TestBackend::new(40, 6);
@@ -896,6 +909,7 @@ mod tests {
             name: Some("shell".to_string()),
             tabs: vec![sp],
             active_tab: 0,
+            short_id: "aa".to_string(),
         };
         let grids = HashMap::new();
         let backend = TestBackend::new(40, 6);
@@ -911,8 +925,8 @@ mod tests {
     fn draw_split_produces_no_panic_and_both_leaves_render() {
         let left_id = Uuid::new_v4();
         let right_id = Uuid::new_v4();
-        let left = ClientPane { id: Uuid::new_v4(), name: Some("left".into()), tabs: vec![left_id], active_tab: 0 };
-        let right = ClientPane { id: Uuid::new_v4(), name: Some("right".into()), tabs: vec![right_id], active_tab: 0 };
+        let left = ClientPane { id: Uuid::new_v4(), name: Some("left".into()), tabs: vec![left_id], active_tab: 0, short_id: "aa".to_string() };
+        let right = ClientPane { id: Uuid::new_v4(), name: Some("right".into()), tabs: vec![right_id], active_tab: 0, short_id: "aa".to_string() };
         let tree = SplitTree::Split {
             id: Uuid::new_v4(),
             dir: SplitDir::Vertical,
@@ -985,8 +999,8 @@ mod tests {
         // A vertical split (side-by-side panes) reserves exactly one
         // divider column between the two children -- not two (one from
         // each pane's own border), per module doc "Bezels".
-        let left = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0 };
-        let right = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0 };
+        let left = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() };
+        let right = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() };
         let tree = SplitTree::Split {
             id: Uuid::new_v4(),
             dir: SplitDir::Vertical,
@@ -1014,7 +1028,7 @@ mod tests {
     fn leaf_uses_top_only_border_not_a_full_box() {
         // A single leaf should not draw side/bottom border glyphs -- only
         // the top title-bar row, per module doc "Bezels".
-        let pane = ClientPane { id: Uuid::new_v4(), name: Some("solo".into()), tabs: vec![], active_tab: 0 };
+        let pane = ClientPane { id: Uuid::new_v4(), name: Some("solo".into()), tabs: vec![], active_tab: 0, short_id: "aa".to_string() };
         let workspace = workspace_with_tree(SplitTree::Leaf(pane));
         let grids = HashMap::new();
         let backend = TestBackend::new(20, 6);
@@ -1033,8 +1047,8 @@ mod tests {
 
     #[test]
     fn divider_rects_finds_vertical_split_at_reserved_column() {
-        let left = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0 };
-        let right = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0 };
+        let left = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() };
+        let right = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() };
         let split_id = Uuid::new_v4();
         let tree = SplitTree::Split {
             id: split_id,
@@ -1058,8 +1072,8 @@ mod tests {
 
     #[test]
     fn divider_rects_finds_horizontal_split_at_lower_titlebar_row() {
-        let top = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0 };
-        let bottom = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0 };
+        let top = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() };
+        let bottom = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() };
         let split_id = Uuid::new_v4();
         let tree = SplitTree::Split {
             id: split_id,
@@ -1138,6 +1152,41 @@ mod tests {
         assert!(buffer_contains(&terminal, "/home/dev/project"));
         assert!(buffer_contains(&terminal, "spawn new"));
         assert!(buffer_contains(&terminal, "Attach server-pane"));
+    }
+
+    #[test]
+    fn draw_attach_menu_shows_key_hints() {
+        let menu = super::super::AttachMenu {
+            servers: vec![],
+            selected: 0,
+            pending_delete: None,
+            rename: None,
+            previously_bound: None,
+            spawn_in_group: None,
+            adding_tab: false,
+        };
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[])).unwrap();
+        assert!(buffer_contains(&terminal, "move"));
+        assert!(buffer_contains(&terminal, "attach"));
+        assert!(buffer_contains(&terminal, "cancel"));
+    }
+
+    #[test]
+    fn draw_attach_menu_key_hints_do_not_panic_on_a_narrow_popup() {
+        let menu = super::super::AttachMenu {
+            servers: vec![],
+            selected: 0,
+            pending_delete: None,
+            rename: None,
+            previously_bound: None,
+            spawn_in_group: None,
+            adding_tab: false,
+        };
+        let backend = TestBackend::new(40, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[])).unwrap();
     }
 
     #[test]
@@ -1734,7 +1783,7 @@ mod tests {
     #[test]
     fn leaf_rects_single_leaf_returns_the_whole_area() {
         let id = Uuid::new_v4();
-        let tree = SplitTree::Leaf(ClientPane { id, name: None, tabs: vec![], active_tab: 0 });
+        let tree = SplitTree::Leaf(ClientPane { id, name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() });
         let area = Rect { x: 0, y: 0, width: 80, height: 24 };
         let rects = leaf_rects(&tree, area);
         assert_eq!(rects, vec![(id, area)]);
@@ -1748,8 +1797,8 @@ mod tests {
             id: Uuid::new_v4(),
             dir: SplitDir::Vertical,
             ratio: 0.5,
-            a: Box::new(SplitTree::Leaf(ClientPane { id: a, name: None, tabs: vec![], active_tab: 0 })),
-            b: Box::new(SplitTree::Leaf(ClientPane { id: b, name: None, tabs: vec![], active_tab: 0 })),
+            a: Box::new(SplitTree::Leaf(ClientPane { id: a, name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() })),
+            b: Box::new(SplitTree::Leaf(ClientPane { id: b, name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() })),
         };
         let area = Rect { x: 0, y: 0, width: 81, height: 24 };
         let rects = leaf_rects(&tree, area);
@@ -1771,8 +1820,8 @@ mod tests {
             id: Uuid::new_v4(),
             dir: SplitDir::Horizontal,
             ratio: 0.5,
-            a: Box::new(SplitTree::Leaf(ClientPane { id: a, name: None, tabs: vec![], active_tab: 0 })),
-            b: Box::new(SplitTree::Leaf(ClientPane { id: b, name: None, tabs: vec![], active_tab: 0 })),
+            a: Box::new(SplitTree::Leaf(ClientPane { id: a, name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() })),
+            b: Box::new(SplitTree::Leaf(ClientPane { id: b, name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() })),
         };
         let area = Rect { x: 0, y: 0, width: 80, height: 24 };
         let rects = leaf_rects(&tree, area);
