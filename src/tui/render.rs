@@ -380,7 +380,7 @@ fn cell_to_span(cell: &Cell) -> Span<'static> {
 /// bottom border, plus enough interior rows to show a handful of a
 /// pane's most recent lines at a glance without the popup growing tall
 /// enough to crowd out the row list above it.
-const PREVIEW_PANEL_HEIGHT: u16 = 8;
+const PREVIEW_PANEL_HEIGHT: u16 = 10;
 
 /// Overlay for `cmd-shift-z`'s attach menu: lists every server-pane
 /// (grouped under selectable per-cwd headers) plus a trailing "spawn
@@ -1306,7 +1306,7 @@ mod tests {
             adding_tab: false,
         };
         // More lines than the preview panel's interior can hold
-        // (PREVIEW_PANEL_HEIGHT is 8, i.e. 6 interior rows) -- a naive
+        // (PREVIEW_PANEL_HEIGHT is 10, i.e. 8 interior rows) -- a naive
         // top-down render would show "line-0" and cut off before ever
         // reaching the pane's actual current/most-recent output.
         let full_text = (0..20).map(|i| format!("line-{i}")).collect::<Vec<_>>().join("\n");

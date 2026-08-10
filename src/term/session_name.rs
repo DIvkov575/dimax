@@ -1,11 +1,11 @@
 //! Derives a human-readable name for a server-pane whose foreground
-//! process is a Claude Code or Codex CLI session, from that tool's own
-//! on-disk session transcript -- so an unnamed pane running one of these
-//! shows up as e.g. "clarify e2e.py" instead of a bare UUID prefix.
+//! process is a recognized AI coding CLI session -- so an unnamed pane
+//! running one of these shows up as something meaningful instead of a
+//! bare UUID prefix.
 //!
-//! Both tools are detected the same way: the foreground process's own
-//! command line (`argv`, not just its executable name) is inspected for
-//! a session-identifying flag or the tool name itself. From there:
+//! Claude Code and Codex are detected via their own on-disk session
+//! transcript, which the command line is inspected for a
+//! session-identifying flag or the tool name to locate:
 //! - **Claude Code** carries an explicit `--session-id <uuid>` or
 //!   `--resume <uuid>` argument, which names its transcript file
 //!   directly (`~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`) --
@@ -21,15 +21,22 @@
 //!   which case whichever file was modified most recently wins). Since
 //!   there's no title either, the first real user message's first few
 //!   words stand in for one.
+//!
+//! **opencode**, **omp** ("Oh My Pi"), and **herdr** have no documented
+//! on-disk transcript format to mine a real title from, so they're
+//! recognized by binary name alone and simply named after the tool
+//! itself -- still a real improvement over an anonymous short id, without
+//! guessing at an unverified file format.
 
 use std::path::{Path, PathBuf};
 
 /// Look up a display name for the CLI session running as `cmd` (the
 /// foreground process's full command line, `argv[0]` first) with
 /// current directory `cwd`. Returns `None` if `cmd` isn't recognized as
-/// a Claude Code or Codex invocation, no title could be resolved, or
-/// `$HOME` isn't set -- all expected outcomes for the vast majority of
-/// server-panes (plain shells, editors, etc.), not error conditions.
+/// one of the tools in this module's doc comment, no title could be
+/// resolved, or `$HOME` isn't set -- all expected outcomes for the vast
+/// majority of server-panes (plain shells, editors, etc.), not error
+/// conditions.
 pub fn derive_session_name(cmd: &[String], cwd: &str) -> Option<String> {
     let home = std::env::var("HOME").ok()?;
     derive_session_name_under(cmd, cwd, Path::new(&home))
@@ -46,6 +53,30 @@ fn derive_session_name_under(cmd: &[String], cwd: &str, home: &Path) -> Option<S
     }
     if is_codex_invocation(cmd) {
         return codex_title_for_cwd(home, cwd);
+    }
+    if let Some(name) = named_by_binary_only(cmd) {
+        return Some(name.to_string());
+    }
+    None
+}
+
+/// Tools recognized purely by their binary name, each just named after
+/// itself -- see the module doc comment for why these don't get a
+/// transcript-derived title the way Claude Code and Codex do.
+fn named_by_binary_only(cmd: &[String]) -> Option<&'static str> {
+    let arg0 = cmd.first()?;
+    let file_name = Path::new(arg0).file_name()?.to_string_lossy().to_lowercase();
+    if file_name.contains("opencode") {
+        return Some("opencode");
+    }
+    // "omp" is short enough that a substring match would false-positive
+    // on unrelated binaries (e.g. "compass" contains "omp") -- exact
+    // match only.
+    if file_name == "omp" {
+        return Some("omp");
+    }
+    if file_name.contains("herdr") {
+        return Some("herdr");
     }
     None
 }
@@ -557,5 +588,40 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id() + 9));
         let cmd = vec!["bash".to_string()];
         assert_eq!(derive_session_name_under(&cmd, "/whatever", &dir), None);
+    }
+
+    #[test]
+    fn named_by_binary_only_matches_opencode_plain_and_versioned_paths() {
+        assert_eq!(named_by_binary_only(&["opencode".to_string()]), Some("opencode"));
+        assert_eq!(
+            named_by_binary_only(&["/Users/dev/.local/bin/opencode".to_string()]),
+            Some("opencode")
+        );
+    }
+
+    #[test]
+    fn named_by_binary_only_matches_omp_exactly_not_as_a_substring() {
+        assert_eq!(named_by_binary_only(&["omp".to_string()]), Some("omp"));
+        assert_eq!(named_by_binary_only(&["/opt/homebrew/bin/omp".to_string()]), Some("omp"));
+        assert_eq!(named_by_binary_only(&["compass".to_string()]), None);
+    }
+
+    #[test]
+    fn named_by_binary_only_matches_herdr() {
+        assert_eq!(named_by_binary_only(&["herdr".to_string()]), Some("herdr"));
+        assert_eq!(named_by_binary_only(&["/usr/local/bin/herdr".to_string()]), Some("herdr"));
+    }
+
+    #[test]
+    fn named_by_binary_only_none_for_unrelated_commands() {
+        assert_eq!(named_by_binary_only(&["bash".to_string()]), None);
+        assert_eq!(named_by_binary_only(&[]), None);
+    }
+
+    #[test]
+    fn derive_session_name_under_names_an_opencode_pane_after_the_tool() {
+        let dir = std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id() + 10));
+        let cmd = vec!["opencode".to_string()];
+        assert_eq!(derive_session_name_under(&cmd, "/whatever", &dir), Some("opencode".to_string()));
     }
 }
