@@ -605,10 +605,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "dimux"
+name = "dimax"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "libc",
  "portable-pty",

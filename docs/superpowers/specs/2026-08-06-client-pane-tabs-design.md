@@ -37,10 +37,10 @@ No change to `Response`/`Event` shapes beyond `ClientPane`'s own field rename �
 
 ## CLI Surface
 
-- `dimux client bind <addr> <target>` — unchanged meaning (replace the active tab).
-- `dimux client add-tab <addr> <target>` — new; wraps `ClientAddTab`.
-- `dimux client unbind <addr>` / `dimux client close <addr>` — unchanged meaning, now phrased against "the active tab" / "the whole leaf" respectively, per the field rename.
-- `dimux client ls` — its one-line-per-pane output format changes from `id  name  bound-server-pane-or-dash` to `id  name  active-tab-or-dash  tab-count`, e.g. `<id>  editor  <server-pane-id>  2/3`. (`format_client_pane_line` is the one function to update; its existing tests get updated alongside.)
+- `dimax client bind <addr> <target>` — unchanged meaning (replace the active tab).
+- `dimax client add-tab <addr> <target>` — new; wraps `ClientAddTab`.
+- `dimax client unbind <addr>` / `dimax client close <addr>` — unchanged meaning, now phrased against "the active tab" / "the whole leaf" respectively, per the field rename.
+- `dimax client ls` — its one-line-per-pane output format changes from `id  name  bound-server-pane-or-dash` to `id  name  active-tab-or-dash  tab-count`, e.g. `<id>  editor  <server-pane-id>  2/3`. (`format_client_pane_line` is the one function to update; its existing tests get updated alongside.)
 
 No CLI surface for cycling — cycling is an interactive, momentary action with no scripting use case that a picker-through-a-list can't already serve (`add-tab`/`bind` let a script set up whatever tab layout it wants; which one happens to be "active" when a human is looking at the TUI isn't something worth a CLI verb for).
 
@@ -67,7 +67,7 @@ No CLI surface for cycling — cycling is an interactive, momentary action with 
 - Independent resizing/dragging of tabs — a leaf's tabs all share the leaf's one rect; only splits (the existing mechanism) create independently-resizable regions.
 - Persisting which tab was active across a daemon restart — tabs live in `SplitTree`, which (like every other piece of `State` except pinned directories) doesn't survive a restart today, and this doesn't change that.
 - A CLI verb for cycling (see "CLI Surface" above).
-- Renaming individual tabs independently of the server-pane's own name — a tab's displayed name is always its bound server-pane's name (or short id), exactly like today's single-binding leaves; `dimux server rename` already covers naming a server-pane.
+- Renaming individual tabs independently of the server-pane's own name — a tab's displayed name is always its bound server-pane's name (or short id), exactly like today's single-binding leaves; `dimax server rename` already covers naming a server-pane.
 
 ## Testing
 

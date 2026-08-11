@@ -17,7 +17,7 @@ pub mod session_name;
 use crate::protocol::{
     Cell, ForegroundProcessInfo, GridSnapshot, ServerPaneId, ServerPaneStatus, Size, WorkspaceId,
 };
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtyPair, PtySize};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::os::fd::RawFd;
 use std::sync::{Arc, Mutex};
@@ -160,7 +160,7 @@ impl ServerPane {
                 dpi: 0,
             },
             Arc::new(Config),
-            "dimux",
+            "dimax",
             env!("CARGO_PKG_VERSION"),
             Box::new(writer.clone()),
         );
@@ -270,7 +270,13 @@ impl ServerPane {
             let _ = events.send(ServerPaneEvent::Died(id));
         });
 
-        Ok(Self { id, name, owner_workspace, short_id, inner })
+        Ok(Self {
+            id,
+            name,
+            owner_workspace,
+            short_id,
+            inner,
+        })
     }
 
     pub fn id(&self) -> ServerPaneId {
@@ -315,13 +321,15 @@ impl ServerPane {
     pub fn scrollback_rows(&self) -> usize {
         let guard = self.inner.lock().unwrap();
         let screen = guard.terminal.screen();
-        screen.scrollback_rows().saturating_sub(screen.physical_rows)
+        screen
+            .scrollback_rows()
+            .saturating_sub(screen.physical_rows)
     }
 
     /// A live OS-level snapshot of this PTY's foreground process — see
     /// design doc "Attach menu identification columns": queried fresh on
     /// every call rather than tracked/cached, since callers (the attach
-    /// menu, `dimux server ls`) already re-fetch on their own cadence.
+    /// menu, `dimax server ls`) already re-fetch on their own cadence.
     ///
     /// `MasterPty::process_group_leader` (already provided by
     /// `portable-pty`, no unsafe code needed here) gives the PID of
@@ -389,7 +397,11 @@ impl ServerPane {
                 .with_cmd(sysinfo::UpdateKind::Always),
         );
         let process = system.process(sysinfo_pid)?;
-        let cmd: Vec<String> = process.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect();
+        let cmd: Vec<String> = process
+            .cmd()
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
         let cwd = process.cwd()?.display().to_string();
         session_name::derive_session_name(&cmd, &cwd)
     }
@@ -444,7 +456,13 @@ impl ServerPane {
         let mut lines: Vec<String> = snapshot
             .lines
             .iter()
-            .map(|row| row.iter().map(|c| c.text.as_str()).collect::<String>().trim_end().to_string())
+            .map(|row| {
+                row.iter()
+                    .map(|c| c.text.as_str())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
             .collect();
         while lines.last().is_some_and(|l| l.is_empty()) {
             lines.pop();
@@ -514,8 +532,11 @@ fn set_nonblocking(fd: RawFd, nonblocking: bool) {
         if flags < 0 {
             return;
         }
-        let new_flags =
-            if nonblocking { flags | libc::O_NONBLOCK } else { flags & !libc::O_NONBLOCK };
+        let new_flags = if nonblocking {
+            flags | libc::O_NONBLOCK
+        } else {
+            flags & !libc::O_NONBLOCK
+        };
         libc::fcntl(fd, libc::F_SETFL, new_flags);
     }
 }
@@ -617,7 +638,10 @@ mod tests {
     /// Block on `rx` (via `blocking_recv`, which tokio explicitly
     /// supports outside an async context) until `pred` is true or the
     /// channel closes because the background reader thread exited.
-    fn wait_until<F: FnMut() -> bool>(rx: &mut UnboundedReceiver<ServerPaneEvent>, mut pred: F) -> bool {
+    fn wait_until<F: FnMut() -> bool>(
+        rx: &mut UnboundedReceiver<ServerPaneEvent>,
+        mut pred: F,
+    ) -> bool {
         if pred() {
             return true;
         }
@@ -636,7 +660,7 @@ mod tests {
         let pane = ServerPane::spawn(
             id,
             None,
-            Some("printf hello-dimux".to_string()),
+            Some("printf hello-dimax".to_string()),
             None,
             Size { rows: 24, cols: 80 },
             tx,
@@ -645,8 +669,8 @@ mod tests {
         )
         .unwrap();
 
-        let found = wait_until(&mut rx, || snapshot_text(&pane).contains("hello-dimux"));
-        assert!(found, "expected snapshot to contain \"hello-dimux\"");
+        let found = wait_until(&mut rx, || snapshot_text(&pane).contains("hello-dimax"));
+        assert!(found, "expected snapshot to contain \"hello-dimax\"");
 
         // A `printf` with no further work should exit near-instantly;
         // poll for `Dead` with a generous timeout rather than assume a
@@ -677,7 +701,10 @@ mod tests {
         pane.write_input(b"ping\n").unwrap();
 
         let found = wait_until(&mut rx, || snapshot_text(&pane).contains("ping"));
-        assert!(found, "expected snapshot to contain \"ping\" after write_input");
+        assert!(
+            found,
+            "expected snapshot to contain \"ping\" after write_input"
+        );
 
         pane.kill().unwrap();
         assert_eq!(pane.status(), ServerPaneStatus::Dead);
@@ -703,10 +730,13 @@ mod tests {
         assert!(found, "expected snapshot_text to contain \"hi\"");
 
         let text = pane.snapshot_text();
-        assert_eq!(text, "hi", "should be exactly the one non-blank row, right-trimmed, with no trailing blank rows");
+        assert_eq!(
+            text, "hi",
+            "should be exactly the one non-blank row, right-trimmed, with no trailing blank rows"
+        );
     }
 
-    /// Regression test for the "dimux hangs often" investigation: a
+    /// Regression test for the "dimax hangs often" investigation: a
     /// rapidly-flooding pane (`yes`) must not fire a `Changed` event per
     /// individual PTY read. Measured before this test existed: an
     /// unbatched reader thread produced ~2,584 events/sec for `yes`,
@@ -722,8 +752,17 @@ mod tests {
     fn flooding_pane_batches_changed_events_instead_of_firing_per_read() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let id = Uuid::new_v4();
-        let pane = ServerPane::spawn(id, None, Some("yes".to_string()), None, Size { rows: 24, cols: 80 }, tx, None, "test-short-id".to_string())
-            .unwrap();
+        let pane = ServerPane::spawn(
+            id,
+            None,
+            Some("yes".to_string()),
+            None,
+            Size { rows: 24, cols: 80 },
+            tx,
+            None,
+            "test-short-id".to_string(),
+        )
+        .unwrap();
 
         // Let `yes` actually get its output flowing before measuring, so
         // the count isn't diluted by process startup time.
@@ -757,8 +796,17 @@ mod tests {
     fn batching_preserves_all_output_across_multiple_writes() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let id = Uuid::new_v4();
-        let pane =
-            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx, None, "test-short-id".to_string()).unwrap();
+        let pane = ServerPane::spawn(
+            id,
+            None,
+            Some("cat".to_string()),
+            None,
+            Size { rows: 24, cols: 80 },
+            tx,
+            None,
+            "test-short-id".to_string(),
+        )
+        .unwrap();
 
         for line in ["alpha", "bravo", "charlie"] {
             pane.write_input(format!("{line}\n").as_bytes()).unwrap();
@@ -768,10 +816,11 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
-        let found =
-            wait_until(&mut rx, || snapshot_text(&pane).contains("alpha")
+        let found = wait_until(&mut rx, || {
+            snapshot_text(&pane).contains("alpha")
                 && snapshot_text(&pane).contains("bravo")
-                && snapshot_text(&pane).contains("charlie"));
+                && snapshot_text(&pane).contains("charlie")
+        });
         assert!(found, "expected all three writes to appear in the snapshot");
 
         let text = snapshot_text(&pane);
@@ -838,8 +887,17 @@ mod tests {
     fn scrollback_rows_is_zero_for_a_fresh_pane() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let id = Uuid::new_v4();
-        let pane =
-            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx, None, "test-short-id".to_string()).unwrap();
+        let pane = ServerPane::spawn(
+            id,
+            None,
+            Some("cat".to_string()),
+            None,
+            Size { rows: 24, cols: 80 },
+            tx,
+            None,
+            "test-short-id".to_string(),
+        )
+        .unwrap();
         assert_eq!(pane.scrollback_rows(), 0);
     }
 
@@ -849,8 +907,17 @@ mod tests {
         let id = Uuid::new_v4();
         // A small 5-row pane makes it easy to scroll content off the
         // top with a modest number of printed lines.
-        let pane =
-            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 5, cols: 80 }, tx, None, "test-short-id".to_string()).unwrap();
+        let pane = ServerPane::spawn(
+            id,
+            None,
+            Some("cat".to_string()),
+            None,
+            Size { rows: 5, cols: 80 },
+            tx,
+            None,
+            "test-short-id".to_string(),
+        )
+        .unwrap();
 
         // Write enough lines to scroll "first-line" off the top of a
         // 5-row screen and into scrollback.
@@ -866,9 +933,15 @@ mod tests {
                 .join("\n")
                 .contains("line-19")
         });
-        assert!(found, "expected the live view to eventually show the last written line");
+        assert!(
+            found,
+            "expected the live view to eventually show the last written line"
+        );
 
-        assert!(pane.scrollback_rows() > 0, "expected some scrollback to have accumulated");
+        assert!(
+            pane.scrollback_rows() > 0,
+            "expected some scrollback to have accumulated"
+        );
 
         // At offset 0 (live), the most recent content should be
         // visible; at a nonzero offset, it should NOT be (we've
@@ -898,8 +971,17 @@ mod tests {
     fn foreground_info_reports_the_running_shell_command() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let id = Uuid::new_v4();
-        let pane = ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx, None, "test-short-id".to_string())
-            .unwrap();
+        let pane = ServerPane::spawn(
+            id,
+            None,
+            Some("cat".to_string()),
+            None,
+            Size { rows: 24, cols: 80 },
+            tx,
+            None,
+            "test-short-id".to_string(),
+        )
+        .unwrap();
 
         // Wait for the shell to actually exec `cat` (there's a brief
         // window right after spawn where the foreground process is still
@@ -910,7 +992,9 @@ mod tests {
         // directly with a short sleep instead.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut info = pane.foreground_info();
-        while info.as_ref().is_none_or(|i| i.process_name != "cat") && std::time::Instant::now() < deadline {
+        while info.as_ref().is_none_or(|i| i.process_name != "cat")
+            && std::time::Instant::now() < deadline
+        {
             std::thread::sleep(std::time::Duration::from_millis(20));
             info = pane.foreground_info();
         }
@@ -931,8 +1015,17 @@ mod tests {
     fn foreground_info_is_none_after_kill() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let id = Uuid::new_v4();
-        let mut pane =
-            ServerPane::spawn(id, None, Some("cat".to_string()), None, Size { rows: 24, cols: 80 }, tx, None, "test-short-id".to_string()).unwrap();
+        let mut pane = ServerPane::spawn(
+            id,
+            None,
+            Some("cat".to_string()),
+            None,
+            Size { rows: 24, cols: 80 },
+            tx,
+            None,
+            "test-short-id".to_string(),
+        )
+        .unwrap();
         pane.kill().unwrap();
         // The process group leader is gone once killed; there's nothing
         // left to query.

@@ -56,7 +56,7 @@ impl ClientPane {
 }
 
 /// A binary split tree of client-panes within one workspace.
-/// See docs/superpowers/specs/2026-07-30-dimux-design.md "Data model reference".
+/// See docs/superpowers/specs/2026-07-30-dimax-design.md "Data model reference".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SplitTree {
     Leaf(ClientPane),
@@ -140,7 +140,13 @@ impl SplitTree {
         match self {
             SplitTree::Leaf(p) if p.id == target => Ok(None),
             SplitTree::Leaf(_) => anyhow::bail!("client-pane {target} not found"),
-            SplitTree::Split { id, dir, ratio, a, b } => {
+            SplitTree::Split {
+                id,
+                dir,
+                ratio,
+                a,
+                b,
+            } => {
                 let a_has = a.find(target).is_some();
                 let b_has = b.find(target).is_some();
                 if a_has {
@@ -192,7 +198,9 @@ impl SplitTree {
     pub fn resize_split(&mut self, target: SplitId, new_ratio: f32) -> anyhow::Result<()> {
         match self {
             SplitTree::Leaf(_) => anyhow::bail!("split {target} not found"),
-            SplitTree::Split { id, ratio, a, b, .. } if *id == target => {
+            SplitTree::Split {
+                id, ratio, a, b, ..
+            } if *id == target => {
                 *ratio = new_ratio.clamp(0.05, 0.95);
                 Ok(())
             }
@@ -241,7 +249,7 @@ pub struct ServerPaneInfo {
     /// at `ServerSpawn` time from the request's own `workspace` field and
     /// never changed afterward — binding/adding this pane as a tab into a
     /// *different* workspace's client-pane does not transfer ownership.
-    /// `None` for a pane spawned with no workspace context (e.g. `dimux
+    /// `None` for a pane spawned with no workspace context (e.g. `dimax
     /// server spawn` from the CLI) — an "orphan" pane, always shown in
     /// every workspace's attach menu regardless of the
     /// same-workspace-only filter (see `tui::filter_servers_for_menu`).
@@ -319,7 +327,7 @@ pub enum Request {
         /// Same name-or-number-or-id addressing as `ClientSpawn`'s
         /// `workspace` field, but optional: `Some` records this pane's
         /// `owner_workspace` (every TUI-driven spawn passes the current
-        /// workspace); `None` leaves it unowned/orphaned (e.g. `dimux
+        /// workspace); `None` leaves it unowned/orphaned (e.g. `dimax
         /// server spawn` from the CLI, which has no workspace context).
         /// Unlike `ClientSpawn`, a `Some` value here never creates a
         /// workspace that doesn't already exist -- there is no
@@ -501,7 +509,9 @@ pub enum Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
     Ack,
-    Error { message: String },
+    Error {
+        message: String,
+    },
     ServerPane(ServerPaneInfo),
     ServerPaneList(Vec<ServerPaneInfo>),
     /// Reply to `PinnedDirsList` (and to `ToggleDirectoryPin`, so a
@@ -510,9 +520,17 @@ pub enum Response {
     /// pin order, earliest-pinned first.
     PinnedDirsList(Vec<String>),
     /// Reply to `ConsumeShellFallback`.
-    ShellFallback { available: bool },
-    ClientPaneCreated { workspace: WorkspaceId, pane: ClientPaneId },
-    ClientPaneList { workspace: WorkspaceId, panes: Vec<ClientPane> },
+    ShellFallback {
+        available: bool,
+    },
+    ClientPaneCreated {
+        workspace: WorkspaceId,
+        pane: ClientPaneId,
+    },
+    ClientPaneList {
+        workspace: WorkspaceId,
+        panes: Vec<ClientPane>,
+    },
     /// Full state handed back on `Subscribe`: current layout plus a grid
     /// snapshot for every server-pane bound within the workspace.
     Snapshot {
@@ -531,9 +549,16 @@ pub enum Response {
 /// Pushed to subscribed connections outside the request/response cycle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Event {
-    LayoutDelta { workspace: WorkspaceId, tree: Option<SplitTree> },
-    GridDelta { snapshot: GridSnapshot },
-    ServerPaneDied { server_pane: ServerPaneId },
+    LayoutDelta {
+        workspace: WorkspaceId,
+        tree: Option<SplitTree>,
+    },
+    GridDelta {
+        snapshot: GridSnapshot,
+    },
+    ServerPaneDied {
+        server_pane: ServerPaneId,
+    },
 }
 
 /// Frames sent daemon -> client. Distinguishes a reply to a specific
@@ -550,10 +575,10 @@ pub enum ServerMessage {
 /// per-user path under `/tmp` (mirrors tmux's own fallback behavior).
 pub fn socket_path() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(dir).join("dimux.sock");
+        return PathBuf::from(dir).join("dimax.sock");
     }
     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
-    PathBuf::from(format!("/tmp/dimux-{user}.sock"))
+    PathBuf::from(format!("/tmp/dimax-{user}.sock"))
 }
 
 /// Length-prefixed JSON framing used for every message on the socket:
@@ -562,7 +587,7 @@ pub fn socket_path() -> PathBuf {
 /// wire format without duplicating it.
 pub mod framing {
     use anyhow::Result;
-    use serde::{de::DeserializeOwned, Serialize};
+    use serde::{Serialize, de::DeserializeOwned};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     pub async fn write_frame<W, T>(w: &mut W, msg: &T) -> Result<()>
@@ -596,7 +621,13 @@ mod tests {
     use super::*;
 
     fn pane(id: ClientPaneId) -> ClientPane {
-        ClientPane { id, name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() }
+        ClientPane {
+            id,
+            name: None,
+            tabs: vec![],
+            active_tab: 0,
+            short_id: "aa".to_string(),
+        }
     }
 
     #[test]
@@ -615,7 +646,10 @@ mod tests {
         let a = Uuid::new_v4();
         let mut tree = SplitTree::Leaf(pane(a));
         let missing = Uuid::new_v4();
-        assert!(tree.split_leaf(missing, SplitDir::Horizontal, pane(Uuid::new_v4())).is_err());
+        assert!(
+            tree.split_leaf(missing, SplitDir::Horizontal, pane(Uuid::new_v4()))
+                .is_err()
+        );
     }
 
     #[test]

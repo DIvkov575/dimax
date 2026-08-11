@@ -1,15 +1,15 @@
-# dimux — design
+# dimax — design
 
 ## Summary
 
-`dimux` is a tmux-style, client/server terminal multiplexer written in Rust.
+`dimax` is a tmux-style, client/server terminal multiplexer written in Rust.
 A background daemon owns two pools of global, shared state:
 
 - **server-panes** — PTY-backed processes (a shell, an editor, whatever).
 - **workspaces** — named/numbered groups of **client-panes**, arranged as a
   split tree. Each client-pane binds to zero or one server-pane by id.
 
-Both pools are live-synced across every attached frontend (a `dimux attach`
+Both pools are live-synced across every attached frontend (a `dimax attach`
 process, normally run inside a Kitty window) — the same way tmux mirrors a
 session's window layout across multiple attached terminals. A single
 server-pane can be bound into many client-panes at once, even across
@@ -19,7 +19,7 @@ and CLI-triggered changes appear live in any frontend currently viewing the
 affected workspace.
 
 `name` fields on both server-panes and client-panes are just a human-legible
-alias alongside their `id` — convenient for CLI reference (`dimux client
+alias alongside their `id` — convenient for CLI reference (`dimax client
 close dev/editor`) and for the picker UI. They are not a saved/loadable
 config mechanism; there is no separate "save layout" feature — the daemon's
 live state *is* the only persisted-while-running layout, and every frontend
@@ -29,8 +29,9 @@ sees the same thing.
 
 - No named/saved layout snapshots or config profiles (rejected during design
   — see "Sync scope" decision below; live sync replaces this).
-- No support for terminal emulators other than Kitty in v1 (Cmd-key
-  forwarding depends on Kitty's `map` remap system).
+- Portable Ctrl-Space prefix bindings work without terminal-specific
+  configuration. Kitty remains an optional integration for Cmd-key
+  forwarding through its `map` remap system.
 - No cross-machine/remote attach (mosh-style) — local Unix socket only.
 - No persistence across daemon restarts — server-panes and workspaces are
   in-memory; a daemon restart loses all panes (matches tmux without
@@ -38,11 +39,11 @@ sees the same thing.
 
 ## Architecture
 
-Single binary, `dimux`, three roles over one protocol:
+Single binary, `dimax`, three roles over one protocol:
 
 1. **Daemon** — long-lived background process, one per user, listening on a
-   Unix domain socket (`$XDG_RUNTIME_DIR/dimux.sock`, falling back to
-   `/tmp/dimux-$UID.sock` if `XDG_RUNTIME_DIR` is unset). Owns all state:
+   Unix domain socket (`$XDG_RUNTIME_DIR/dimax.sock`, falling back to
+   `/tmp/dimax-$UID.sock` if `XDG_RUNTIME_DIR` is unset). Owns all state:
 
    - **Server-pane pool**: `{id, name, state, size}` where `state` is
      `Running(portable_pty::Child handle, wezterm_term::Terminal grid)` or
@@ -56,14 +57,14 @@ Single binary, `dimux`, three roles over one protocol:
    - A registry of connected frontends, each tagged with the workspace it's
      currently viewing (or none, right after connecting).
 
-2. **Frontend** (`dimux attach`) — holds no durable state of its own. On
+2. **Frontend** (`dimax attach`) — holds no durable state of its own. On
    attach: lists workspaces, subscribes to one (see Protocol below), renders
    via `ratatui`, applies deltas as they stream in. Translates Kitty-forwarded
    Cmd-chords and normal keystrokes into either local view changes (switch
    workspace, move focus — pure client-side) or commands sent to the daemon
    (split, close, rebind, spawn — same command path the CLI uses).
 
-3. **CLI** (`dimux server ...`, `dimux client ...`) — connects, sends one
+3. **CLI** (`dimax server ...`, `dimax client ...`) — connects, sends one
    command, prints the result, exits. Uses the exact same request types the
    frontend sends internally; the daemon does not distinguish CLI callers
    from frontend callers except that frontends additionally hold a live
@@ -77,7 +78,7 @@ created them, with the CLI addressing panes as
 splitting is that a script or a second window can reshape a layout and see
 it reflected wherever that workspace is open — per-frontend ownership would
 mean the CLI could only affect one specific window's private copy, and
-"loading dimux from a new window" would show nothing shared by default. Global
+"loading dimax from a new window" would show nothing shared by default. Global
 workspaces make `<workspace>/<pane>` a complete, frontend-independent address,
 and dropping the frontend segment simplifies every CLI command.
 
@@ -85,7 +86,7 @@ and dropping the frontend segment simplifies every CLI command.
 
 Length-prefixed JSON frames (`u32` little-endian length + UTF-8 JSON body)
 over the Unix socket. JSON chosen over a binary format for debuggability
-(`socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/dimux.sock` + manual frames while
+(`socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/dimax.sock` + manual frames while
 developing) at negligible cost for single-machine, human-scale pane counts.
 
 ### Subscription model
@@ -142,22 +143,22 @@ no existing workspace creates one, empty, on the fly.
 ## CLI surface
 
 ```
-dimux attach                                   # launch TUI, auto-start daemon if needed
+dimax attach                                   # launch TUI, auto-start daemon if needed
 
-dimux server spawn  <name> [--cmd <shell-cmd>] # default $SHELL if --cmd omitted
-dimux server kill   <name-or-id>
-dimux server rename <name-or-id> <new-name>
-dimux server ls
+dimax server spawn  <name> [--cmd <shell-cmd>] # default $SHELL if --cmd omitted
+dimax server kill   <name-or-id>
+dimax server rename <name-or-id> <new-name>
+dimax server ls
 
-dimux client spawn   <workspace> [--split <pane-id> --dir h|v] [--bind <server-name-or-id>]
-dimux client close   <workspace>/<pane-id>       # closes the client-pane; bound server-pane keeps running
-dimux client rename  <workspace>/<pane-id> <new-name>
-dimux client bind    <workspace>/<pane-id> <server-name-or-id>
-dimux client unbind  <workspace>/<pane-id>       # detaches; bound server-pane keeps running
-dimux client ls      [workspace]                 # omit workspace to list all
+dimax client spawn   <workspace> [--split <pane-id> --dir h|v] [--bind <server-name-or-id>]
+dimax client close   <workspace>/<pane-id>       # closes the client-pane; bound server-pane keeps running
+dimax client rename  <workspace>/<pane-id> <new-name>
+dimax client bind    <workspace>/<pane-id> <server-name-or-id>
+dimax client unbind  <workspace>/<pane-id>       # detaches; bound server-pane keeps running
+dimax client ls      [workspace]                 # omit workspace to list all
 ```
 
-`dimux client spawn` with no `--split` creates a new top-level leaf in an
+`dimax client spawn` with no `--split` creates a new top-level leaf in an
 otherwise-empty workspace (error if the workspace already has panes and no
 split point was given — ambiguous where to put it). Every `spawn`/`bind`
 targeting a workspace some frontend is currently subscribed to results in
@@ -166,20 +167,28 @@ the CLI, the feature that motivated dropping per-frontend layout state).
 
 ## Default keybinds (TUI)
 
-Forwarded from Kitty via its `map` remap config (each Cmd-chord bound to
-`send_text` with a distinct escape sequence dimux's input parser recognizes).
-Setup docs will include the exact `kitty.conf` snippet.
+The frontend supports two independently selectable input layers:
 
-| Chord | Action |
-|---|---|
-| `cmd-1`..`cmd-9` | switch to workspace N (create if absent) |
-| `cmd-d` | split focused client-pane vertically, spawn a fresh server-pane and bind it into the new half |
-| `cmd-shift-d` | split focused client-pane horizontally, spawn a fresh server-pane and bind it into the new half |
-| `cmd-w` | close focused client-pane (server-pane keeps running) |
-| `cmd-shift-w` | kill focused client-pane's bound server-pane |
-| `cmd-shift-z` | detach focused client-pane (server-pane keeps running), open attach menu to pick its replacement |
-| `cmd-h/j/k/l` | move focus between client-panes |
-| *(mouse drag)* | drag a divider to resize the two panes it separates — no keybind, drag-only |
+- Portable bindings use Ctrl-Space as a prefix and require no terminal
+  configuration.
+- Kitty bindings use `map ... send_text` to forward Cmd chords as private
+  APC escape sequences.
+
+`dimax keys install --mode portable|kitty|both` selects the active layers.
+Kitty changes are explicit, idempotent, backed up, and removable with
+`dimax keys uninstall`.
+
+| Portable | Kitty | Action |
+|---|---|---|
+| `prefix 1`..`prefix 9` | `cmd-1`..`cmd-9` | switch to workspace N (create if absent) |
+| `prefix s 1`..`prefix s 9` | `cmd-alt-1`..`cmd-alt-9` | bind the focused pane to existing session N |
+| `prefix d` | `cmd-d` | split focused client-pane vertically, spawn a fresh server-pane and bind it into the new half |
+| `prefix D` | `cmd-shift-d` | split focused client-pane horizontally, spawn a fresh server-pane and bind it into the new half |
+| `prefix w` | `cmd-w` | close focused client-pane (server-pane keeps running) |
+| `prefix W` | `cmd-shift-w` | kill focused client-pane's bound server-pane |
+| `prefix Z` | `cmd-shift-z` | detach focused client-pane (server-pane keeps running), open attach menu to pick its replacement |
+| `prefix h/j/k/l` | `cmd-h/j/k/l` | move focus between client-panes |
+| *(mouse drag)* | *(mouse drag)* | drag a divider to resize the two panes it separates — no keybind, drag-only |
 
 Superseded: an earlier revision of this doc specified a `cmd-p` chord
 opening a picker overlay (choose an existing server-pane, or "spawn new")
@@ -189,7 +198,7 @@ shell" shortcut covers the common case with one keystroke instead of two.
 The picker's other capability — binding a client-pane to an *existing*
 server-pane, e.g. to display one shell in two places — now has two paths:
 `cmd-shift-z` (detach the focused pane, then pick a replacement from a
-rebuilt attach menu) in the TUI, or `dimux client bind <workspace>/<pane>
+rebuilt attach menu) in the TUI, or `dimax client bind <workspace>/<pane>
 <server-name-or-id>` directly from the CLI without detaching first.
 
 ### Attach menu identification columns
@@ -199,11 +208,11 @@ non-selectable header lines (one per distinct `cwd`, with a synthetic
 "Unknown" group sorted last for panes with no resolvable `cwd` —
 see docs/superpowers/specs/2026-08-03-attach-menu-groups-and-shortcuts-design.md).
 Each row then shows four columns: `name | process | id | status` (`cwd`
-moved to the group header, no longer repeated per row). `dimux server
+moved to the group header, no longer repeated per row). `dimax server
 ls`'s CLI output is unaffected — it still lists all five fields per row;
 only the TUI attach menu groups/drops columns.
 
-`name` is the user-given name (via `dimux server rename`), falling back
+`name` is the user-given name (via `dimax server rename`), falling back
 to an 8-character id prefix if unset — the same fallback
 `render::short_id` uses elsewhere.
 `cwd` and `process` come from `ServerPaneInfo.foreground: Option<
@@ -257,8 +266,8 @@ button-event (`?1002h`) mouse tracking plus SGR extended coordinates
 revision used `ratatui::crossterm::event::EnableMouseCapture`, which
 enables all four unconditionally; under `?1003h`, moving the mouse over
 the window for any reason — not just dragging a divider — generated a
-mouse escape sequence dimux's parser didn't recognize (a bare-movement
-event encodes as SGR button number 3, which dimux has no binding for),
+mouse escape sequence dimax's parser didn't recognize (a bare-movement
+event encodes as SGR button number 3, which dimax has no binding for),
 and an unrecognized mouse byte used to fall through to the keyboard-chord
 parser, which also didn't recognize it, and wrote the raw escape sequence
 into the focused pane as literal text — the "random garbage characters"
@@ -272,7 +281,7 @@ narrower mode request still can't leak into a pane as text.
 
 ### PTY read batching
 
-A second "dimux hangs often" investigation, separate from the mouse
+A second "dimax hangs often" investigation, separate from the mouse
 report above, traced a real freeze to a different cause: the daemon's
 one global state lock (see "Concurrency model" at the top of this doc)
 being held not just during request handling but during PTY-output
@@ -321,7 +330,7 @@ Two independent fixes, at two different layers:
   tmux-style.
 - A server-pane's underlying process exiting transitions it to `Dead` state
   (last grid snapshot retained, rendered greyed-out in any client-pane still
-  bound to it) rather than disappearing. Only `dimux server kill` (or the
+  bound to it) rather than disappearing. Only `dimax server kill` (or the
   daemon exiting) removes it from the pool.
 - If a client-pane's bound server-pane is killed while displayed, that
   client-pane switches to an "unbound" placeholder (not auto-closed, not
@@ -357,14 +366,14 @@ Single Rust crate to start (split into a workspace of multiple crates later
 only if/when a real boundary emerges — no speculative split now):
 
 ```
-dimux/
+dimax/
   src/
     main.rs        # subcommand dispatch: attach / server / client
     daemon/        # server-pane pool, workspace state, socket listener
     protocol.rs     # wire types (requests/responses/events), framing
     term/           # wezterm-term + portable-pty glue (spawn, feed, snapshot)
     tui/            # ratatui compositor, keybind parsing, picker overlay
-    cli.rs          # `dimux server`/`dimux client` command implementations
+    cli.rs          # `dimax server`/`dimax client` command implementations
   Cargo.toml
   docs/superpowers/specs/
 ```

@@ -65,7 +65,10 @@ fn derive_session_name_under(cmd: &[String], cwd: &str, home: &Path) -> Option<S
 /// transcript-derived title the way Claude Code and Codex do.
 fn named_by_binary_only(cmd: &[String]) -> Option<&'static str> {
     let arg0 = cmd.first()?;
-    let file_name = Path::new(arg0).file_name()?.to_string_lossy().to_lowercase();
+    let file_name = Path::new(arg0)
+        .file_name()?
+        .to_string_lossy()
+        .to_lowercase();
     if file_name.contains("opencode") {
         return Some("opencode");
     }
@@ -152,7 +155,9 @@ fn claude_title_for_session(home: &Path, session_id: &str) -> Option<String> {
 /// single trailing field would be wasteful on every attach-menu open.
 fn last_matching_json_field(path: &Path, type_value: &str, field_name: &str) -> Option<String> {
     for line in ReverseLineReader::new(path)?.take(MAX_LINES_SCANNED_FROM_END) {
-        let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
         if obj.get("type").and_then(|v| v.as_str()) != Some(type_value) {
             continue;
         }
@@ -203,7 +208,11 @@ impl ReverseLineReader {
     fn new(path: &Path) -> Option<Self> {
         let file = std::fs::File::open(path).ok()?;
         let pos = file.metadata().ok()?.len();
-        Some(Self { file, pos, buf: Vec::new() })
+        Some(Self {
+            file,
+            pos,
+            buf: Vec::new(),
+        })
     }
 
     /// Pull one more chunk from `file` immediately before `pos`,
@@ -217,7 +226,9 @@ impl ReverseLineReader {
         let chunk_len = REVERSE_READ_CHUNK.min(self.pos as usize);
         let start = self.pos - chunk_len as u64;
         let mut chunk = vec![0u8; chunk_len];
-        if self.file.seek(SeekFrom::Start(start)).is_err() || self.file.read_exact(&mut chunk).is_err() {
+        if self.file.seek(SeekFrom::Start(start)).is_err()
+            || self.file.read_exact(&mut chunk).is_err()
+        {
             return false;
         }
         chunk.extend_from_slice(&self.buf);
@@ -274,7 +285,9 @@ fn find_codex_transcript(home: &Path, cwd: &str) -> Option<PathBuf> {
 /// Codex rollouts live under `sessions/<year>/<month>/<day>/*.jsonl`, a
 /// depth not worth hard-coding -- this just walks whatever's there.
 fn visit_jsonl_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
         if path.is_dir() {
@@ -290,7 +303,9 @@ fn visit_jsonl_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// this is always the very first line, so no backward scan is needed.
 fn rollout_cwd(path: &Path) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
-    let first_line = std::io::BufRead::lines(std::io::BufReader::new(file)).next()?.ok()?;
+    let first_line = std::io::BufRead::lines(std::io::BufReader::new(file))
+        .next()?
+        .ok()?;
     let obj: serde_json::Value = serde_json::from_str(&first_line).ok()?;
     obj.get("payload")?.get("cwd")?.as_str().map(str::to_string)
 }
@@ -315,7 +330,9 @@ fn first_codex_user_message(path: &Path) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
     for line in std::io::BufRead::lines(std::io::BufReader::new(file)) {
         let Ok(line) = line else { continue };
-        let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
         if obj.get("type").and_then(|v| v.as_str()) != Some("event_msg") {
             continue;
         }
@@ -366,31 +383,48 @@ mod tests {
     #[test]
     fn is_codex_invocation_matches_plain_and_versioned_paths() {
         assert!(is_codex_invocation(&["codex".to_string()]));
-        assert!(is_codex_invocation(&["/Users/dev/.toolbox/tools/codex/0.146.0/codex".to_string()]));
+        assert!(is_codex_invocation(&[
+            "/Users/dev/.toolbox/tools/codex/0.146.0/codex".to_string()
+        ]));
         assert!(!is_codex_invocation(&["zsh".to_string()]));
     }
 
     #[test]
     fn claude_session_id_reads_session_id_flag() {
-        let cmd = vec!["claude".to_string(), "--session-id".to_string(), "abc-123".to_string()];
+        let cmd = vec![
+            "claude".to_string(),
+            "--session-id".to_string(),
+            "abc-123".to_string(),
+        ];
         assert_eq!(claude_session_id(&cmd), Some("abc-123".to_string()));
     }
 
     #[test]
     fn claude_session_id_reads_resume_flag() {
-        let cmd = vec!["claude".to_string(), "--resume".to_string(), "xyz-789".to_string()];
+        let cmd = vec![
+            "claude".to_string(),
+            "--resume".to_string(),
+            "xyz-789".to_string(),
+        ];
         assert_eq!(claude_session_id(&cmd), Some("xyz-789".to_string()));
     }
 
     #[test]
     fn claude_session_id_none_without_either_flag() {
-        let cmd = vec!["claude".to_string(), "--dangerously-skip-permissions".to_string()];
+        let cmd = vec![
+            "claude".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+        ];
         assert_eq!(claude_session_id(&cmd), None);
     }
 
     #[test]
     fn claude_session_id_none_for_non_claude_command() {
-        let cmd = vec!["bash".to_string(), "--session-id".to_string(), "abc".to_string()];
+        let cmd = vec![
+            "bash".to_string(),
+            "--session-id".to_string(),
+            "abc".to_string(),
+        ];
         assert_eq!(claude_session_id(&cmd), None);
     }
 
@@ -408,14 +442,19 @@ mod tests {
         // word from the original -- none chopped mid-word.
         let original_words: std::collections::HashSet<&str> = long.split_whitespace().collect();
         assert!(
-            result.split_whitespace().all(|w| original_words.contains(w)),
+            result
+                .split_whitespace()
+                .all(|w| original_words.contains(w)),
             "result {result:?} contains a word not present whole in the original"
         );
     }
 
     #[test]
     fn truncate_at_word_boundary_flattens_newlines() {
-        assert_eq!(truncate_at_word_boundary("line one\nline two", 40), "line one line two");
+        assert_eq!(
+            truncate_at_word_boundary("line one\nline two", 40),
+            "line one line two"
+        );
     }
 
     fn write_jsonl(path: &Path, lines: &[&str]) {
@@ -424,7 +463,8 @@ mod tests {
 
     #[test]
     fn last_matching_json_field_finds_the_most_recent_matching_line() {
-        let dir = std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("transcript.jsonl");
         write_jsonl(
@@ -445,7 +485,8 @@ mod tests {
 
     #[test]
     fn last_matching_json_field_none_when_no_line_matches() {
-        let dir = std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id() + 1));
+        let dir =
+            std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id() + 1));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("transcript.jsonl");
         write_jsonl(&path, &[r#"{"type":"other"}"#]);
@@ -458,7 +499,8 @@ mod tests {
         // Force at least two backward-read chunks by padding the file
         // well past REVERSE_READ_CHUNK, with the matching line at the
         // very start (i.e. the last chunk read).
-        let dir = std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id() + 2));
+        let dir =
+            std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id() + 2));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("transcript.jsonl");
         let padding_line = format!(r#"{{"type":"other","pad":"{}"}}"#, "x".repeat(200));
@@ -477,18 +519,23 @@ mod tests {
 
     #[test]
     fn reverse_line_reader_yields_lines_in_reverse_order() {
-        let dir = std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id() + 3));
+        let dir =
+            std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id() + 3));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("plain.txt");
         std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
         let lines: Vec<String> = ReverseLineReader::new(&path).unwrap().collect();
-        assert_eq!(lines, vec!["three".to_string(), "two".to_string(), "one".to_string()]);
+        assert_eq!(
+            lines,
+            vec!["three".to_string(), "two".to_string(), "one".to_string()]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn reverse_line_reader_handles_a_file_with_no_trailing_newline() {
-        let dir = std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id() + 4));
+        let dir =
+            std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id() + 4));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("no-trailing-newline.txt");
         std::fs::write(&path, "one\ntwo").unwrap();
@@ -499,7 +546,8 @@ mod tests {
 
     #[test]
     fn first_codex_user_message_skips_non_user_message_lines() {
-        let dir = std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id() + 5));
+        let dir =
+            std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id() + 5));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rollout.jsonl");
         write_jsonl(
@@ -511,24 +559,42 @@ mod tests {
                 r#"{"type":"event_msg","payload":{"type":"user_message","message":"a later message"}}"#,
             ],
         );
-        assert_eq!(first_codex_user_message(&path), Some("fix the bug in parser.rs".to_string()));
+        assert_eq!(
+            first_codex_user_message(&path),
+            Some("fix the bug in parser.rs".to_string())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn find_codex_transcript_matches_by_cwd_and_picks_most_recent() {
-        let dir = std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id() + 6));
-        let sessions_dir = dir.join(".codex").join("sessions").join("2026").join("01").join("01");
+        let dir =
+            std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id() + 6));
+        let sessions_dir = dir
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("01")
+            .join("01");
         std::fs::create_dir_all(&sessions_dir).unwrap();
 
         let other_cwd_path = sessions_dir.join("other-cwd.jsonl");
-        write_jsonl(&other_cwd_path, &[r#"{"type":"session_meta","payload":{"cwd":"/elsewhere"}}"#]);
+        write_jsonl(
+            &other_cwd_path,
+            &[r#"{"type":"session_meta","payload":{"cwd":"/elsewhere"}}"#],
+        );
 
         let older_path = sessions_dir.join("older.jsonl");
-        write_jsonl(&older_path, &[r#"{"type":"session_meta","payload":{"cwd":"/target"}}"#]);
+        write_jsonl(
+            &older_path,
+            &[r#"{"type":"session_meta","payload":{"cwd":"/target"}}"#],
+        );
 
         let newer_path = sessions_dir.join("newer.jsonl");
-        write_jsonl(&newer_path, &[r#"{"type":"session_meta","payload":{"cwd":"/target"}}"#]);
+        write_jsonl(
+            &newer_path,
+            &[r#"{"type":"session_meta","payload":{"cwd":"/target"}}"#],
+        );
 
         // Ensure a distinguishable, real mtime ordering rather than
         // relying on filesystem write timing to happen to differ.
@@ -537,7 +603,10 @@ mod tests {
             .unwrap()
             .set_modified(now - std::time::Duration::from_secs(60))
             .unwrap();
-        std::fs::File::open(&newer_path).unwrap().set_modified(now).unwrap();
+        std::fs::File::open(&newer_path)
+            .unwrap()
+            .set_modified(now)
+            .unwrap();
 
         let found = find_codex_transcript(&dir, "/target");
 
@@ -547,24 +616,41 @@ mod tests {
 
     #[test]
     fn derive_session_name_under_resolves_a_claude_session() {
-        let dir = std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id() + 7));
-        let projects_dir = dir.join(".claude").join("projects").join("-some-encoded-cwd");
+        let dir =
+            std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id() + 7));
+        let projects_dir = dir
+            .join(".claude")
+            .join("projects")
+            .join("-some-encoded-cwd");
         std::fs::create_dir_all(&projects_dir).unwrap();
         write_jsonl(
             &projects_dir.join("abc-123.jsonl"),
             &[r#"{"type":"ai-title","aiTitle":"fix the parser"}"#],
         );
 
-        let cmd = vec!["claude".to_string(), "--resume".to_string(), "abc-123".to_string()];
-        assert_eq!(derive_session_name_under(&cmd, "/whatever", &dir), Some("fix the parser".to_string()));
+        let cmd = vec![
+            "claude".to_string(),
+            "--resume".to_string(),
+            "abc-123".to_string(),
+        ];
+        assert_eq!(
+            derive_session_name_under(&cmd, "/whatever", &dir),
+            Some("fix the parser".to_string())
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn derive_session_name_under_resolves_a_codex_session_by_cwd() {
-        let dir = std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id() + 8));
-        let sessions_dir = dir.join(".codex").join("sessions").join("2026").join("01").join("01");
+        let dir =
+            std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id() + 8));
+        let sessions_dir = dir
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("01")
+            .join("01");
         std::fs::create_dir_all(&sessions_dir).unwrap();
         write_jsonl(
             &sessions_dir.join("rollout.jsonl"),
@@ -585,14 +671,18 @@ mod tests {
 
     #[test]
     fn derive_session_name_under_none_for_an_unrecognized_command() {
-        let dir = std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id() + 9));
+        let dir =
+            std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id() + 9));
         let cmd = vec!["bash".to_string()];
         assert_eq!(derive_session_name_under(&cmd, "/whatever", &dir), None);
     }
 
     #[test]
     fn named_by_binary_only_matches_opencode_plain_and_versioned_paths() {
-        assert_eq!(named_by_binary_only(&["opencode".to_string()]), Some("opencode"));
+        assert_eq!(
+            named_by_binary_only(&["opencode".to_string()]),
+            Some("opencode")
+        );
         assert_eq!(
             named_by_binary_only(&["/Users/dev/.local/bin/opencode".to_string()]),
             Some("opencode")
@@ -602,14 +692,20 @@ mod tests {
     #[test]
     fn named_by_binary_only_matches_omp_exactly_not_as_a_substring() {
         assert_eq!(named_by_binary_only(&["omp".to_string()]), Some("omp"));
-        assert_eq!(named_by_binary_only(&["/opt/homebrew/bin/omp".to_string()]), Some("omp"));
+        assert_eq!(
+            named_by_binary_only(&["/opt/homebrew/bin/omp".to_string()]),
+            Some("omp")
+        );
         assert_eq!(named_by_binary_only(&["compass".to_string()]), None);
     }
 
     #[test]
     fn named_by_binary_only_matches_herdr() {
         assert_eq!(named_by_binary_only(&["herdr".to_string()]), Some("herdr"));
-        assert_eq!(named_by_binary_only(&["/usr/local/bin/herdr".to_string()]), Some("herdr"));
+        assert_eq!(
+            named_by_binary_only(&["/usr/local/bin/herdr".to_string()]),
+            Some("herdr")
+        );
     }
 
     #[test]
@@ -620,8 +716,12 @@ mod tests {
 
     #[test]
     fn derive_session_name_under_names_an_opencode_pane_after_the_tool() {
-        let dir = std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id() + 10));
+        let dir =
+            std::env::temp_dir().join(format!("dmx-session-name-test-{}", std::process::id() + 10));
         let cmd = vec!["opencode".to_string()];
-        assert_eq!(derive_session_name_under(&cmd, "/whatever", &dir), Some("opencode".to_string()));
+        assert_eq!(
+            derive_session_name_under(&cmd, "/whatever", &dir),
+            Some("opencode".to_string())
+        );
     }
 }

@@ -1,5 +1,5 @@
 //! On-disk persistence for the attach menu's pinned-directory-group
-//! list -- the one piece of dimux state that survives a daemon
+//! list -- the one piece of dimax state that survives a daemon
 //! restart. Every other piece of `State` (the server-pane pool, split
 //! trees, etc.) is intentionally ephemeral, tied to the daemon
 //! process's own lifetime; pinning is different because it's a pure
@@ -17,7 +17,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-/// `<config-dir>/dimux/pinned_dirs.json`, where `<config-dir>` is
+/// `<config-dir>/dimax/pinned_dirs.json`, where `<config-dir>` is
 /// `$XDG_CONFIG_HOME` if set, else `~/.config` -- same fallback
 /// convention `protocol::socket_path` already uses for
 /// `$XDG_RUNTIME_DIR`. Returns `None` only if neither `$XDG_CONFIG_HOME`
@@ -25,10 +25,15 @@ use std::path::PathBuf;
 /// persistence available this run" rather than an error.
 fn file_path() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(dir).join("dimux").join("pinned_dirs.json"));
+        return Some(PathBuf::from(dir).join("dimax").join("pinned_dirs.json"));
     }
     let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".config").join("dimux").join("pinned_dirs.json"))
+    Some(
+        PathBuf::from(home)
+            .join(".config")
+            .join("dimax")
+            .join("pinned_dirs.json"),
+    )
 }
 
 /// Load the saved pin order, oldest-pinned first (see `state.rs`'s
@@ -38,15 +43,19 @@ fn file_path() -> Option<PathBuf> {
 /// or hand-edited file shouldn't prevent the daemon from starting;
 /// worst case, previously pinned dirs just don't come back pinned).
 pub fn load() -> Vec<String> {
-    let Some(path) = file_path() else { return Vec::new() };
-    let Ok(contents) = std::fs::read_to_string(&path) else { return Vec::new() };
+    let Some(path) = file_path() else {
+        return Vec::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
     serde_json::from_str(&contents).unwrap_or_default()
 }
 
 /// Persist `dirs` (the full current pin order) to disk, creating the
 /// containing directory if needed. Best-effort: any I/O error is
 /// silently swallowed rather than propagated -- same rationale as
-/// `kitty_setup::ensure_installed` (see `tui/kitty_setup.rs`): whether
+/// the keybinding config loader (see `tui/keys.rs`): whether
 /// a preference could be saved to disk must never be allowed to fail a
 /// request the daemon is otherwise perfectly able to serve from memory.
 pub fn save(dirs: &[String]) {
@@ -55,7 +64,9 @@ pub fn save(dirs: &[String]) {
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    let Ok(json) = serde_json::to_string_pretty(dirs) else { return };
+    let Ok(json) = serde_json::to_string_pretty(dirs) else {
+        return;
+    };
     if let Ok(mut file) = std::fs::File::create(&path) {
         let _ = file.write_all(json.as_bytes());
     }
@@ -101,7 +112,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dmx-pinned-test-{}", std::process::id() + 1));
         with_fake_config_home(&dir, || {
             save(&["/home/dev/api".to_string(), "/home/dev/web".to_string()]);
-            assert_eq!(load(), vec!["/home/dev/api".to_string(), "/home/dev/web".to_string()]);
+            assert_eq!(
+                load(),
+                vec!["/home/dev/api".to_string(), "/home/dev/web".to_string()]
+            );
         });
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -110,7 +124,7 @@ mod tests {
     fn load_returns_empty_for_a_corrupted_file_rather_than_panicking() {
         let dir = std::env::temp_dir().join(format!("dmx-pinned-test-{}", std::process::id() + 2));
         with_fake_config_home(&dir, || {
-            let path = dir.join("dimux").join("pinned_dirs.json");
+            let path = dir.join("dimax").join("pinned_dirs.json");
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, "not valid json").unwrap();
             assert_eq!(load(), Vec::<String>::new());

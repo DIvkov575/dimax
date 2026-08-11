@@ -1,13 +1,13 @@
 use clap::Parser;
-use dimux::cli::{self, Args, Cli};
+use dimax::cli::{self, Args, Cli};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Args::parse().command.unwrap_or(Cli::Attach);
     match cli {
-        Cli::Attach => dimux::tui::run().await,
+        Cli::Attach => dimax::tui::run().await,
         Cli::Daemon => {
-            let daemon = dimux::daemon::run(dimux::protocol::socket_path()).await?;
+            let daemon = dimax::daemon::run(dimax::protocol::socket_path()).await?;
             let _ = daemon;
             std::future::pending::<()>().await;
             Ok(())

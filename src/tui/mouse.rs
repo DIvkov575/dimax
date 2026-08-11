@@ -8,24 +8,26 @@
 //! same stdin stream as an escape sequence too, so the same constraint
 //! applies: this module hand-parses just enough of the SGR mouse protocol
 //! (`ESC [ < Cb ; Cx ; Cy M` for a press, `...m` for a release) to drive
-//! divider dragging, rather than pulling in crossterm's mouse events.
+//! divider dragging, text selection, and pane scrolling rather than
+//! pulling in crossterm's mouse events.
 //!
 //! Reference: <http://www.xfree86.org/current/ctlseqs.html#Mouse%20Tracking>.
-//! Only the left mouse button matters for dragging a divider; every other
-//! button, and scroll events, are recognized but discarded (see
-//! [`ParsedInput::Mouse`] below) — never `PassThrough`, since mouse bytes
-//! are never meaningful keyboard input to forward to a focused pane.
+//! The left mouse button drives focus, divider drags, and text selection;
+//! wheel events drive scrollback. Every other button is recognized but
+//! discarded (see [`ParsedInput::Mouse`] below) — never `PassThrough`,
+//! since mouse bytes are never meaningful keyboard input to forward to a
+//! focused pane.
 //!
 //! # Defense in depth: any SGR mouse sequence is swallowed, not just the
-//! ones dimux acts on
+//! ones dimax acts on
 //!
-//! dimux only requests button-event mouse tracking from the terminal
+//! dimax only requests button-event mouse tracking from the terminal
 //! (`?1000h` + `?1002h` + `?1006h` in `tui/mod.rs`'s
 //! `enable_button_event_mouse_tracking`), deliberately *not* any-event
 //! tracking (`?1003h`, which reports every mouse movement with no button
 //! held). That's the root-cause fix for a bug where bare mouse movement
 //! generated an SGR sequence (`Cb=35`, "button 3" in this encoding, no
-//! button dimux recognizes) that `parse` used to reject outright — and a
+//! button dimax recognizes) that `parse` used to reject outright — and a
 //! rejected mouse byte used to fall through to `keys::parse`, which also
 //! didn't recognize it, resolved to `Action::PassThrough`, and wrote the
 //! raw escape sequence into the focused pane as literal keystrokes. That
@@ -91,13 +93,28 @@
 /// `ratatui::layout::Rect` coordinates).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseEvent {
-    Down { col: u16, row: u16 },
-    Drag { col: u16, row: u16 },
-    Up { col: u16, row: u16 },
+    Down {
+        col: u16,
+        row: u16,
+    },
+    Drag {
+        col: u16,
+        row: u16,
+    },
+    Up {
+        col: u16,
+        row: u16,
+    },
     /// One wheel-tick scrolling back into a pane's history.
-    ScrollUp { col: u16, row: u16 },
+    ScrollUp {
+        col: u16,
+        row: u16,
+    },
     /// One wheel-tick scrolling toward a pane's live tail.
-    ScrollDown { col: u16, row: u16 },
+    ScrollDown {
+        col: u16,
+        row: u16,
+    },
 }
 
 /// Result of parsing one input chunk against the SGR mouse format. See
@@ -105,14 +122,14 @@ pub enum MouseEvent {
 /// case from `NotMouse` — both categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParsedInput {
-    /// A left-button press/drag/release dimux acts on.
+    /// A left-button press/drag/release dimax acts on.
     Mouse(MouseEvent),
-    /// A well-formed SGR mouse sequence for something dimux has no use
+    /// A well-formed SGR mouse sequence for something dimax has no use
     /// for (right/middle button, scroll, bare movement) — recognized as
     /// mouse input and discarded, never passed through as keystrokes.
     Ignored,
     /// Not an SGR mouse sequence at all; the caller should try parsing it
-    /// as something else (a dimux chord, or plain keyboard input).
+    /// as something else (a dimax chord, or plain keyboard input).
     NotMouse,
 }
 
@@ -146,7 +163,9 @@ enum ParseOneResult {
 /// means and why "no complete match" is split into two cases instead of
 /// one.
 fn parse_one(bytes: &[u8]) -> ParseOneResult {
-    let Some(rest) = bytes.strip_prefix(b"\x1b[<") else { return ParseOneResult::NoMatch };
+    let Some(rest) = bytes.strip_prefix(b"\x1b[<") else {
+        return ParseOneResult::NoMatch;
+    };
     let Some(term_idx) = rest.iter().position(|&b| b == b'M' || b == b'm') else {
         return ParseOneResult::Incomplete;
     };
@@ -178,7 +197,7 @@ fn parse_one(bytes: &[u8]) -> ParseOneResult {
     // extra field (see module doc reference's `\x1B[<0;20;10;M` test
     // vector) -- `split` turns it into one trailing empty string, which
     // is fine; anything else after row is a genuinely malformed sequence
-    // (not a mouse event dimux recognizes, so `NotMouse` rather than
+    // (not a mouse event dimax recognizes, so `NotMouse` rather than
     // `Ignored` -- this matches the pre-existing test expectation that a
     // truncated/malformed sequence still falls through, e.g. to be typed
     // literally if that's ever genuinely desired, rather than being
@@ -193,7 +212,7 @@ fn parse_one(bytes: &[u8]) -> ParseOneResult {
     // press/release; dragging=1 with button 0 is a drag. Any other
     // button number (middle, right, or the higher values used for
     // scroll/bare-movement encoding) is a recognized SGR mouse sequence
-    // dimux simply doesn't act on.
+    // dimax simply doesn't act on.
     let button_number = (cb & 0b0000_0011) | ((cb & 0b1100_0000) >> 4);
     let dragging = cb & 0b0010_0000 != 0;
 
@@ -260,7 +279,7 @@ pub fn parse_all(bytes: &[u8]) -> (Vec<MouseEvent>, &[u8], &[u8]) {
                 rest = &rest[consumed..];
             }
             ParseOneResult::Complete(ParsedInput::Ignored, consumed) => {
-                // Recognized mouse input dimux has no use for (e.g.
+                // Recognized mouse input dimax has no use for (e.g.
                 // middle/right-click) -- consumed so it can't leak
                 // through as keyboard input, but not collected.
                 rest = &rest[consumed..];
@@ -306,7 +325,10 @@ mod tests {
 
     #[test]
     fn left_button_up() {
-        assert_eq!(parse(b"\x1b[<0;20;10m"), ParsedInput::Mouse(MouseEvent::Up { col: 19, row: 9 }));
+        assert_eq!(
+            parse(b"\x1b[<0;20;10m"),
+            ParsedInput::Mouse(MouseEvent::Up { col: 19, row: 9 })
+        );
         assert_eq!(
             parse(b"\x1b[<0;20;10;m"),
             ParsedInput::Mouse(MouseEvent::Up { col: 19, row: 9 })
@@ -316,7 +338,10 @@ mod tests {
     #[test]
     fn left_button_drag() {
         // dragging bit (0b0010_0000 = 32) set alongside button 0.
-        assert_eq!(parse(b"\x1b[<32;5;5M"), ParsedInput::Mouse(MouseEvent::Drag { col: 4, row: 4 }));
+        assert_eq!(
+            parse(b"\x1b[<32;5;5M"),
+            ParsedInput::Mouse(MouseEvent::Drag { col: 4, row: 4 })
+        );
     }
 
     #[test]
@@ -342,7 +367,7 @@ mod tests {
         // The exact sequence class that used to leak into the pane as
         // garbage text before the ?1003h any-event-tracking root-cause
         // fix: bare mouse movement encodes as button_number=3 (Cb=35 with
-        // the dragging bit set), which dimux never acts on but must
+        // the dragging bit set), which dimax never acts on but must
         // still recognize as mouse input, not keyboard input.
         assert_eq!(parse(b"\x1b[<35;10;5M"), ParsedInput::Ignored);
     }
@@ -351,7 +376,7 @@ mod tests {
     fn non_mouse_bytes_fall_through() {
         assert_eq!(parse(b""), ParsedInput::NotMouse);
         assert_eq!(parse(b"hello"), ParsedInput::NotMouse);
-        assert_eq!(parse(b"\x1b_Dd\x1b\\"), ParsedInput::NotMouse); // a dimux chord, not a mouse event
+        assert_eq!(parse(b"\x1b_Dd\x1b\\"), ParsedInput::NotMouse); // a dimax chord, not a mouse event
     }
 
     #[test]
@@ -432,7 +457,7 @@ mod tests {
     #[test]
     fn parse_all_reports_a_trailing_incomplete_sequence_separately_from_leftover() {
         // Regression test for the second reported bug: a real capture of
-        // dimux's stdin during a sustained scroll showed a fixed-size
+        // dimax's stdin during a sustained scroll showed a fixed-size
         // read() boundary cutting one SGR sequence in half. `parse_all`
         // must recognize the cut-off tail as "possibly a real sequence,
         // needs more bytes" (`incomplete`), NOT as "definitely not mouse

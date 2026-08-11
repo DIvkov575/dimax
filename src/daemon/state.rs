@@ -51,7 +51,8 @@ const DEFAULT_PTY_SIZE: Size = Size { rows: 24, cols: 80 };
 /// counter value `0` (`'0'`) sorts before `9`, which sorts before `'a'`,
 /// which sorts before `'z'`, which sorts before `'A'`, which sorts before
 /// `'Z'`.
-const SHORT_ID_CHARSET: &[u8; 62] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const SHORT_ID_CHARSET: &[u8; 62] =
+    b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 /// Encode a per-daemon sequential counter value as a short, fixed-width
 /// (per magnitude) base-62 label: `0` -> `"00"`, `1` -> `"01"`, ...,
@@ -272,7 +273,7 @@ impl State {
     /// a Claude Code or Codex CLI session (see
     /// `term::session_name::derive_session_name`) that session's
     /// derived title as its real name -- the same `set_name` a manual
-    /// `dimux server rename` would use, so once applied it's sticky:
+    /// `dimax server rename` would use, so once applied it's sticky:
     /// this only ever touches a pane while `name()` is still `None`,
     /// never overwrites one that already has a name (auto-derived or
     /// manual) even if the session's title later changes. Silently
@@ -299,7 +300,7 @@ impl State {
     /// `&mut self`, not `&self`: this is the one place a still-unnamed
     /// pane picks up an auto-derived name from its foreground process
     /// (see [`Self::apply_pending_session_names`]) -- every caller of
-    /// `server_list` (the attach menu, `dimux server ls`) already
+    /// `server_list` (the attach menu, `dimax server ls`) already
     /// expects it to reflect the pool's current state, and applying the
     /// name here (rather than a separate poll) means it happens exactly
     /// on the same cadence those callers already re-fetch on, with no
@@ -319,7 +320,7 @@ impl State {
                 short_id: p.short_id().to_string(),
             })
             .collect();
-        // HashMap order is unspecified; sort so `dimux server ls` output
+        // HashMap order is unspecified; sort so `dimax server ls` output
         // and tests are stable.
         panes.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
         panes
@@ -444,7 +445,7 @@ impl State {
         })
     }
 
-    /// Implements `dimux client spawn`: create a new client-pane, either
+    /// Implements `dimax client spawn`: create a new client-pane, either
     /// as the sole leaf of an empty workspace (`split_of: None`) or by
     /// splitting an existing leaf (`split_of: Some(pane)`). Errors if
     /// `split_of` is `None` but the workspace already has panes
@@ -485,10 +486,9 @@ impl State {
                 ws.tree = Some(SplitTree::Leaf(pane));
             }
             Some(target) => {
-                let tree = ws
-                    .tree
-                    .as_mut()
-                    .ok_or_else(|| anyhow::anyhow!("workspace {workspace} has no panes to split"))?;
+                let tree = ws.tree.as_mut().ok_or_else(|| {
+                    anyhow::anyhow!("workspace {workspace} has no panes to split")
+                })?;
                 // `split_leaf` validates `target` before mutating, so a
                 // miss leaves the tree untouched (validate-then-apply).
                 tree.split_leaf(target, dir.unwrap_or(SplitDir::Vertical), pane)?;
@@ -500,7 +500,11 @@ impl State {
         Ok(id)
     }
 
-    pub fn client_close(&mut self, workspace: WorkspaceId, pane: ClientPaneId) -> anyhow::Result<()> {
+    pub fn client_close(
+        &mut self,
+        workspace: WorkspaceId,
+        pane: ClientPaneId,
+    ) -> anyhow::Result<()> {
         let ws = self
             .workspaces
             .get_mut(&workspace)
@@ -513,7 +517,9 @@ impl State {
         // miss can't destroy the layout on the error path.
         let bound = tree
             .find(pane)
-            .ok_or_else(|| anyhow::anyhow!("client-pane {pane} not found in workspace {workspace}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("client-pane {pane} not found in workspace {workspace}")
+            })?
             .active_bound();
         let owned = ws.tree.take().expect("tree presence checked above");
         ws.tree = owned.remove_leaf(pane)?;
@@ -564,7 +570,11 @@ impl State {
     /// `client_bind`'s already-established "changing a binding recomputes
     /// the old target's PTY size" behavior rather than tearing it down).
     /// A no-op if `pane` was already unbound.
-    pub fn client_unbind(&mut self, workspace: WorkspaceId, pane: ClientPaneId) -> anyhow::Result<()> {
+    pub fn client_unbind(
+        &mut self,
+        workspace: WorkspaceId,
+        pane: ClientPaneId,
+    ) -> anyhow::Result<()> {
         let leaf = self.client_pane_mut(workspace, pane)?;
         let Some(previous) = leaf.active_bound() else {
             return Ok(());
@@ -663,7 +673,9 @@ impl State {
             // `client_close`'s own resize logic (which reads the leaf's
             // *current* active_bound, now empty) recomputes nothing for
             // it -- apply it explicitly, same as the non-empty path below.
-            let result = self.client_close(workspace, pane).map(|()| CloseTabResult::LeafClosed);
+            let result = self
+                .client_close(workspace, pane)
+                .map(|()| CloseTabResult::LeafClosed);
             self.apply_pty_size(removed);
             return result;
         }
@@ -701,7 +713,7 @@ impl State {
             .iter()
             .filter(|(id, _)| workspace.is_none_or(|wanted| wanted == **id))
             .collect();
-        // Stable output for `dimux client ls` across all workspaces.
+        // Stable output for `dimax client ls` across all workspaces.
         selected.sort_by_key(|(id, ws)| (ws.info_number, **id));
         let mut out = Vec::new();
         for (id, ws) in selected {
@@ -748,7 +760,7 @@ impl State {
 
     fn find_workspace(&self, target: &str) -> Option<WorkspaceId> {
         if let Ok(id) = Uuid::parse_str(target) {
-            // `dimux client spawn` prints `<workspace-uuid>/<pane-uuid>`,
+            // `dimax client spawn` prints `<workspace-uuid>/<pane-uuid>`,
             // so ids come straight back in as addresses.
             return self.workspaces.contains_key(&id).then_some(id);
         }
@@ -803,7 +815,12 @@ impl State {
     /// history by `delta` rows (positive = further back, negative =
     /// toward live), clamped to `0..=server_pane.scrollback_rows()`.
     /// Returns the resulting (already-clamped) offset.
-    pub fn scroll_server_pane(&mut self, subscriber: SubscriberId, server_pane: ServerPaneId, delta: i32) -> usize {
+    pub fn scroll_server_pane(
+        &mut self,
+        subscriber: SubscriberId,
+        server_pane: ServerPaneId,
+        delta: i32,
+    ) -> usize {
         let Some(pane) = self.server_panes.get(&server_pane) else {
             return 0;
         };
@@ -817,7 +834,8 @@ impl State {
         if new_offset == 0 {
             self.scroll_offsets.remove(&(subscriber, server_pane));
         } else {
-            self.scroll_offsets.insert((subscriber, server_pane), new_offset);
+            self.scroll_offsets
+                .insert((subscriber, server_pane), new_offset);
         }
         new_offset
     }
@@ -825,7 +843,10 @@ impl State {
     /// The offset a fresh `GridSnapshot` for `server_pane` should be
     /// built at for `subscriber` -- 0 if they've never scrolled it.
     pub fn scroll_offset_for(&self, subscriber: SubscriberId, server_pane: ServerPaneId) -> usize {
-        self.scroll_offsets.get(&(subscriber, server_pane)).copied().unwrap_or(0)
+        self.scroll_offsets
+            .get(&(subscriber, server_pane))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Remove every scroll-offset entry belonging to `subscriber` --
@@ -1013,16 +1034,25 @@ mod tests {
     fn encode_short_id_never_repeats_across_a_wide_range() {
         let mut seen = std::collections::HashSet::new();
         for n in 0..10_000 {
-            assert!(seen.insert(encode_short_id(n)), "duplicate short id at n={n}");
+            assert!(
+                seen.insert(encode_short_id(n)),
+                "duplicate short id at n={n}"
+            );
         }
     }
 
     #[test]
     fn server_spawn_assigns_sequential_short_ids_starting_at_00() {
         let mut state = State::new();
-        let a = state.server_spawn(None, Some("cat".to_string()), None, None).unwrap();
-        let b = state.server_spawn(None, Some("cat".to_string()), None, None).unwrap();
-        let c = state.server_spawn(None, Some("cat".to_string()), None, None).unwrap();
+        let a = state
+            .server_spawn(None, Some("cat".to_string()), None, None)
+            .unwrap();
+        let b = state
+            .server_spawn(None, Some("cat".to_string()), None, None)
+            .unwrap();
+        let c = state
+            .server_spawn(None, Some("cat".to_string()), None, None)
+            .unwrap();
         assert_eq!(a.short_id, "00");
         assert_eq!(b.short_id, "01");
         assert_eq!(c.short_id, "02");
@@ -1031,7 +1061,14 @@ mod tests {
     #[test]
     fn short_id_survives_into_server_list() {
         let mut state = State::new();
-        state.server_spawn(Some("shell".to_string()), Some("cat".to_string()), None, None).unwrap();
+        state
+            .server_spawn(
+                Some("shell".to_string()),
+                Some("cat".to_string()),
+                None,
+                None,
+            )
+            .unwrap();
         let listed = state.server_list();
         assert_eq!(listed[0].short_id, "00");
     }
@@ -1073,7 +1110,12 @@ mod tests {
     fn server_spawn_returns_info_and_lists_it() {
         let mut state = State::new();
         let info = state
-            .server_spawn(Some("shell".to_string()), Some("cat".to_string()), None, None)
+            .server_spawn(
+                Some("shell".to_string()),
+                Some("cat".to_string()),
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(info.name.as_deref(), Some("shell"));
         assert_eq!(info.size, DEFAULT_PTY_SIZE);
@@ -1088,7 +1130,12 @@ mod tests {
         let mut state = State::new();
         spawn_pane(&mut state, "shell");
         let err = state
-            .server_spawn(Some("shell".to_string()), Some("cat".to_string()), None, None)
+            .server_spawn(
+                Some("shell".to_string()),
+                Some("cat".to_string()),
+                None,
+                None,
+            )
             .unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
         assert_eq!(state.server_list().len(), 1);
@@ -1097,8 +1144,12 @@ mod tests {
     #[test]
     fn server_spawn_allows_repeated_anonymous_panes() {
         let mut state = State::new();
-        state.server_spawn(None, Some("cat".to_string()), None, None).unwrap();
-        state.server_spawn(None, Some("cat".to_string()), None, None).unwrap();
+        state
+            .server_spawn(None, Some("cat".to_string()), None, None)
+            .unwrap();
+        state
+            .server_spawn(None, Some("cat".to_string()), None, None)
+            .unwrap();
         assert_eq!(state.server_list().len(), 2);
     }
 
@@ -1114,7 +1165,11 @@ mod tests {
     fn resolve_server_pane_unknown_errors() {
         let state = State::new();
         assert!(state.resolve_server_pane("nope").is_err());
-        assert!(state.resolve_server_pane(&Uuid::new_v4().to_string()).is_err());
+        assert!(
+            state
+                .resolve_server_pane(&Uuid::new_v4().to_string())
+                .is_err()
+        );
     }
 
     #[test]
@@ -1184,7 +1239,9 @@ mod tests {
     #[test]
     fn server_list_leaves_unnamed_non_session_panes_unnamed() {
         let mut state = State::new();
-        state.server_spawn(None, Some("cat".to_string()), None, None).unwrap();
+        state
+            .server_spawn(None, Some("cat".to_string()), None, None)
+            .unwrap();
         let names: Vec<Option<String>> = state.server_list().into_iter().map(|i| i.name).collect();
         assert_eq!(names, vec![None]);
     }
@@ -1249,7 +1306,8 @@ mod tests {
 
     #[test]
     fn toggle_pinned_dir_appends_new_pins_after_existing_ones() {
-        let dir = std::env::temp_dir().join(format!("dmx-state-pin-test-{}", std::process::id() + 1));
+        let dir =
+            std::env::temp_dir().join(format!("dmx-state-pin-test-{}", std::process::id() + 1));
         with_fake_config_home(&dir, || {
             let mut state = State::new();
             state.toggle_pinned_dir("/a".to_string());
@@ -1261,7 +1319,8 @@ mod tests {
 
     #[test]
     fn toggle_pinned_dir_unpinning_the_first_of_several_preserves_the_rest_in_order() {
-        let dir = std::env::temp_dir().join(format!("dmx-state-pin-test-{}", std::process::id() + 2));
+        let dir =
+            std::env::temp_dir().join(format!("dmx-state-pin-test-{}", std::process::id() + 2));
         with_fake_config_home(&dir, || {
             let mut state = State::new();
             state.toggle_pinned_dir("/a".to_string());
@@ -1275,7 +1334,8 @@ mod tests {
 
     #[test]
     fn toggle_pinned_dir_persists_across_a_fresh_state_load() {
-        let dir = std::env::temp_dir().join(format!("dmx-state-pin-test-{}", std::process::id() + 3));
+        let dir =
+            std::env::temp_dir().join(format!("dmx-state-pin-test-{}", std::process::id() + 3));
         with_fake_config_home(&dir, || {
             let mut state = State::new();
             state.toggle_pinned_dir("/home/dev/api".to_string());
@@ -1293,7 +1353,10 @@ mod tests {
     #[test]
     fn consume_shell_fallback_returns_true_once_then_false() {
         let mut state = State::new();
-        assert!(state.consume_shell_fallback(), "first call should grant the fallback");
+        assert!(
+            state.consume_shell_fallback(),
+            "first call should grant the fallback"
+        );
         assert!(!state.consume_shell_fallback(), "second call should not");
         assert!(!state.consume_shell_fallback(), "third call should not");
     }
@@ -1376,19 +1439,51 @@ mod tests {
         let a = state.client_spawn(ws1, None, None, None).unwrap();
         let ws2 = state.resolve_or_create_workspace("2").unwrap();
         let b = state.client_spawn(ws2, None, None, None).unwrap();
-        assert_eq!(state.workspace_info(ws1).unwrap().tree.unwrap().find(a).unwrap().short_id, "00");
-        assert_eq!(state.workspace_info(ws2).unwrap().tree.unwrap().find(b).unwrap().short_id, "01");
+        assert_eq!(
+            state
+                .workspace_info(ws1)
+                .unwrap()
+                .tree
+                .unwrap()
+                .find(a)
+                .unwrap()
+                .short_id,
+            "00"
+        );
+        assert_eq!(
+            state
+                .workspace_info(ws2)
+                .unwrap()
+                .tree
+                .unwrap()
+                .find(b)
+                .unwrap()
+                .short_id,
+            "01"
+        );
     }
 
     #[test]
     fn client_and_server_short_ids_are_independent_sequences() {
         let mut state = State::new();
-        state.server_spawn(None, Some("cat".to_string()), None, None).unwrap();
+        state
+            .server_spawn(None, Some("cat".to_string()), None, None)
+            .unwrap();
         let ws = state.resolve_or_create_workspace("1").unwrap();
         let pane = state.client_spawn(ws, None, None, None).unwrap();
         // The server-pane already consumed "00" from its own counter --
         // the client-pane's counter is unaffected and still starts fresh.
-        assert_eq!(state.workspace_info(ws).unwrap().tree.unwrap().find(pane).unwrap().short_id, "00");
+        assert_eq!(
+            state
+                .workspace_info(ws)
+                .unwrap()
+                .tree
+                .unwrap()
+                .find(pane)
+                .unwrap()
+                .short_id,
+            "00"
+        );
     }
 
     #[test]
@@ -1399,7 +1494,13 @@ mod tests {
         let err = state.client_spawn(ws, None, None, None).unwrap_err();
         assert!(err.to_string().contains("already has panes"), "{err}");
         assert_eq!(
-            state.workspace_info(ws).unwrap().tree.unwrap().leaves().len(),
+            state
+                .workspace_info(ws)
+                .unwrap()
+                .tree
+                .unwrap()
+                .leaves()
+                .len(),
             1
         );
     }
@@ -1441,7 +1542,9 @@ mod tests {
         let mut state = State::new();
         let ws = state.resolve_or_create_workspace("1").unwrap();
         let first = state.client_spawn(ws, None, None, None).unwrap();
-        state.client_spawn(ws, Some(first), Some(SplitDir::Vertical), None).unwrap();
+        state
+            .client_spawn(ws, Some(first), Some(SplitDir::Vertical), None)
+            .unwrap();
         let split_id = match state.workspace_info(ws).unwrap().tree.unwrap() {
             SplitTree::Split { id, .. } => id,
             other => panic!("expected a split, got {other:?}"),
@@ -1463,15 +1566,21 @@ mod tests {
         let ws = state.resolve_or_create_workspace("1").unwrap();
         let first = state.client_spawn(ws, None, None, None).unwrap();
         let before = state.workspace_info(ws).unwrap().tree;
-        assert!(state.client_spawn(ws, Some(Uuid::new_v4()), None, None).is_err());
+        assert!(
+            state
+                .client_spawn(ws, Some(Uuid::new_v4()), None, None)
+                .is_err()
+        );
         assert_eq!(state.workspace_info(ws).unwrap().tree, before);
-        assert!(state
-            .workspace_info(ws)
-            .unwrap()
-            .tree
-            .unwrap()
-            .find(first)
-            .is_some());
+        assert!(
+            state
+                .workspace_info(ws)
+                .unwrap()
+                .tree
+                .unwrap()
+                .find(first)
+                .is_some()
+        );
     }
 
     #[test]
@@ -1498,7 +1607,11 @@ mod tests {
     #[test]
     fn client_spawn_into_unknown_workspace_errors() {
         let mut state = State::new();
-        assert!(state.client_spawn(Uuid::new_v4(), None, None, None).is_err());
+        assert!(
+            state
+                .client_spawn(Uuid::new_v4(), None, None, None)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1539,13 +1652,15 @@ mod tests {
         assert!(state.client_close(ws, Uuid::new_v4()).is_err());
         assert!(state.client_close(Uuid::new_v4(), pane).is_err());
         // The failed closes left the layout intact.
-        assert!(state
-            .workspace_info(ws)
-            .unwrap()
-            .tree
-            .unwrap()
-            .find(pane)
-            .is_some());
+        assert!(
+            state
+                .workspace_info(ws)
+                .unwrap()
+                .tree
+                .unwrap()
+                .find(pane)
+                .is_some()
+        );
     }
 
     #[test]
@@ -1562,9 +1677,11 @@ mod tests {
     fn client_rename_unknown_errors() {
         let mut state = State::new();
         let ws = state.resolve_or_create_workspace("1").unwrap();
-        assert!(state
-            .client_rename(ws, Uuid::new_v4(), "x".to_string())
-            .is_err());
+        assert!(
+            state
+                .client_rename(ws, Uuid::new_v4(), "x".to_string())
+                .is_err()
+        );
     }
 
     #[test]
@@ -1759,9 +1876,16 @@ mod tests {
         state.resize_client_pane(small, size(10, 20));
         let big_pane = state.workspace_info(ws_b).unwrap().tree.unwrap().leaves()[0].id;
         state.resize_client_pane(big_pane, size(40, 100));
-        assert_eq!(pane_size(&state, shared), size(10, 20), "smallest viewer should win before closing");
+        assert_eq!(
+            pane_size(&state, shared),
+            size(10, 20),
+            "smallest viewer should win before closing"
+        );
 
-        assert_eq!(state.client_close_tab(ws_a, small).unwrap(), CloseTabResult::LeafClosed);
+        assert_eq!(
+            state.client_close_tab(ws_a, small).unwrap(),
+            CloseTabResult::LeafClosed
+        );
 
         assert_eq!(
             pane_size(&state, shared),
@@ -1806,7 +1930,8 @@ mod tests {
     /// in range after the shift -- the exact case `..from_background_tabs`
     /// above can't catch, since there the active tab is last).
     #[test]
-    fn unbind_all_removes_a_background_tab_before_the_active_one_without_shifting_the_active_pane() {
+    fn unbind_all_removes_a_background_tab_before_the_active_one_without_shifting_the_active_pane()
+    {
         let mut state = State::new();
         let sp1 = spawn_pane(&mut state, "a");
         let sp2 = spawn_pane(&mut state, "b");
@@ -1822,7 +1947,11 @@ mod tests {
 
         let leaf = leaf_of(&state, ws, pane);
         assert_eq!(leaf.tabs, vec![sp2, sp3]);
-        assert_eq!(leaf.active_bound(), Some(sp2), "killing a background tab must not change which tab is displayed");
+        assert_eq!(
+            leaf.active_bound(),
+            Some(sp2),
+            "killing a background tab must not change which tab is displayed"
+        );
     }
 
     #[test]
@@ -2009,7 +2138,9 @@ mod tests {
     #[test]
     fn scroll_server_pane_clamps_at_zero() {
         let mut state = State::new();
-        let info = state.server_spawn(None, Some("cat".to_string()), None, None).unwrap();
+        let info = state
+            .server_spawn(None, Some("cat".to_string()), None, None)
+            .unwrap();
         let offset = state.scroll_server_pane(1, info.id, 5);
         assert_eq!(offset, 0);
         assert_eq!(state.scroll_offsets.get(&(1, info.id)), None);
@@ -2018,7 +2149,9 @@ mod tests {
     #[test]
     fn scroll_server_pane_absent_entry_defaults_to_zero_before_first_call() {
         let mut state = State::new();
-        let info = state.server_spawn(None, Some("cat".to_string()), None, None).unwrap();
+        let info = state
+            .server_spawn(None, Some("cat".to_string()), None, None)
+            .unwrap();
         let offset = state.scroll_server_pane(1, info.id, -5);
         assert_eq!(offset, 0);
     }
@@ -2037,11 +2170,18 @@ mod tests {
         let mut state = State::new();
         let mut events = state.take_pane_events().unwrap();
         let info = state
-            .server_spawn(Some("greeter".to_string()), Some("printf hi".to_string()), None, None)
+            .server_spawn(
+                Some("greeter".to_string()),
+                Some("printf hi".to_string()),
+                None,
+                None,
+            )
             .unwrap();
         // `blocking_recv` outside a runtime is explicitly supported by
         // tokio, so this stays a plain synchronous unit test.
-        let event = events.blocking_recv().expect("pane reader thread sent nothing");
+        let event = events
+            .blocking_recv()
+            .expect("pane reader thread sent nothing");
         match event {
             ServerPaneEvent::Changed(id) | ServerPaneEvent::Died(id) => assert_eq!(id, info.id),
         }

@@ -1,4 +1,4 @@
-//! The dimux daemon: owns the global server-pane pool and the global
+//! The dimax daemon: owns the global server-pane pool and the global
 //! workspace/split-tree state, and serves both over the Unix socket
 //! defined in [`crate::protocol`].
 //!
@@ -10,21 +10,23 @@
 //!
 //! Concurrency model: a single `tokio::sync::Mutex<State>` guards all
 //! daemon state. Every request handler locks it for the duration of one
-//! request; this is fine at the pane counts dimux targets (see design doc
+//! request; this is fine at the pane counts dimax targets (see design doc
 //! non-goals) and keeps the logic in `state` free of async concerns.
 
 pub mod pinned_dirs;
 pub mod state;
 
-use crate::protocol::{self, ClientPane, Event, Request, Response, ServerMessage, ServerPaneId, WorkspaceId};
+use crate::protocol::{
+    self, ClientPane, Event, Request, Response, ServerMessage, ServerPaneId, WorkspaceId,
+};
 use crate::term::ServerPaneEvent;
 use state::{CloseTabResult, State, SubscriberId};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
 /// Maps each connection's [`SubscriberId`] to a channel that pushes
@@ -50,7 +52,7 @@ pub struct Daemon {
 /// letting the process actually exit, so a *graceful* shutdown leaves no
 /// file behind at all -- [`bind_socket`]'s stale-detection is the
 /// fallback for the crash case this handler can't catch. Used both by
-/// `dimux attach`'s auto-spawn path and directly by integration tests
+/// `dimax attach`'s auto-spawn path and directly by integration tests
 /// with a temp path.
 pub async fn run(socket_path: std::path::PathBuf) -> anyhow::Result<Daemon> {
     let listener = bind_socket(&socket_path).await?;
@@ -143,7 +145,7 @@ async fn bind_socket(socket_path: &Path) -> anyhow::Result<UnixListener> {
 
 /// Install a `SIGTERM`/`SIGINT` handler that unlinks `socket_path` before
 /// the process exits, so a graceful shutdown (a normal `kill`, or
-/// `Ctrl-C` to a foreground `dimux daemon`) leaves no stale file for
+/// `Ctrl-C` to a foreground `dimax daemon`) leaves no stale file for
 /// `bind_socket`'s fallback to need to clean up next time. Spawns a
 /// background task that waits for either signal once, removes the file
 /// (best-effort — nothing further to do if that fails), and exits the
@@ -164,9 +166,9 @@ fn spawn_cleanup_on_signal(socket_path: PathBuf) -> anyhow::Result<()> {
 
 /// Auto-spawn the daemon as a detached background process if
 /// `socket_path` isn't reachable, per design doc "Error handling". Used
-/// by `dimux attach` and every CLI subcommand before connecting.
+/// by `dimax attach` and every CLI subcommand before connecting.
 ///
-/// This does a plain detached `std::process::Command::spawn` of `dimux
+/// This does a plain detached `std::process::Command::spawn` of `dimax
 /// daemon` (current exe re-exec, per `main.rs`'s `Cli::Daemon` arm) with
 /// stdio wired to `/dev/null`, rather than a true double-fork via a
 /// process-control crate. On Unix, a child spawned this way is already
@@ -246,9 +248,12 @@ async fn handle_connection(
             request,
         )
         .await;
-        if protocol::framing::write_frame(&mut *writer.lock().await, &ServerMessage::Response(response))
-            .await
-            .is_err()
+        if protocol::framing::write_frame(
+            &mut *writer.lock().await,
+            &ServerMessage::Response(response),
+        )
+        .await
+        .is_err()
         {
             break;
         }
@@ -259,7 +264,10 @@ async fn handle_connection(
     if let Some(ws) = subscribed_workspace {
         state.lock().await.unsubscribe(subscriber_id, ws);
     }
-    state.lock().await.clear_scroll_offsets_for_subscriber(subscriber_id);
+    state
+        .lock()
+        .await
+        .clear_scroll_offsets_for_subscriber(subscriber_id);
 }
 
 /// Apply one request to `state` and produce its response, pushing any
@@ -275,16 +283,28 @@ async fn dispatch(
 ) -> Response {
     let _ = subscriber_id;
     match request {
-        Request::ServerSpawn { name, cmd, cwd, workspace } => {
+        Request::ServerSpawn {
+            name,
+            cmd,
+            cwd,
+            workspace,
+        } => {
             let mut state = state.lock().await;
             let owner = match workspace {
                 Some(target) => match state.resolve_workspace(&target) {
                     Ok(id) => Some(id),
-                    Err(err) => return Response::Error { message: err.to_string() },
+                    Err(err) => {
+                        return Response::Error {
+                            message: err.to_string(),
+                        };
+                    }
                 },
                 None => None,
             };
-            ok_or_err(state.server_spawn(name, cmd, cwd, owner), Response::ServerPane)
+            ok_or_err(
+                state.server_spawn(name, cmd, cwd, owner),
+                Response::ServerPane,
+            )
         }
 
         Request::ServerKill { target } => {
@@ -315,28 +335,48 @@ async fn dispatch(
 
         Request::ConsumeShellFallback => {
             let mut state = state.lock().await;
-            Response::ShellFallback { available: state.consume_shell_fallback() }
+            Response::ShellFallback {
+                available: state.consume_shell_fallback(),
+            }
         }
 
-        Request::ClientSpawn { workspace, split_of, dir, bind } => {
+        Request::ClientSpawn {
+            workspace,
+            split_of,
+            dir,
+            bind,
+        } => {
             let mut state = state.lock().await;
             let ws_id = match state.resolve_or_create_workspace(&workspace) {
                 Ok(id) => id,
-                Err(err) => return Response::Error { message: err.to_string() },
+                Err(err) => {
+                    return Response::Error {
+                        message: err.to_string(),
+                    };
+                }
             };
             let resolved_bind = match bind {
                 Some(target) => match state.resolve_server_pane(&target) {
                     Ok(id) => Some(id),
-                    Err(err) => return Response::Error { message: err.to_string() },
+                    Err(err) => {
+                        return Response::Error {
+                            message: err.to_string(),
+                        };
+                    }
                 },
                 None => None,
             };
             match state.client_spawn(ws_id, split_of, dir, resolved_bind) {
                 Ok(pane) => {
                     broadcast_layout(&state, registry, ws_id).await;
-                    Response::ClientPaneCreated { workspace: ws_id, pane }
+                    Response::ClientPaneCreated {
+                        workspace: ws_id,
+                        pane,
+                    }
                 }
-                Err(err) => Response::Error { message: err.to_string() },
+                Err(err) => Response::Error {
+                    message: err.to_string(),
+                },
             }
         }
 
@@ -344,48 +384,78 @@ async fn dispatch(
             let mut state = state.lock().await;
             let ws_id = match state.resolve_workspace(&workspace) {
                 Ok(id) => id,
-                Err(err) => return Response::Error { message: err.to_string() },
+                Err(err) => {
+                    return Response::Error {
+                        message: err.to_string(),
+                    };
+                }
             };
             match state.client_close(ws_id, pane) {
                 Ok(()) => {
                     broadcast_layout(&state, registry, ws_id).await;
                     Response::Ack
                 }
-                Err(err) => Response::Error { message: err.to_string() },
+                Err(err) => Response::Error {
+                    message: err.to_string(),
+                },
             }
         }
 
-        Request::ClientRename { workspace, pane, new_name } => {
+        Request::ClientRename {
+            workspace,
+            pane,
+            new_name,
+        } => {
             let mut state = state.lock().await;
             let ws_id = match state.resolve_workspace(&workspace) {
                 Ok(id) => id,
-                Err(err) => return Response::Error { message: err.to_string() },
+                Err(err) => {
+                    return Response::Error {
+                        message: err.to_string(),
+                    };
+                }
             };
             match state.client_rename(ws_id, pane, new_name) {
                 Ok(()) => {
                     broadcast_layout(&state, registry, ws_id).await;
                     Response::Ack
                 }
-                Err(err) => Response::Error { message: err.to_string() },
+                Err(err) => Response::Error {
+                    message: err.to_string(),
+                },
             }
         }
 
-        Request::ClientBind { workspace, pane, target } => {
+        Request::ClientBind {
+            workspace,
+            pane,
+            target,
+        } => {
             let mut state = state.lock().await;
             let ws_id = match state.resolve_workspace(&workspace) {
                 Ok(id) => id,
-                Err(err) => return Response::Error { message: err.to_string() },
+                Err(err) => {
+                    return Response::Error {
+                        message: err.to_string(),
+                    };
+                }
             };
             let target_id = match state.resolve_server_pane(&target) {
                 Ok(id) => id,
-                Err(err) => return Response::Error { message: err.to_string() },
+                Err(err) => {
+                    return Response::Error {
+                        message: err.to_string(),
+                    };
+                }
             };
             match state.client_bind(ws_id, pane, target_id) {
                 Ok(()) => {
                     broadcast_layout(&state, registry, ws_id).await;
                     Response::Ack
                 }
-                Err(err) => Response::Error { message: err.to_string() },
+                Err(err) => Response::Error {
+                    message: err.to_string(),
+                },
             }
         }
 
@@ -393,26 +463,44 @@ async fn dispatch(
             let mut state = state.lock().await;
             let ws_id = match state.resolve_workspace(&workspace) {
                 Ok(id) => id,
-                Err(err) => return Response::Error { message: err.to_string() },
+                Err(err) => {
+                    return Response::Error {
+                        message: err.to_string(),
+                    };
+                }
             };
             match state.client_unbind(ws_id, pane) {
                 Ok(()) => {
                     broadcast_layout(&state, registry, ws_id).await;
                     Response::Ack
                 }
-                Err(err) => Response::Error { message: err.to_string() },
+                Err(err) => Response::Error {
+                    message: err.to_string(),
+                },
             }
         }
 
-        Request::ClientAddTab { workspace, pane, target } => {
+        Request::ClientAddTab {
+            workspace,
+            pane,
+            target,
+        } => {
             let mut state = state.lock().await;
             let ws_id = match state.resolve_workspace(&workspace) {
                 Ok(id) => id,
-                Err(err) => return Response::Error { message: err.to_string() },
+                Err(err) => {
+                    return Response::Error {
+                        message: err.to_string(),
+                    };
+                }
             };
             let target_id = match state.resolve_server_pane(&target) {
                 Ok(id) => id,
-                Err(err) => return Response::Error { message: err.to_string() },
+                Err(err) => {
+                    return Response::Error {
+                        message: err.to_string(),
+                    };
+                }
             };
             match state.client_add_tab(ws_id, pane, target_id) {
                 Ok(()) => {
@@ -429,15 +517,25 @@ async fn dispatch(
                     }
                     Response::Ack
                 }
-                Err(err) => Response::Error { message: err.to_string() },
+                Err(err) => Response::Error {
+                    message: err.to_string(),
+                },
             }
         }
 
-        Request::ClientCycleTab { workspace, pane, forward } => {
+        Request::ClientCycleTab {
+            workspace,
+            pane,
+            forward,
+        } => {
             let mut state = state.lock().await;
             let ws_id = match state.resolve_workspace(&workspace) {
                 Ok(id) => id,
-                Err(err) => return Response::Error { message: err.to_string() },
+                Err(err) => {
+                    return Response::Error {
+                        message: err.to_string(),
+                    };
+                }
             };
             match state.client_cycle_tab(ws_id, pane, forward) {
                 Ok(()) => {
@@ -445,15 +543,18 @@ async fn dispatch(
                     // Same rationale as ClientAddTab above: the tab
                     // cycled onto needs its grid pushed, not just the
                     // layout change that says which tab is now active.
-                    let prepared =
-                        state.bound_server_pane(pane).and_then(|sp| broadcast_grid_prepare(&state, sp));
+                    let prepared = state
+                        .bound_server_pane(pane)
+                        .and_then(|sp| broadcast_grid_prepare(&state, sp));
                     drop(state);
                     if let Some(broadcast) = prepared {
                         broadcast_grid_send(registry, broadcast).await;
                     }
                     Response::Ack
                 }
-                Err(err) => Response::Error { message: err.to_string() },
+                Err(err) => Response::Error {
+                    message: err.to_string(),
+                },
             }
         }
 
@@ -461,7 +562,11 @@ async fn dispatch(
             let mut state = state.lock().await;
             let ws_id = match state.resolve_workspace(&workspace) {
                 Ok(id) => id,
-                Err(err) => return Response::Error { message: err.to_string() },
+                Err(err) => {
+                    return Response::Error {
+                        message: err.to_string(),
+                    };
+                }
             };
             match state.client_close_tab(ws_id, pane) {
                 // Both outcomes need the same broadcast: `LeafClosed` already
@@ -474,15 +579,18 @@ async fn dispatch(
                     // reason ClientCycleTab does. LeafClosed leaves no
                     // pane bound here at all, so `bound_server_pane`
                     // correctly yields nothing to push.
-                    let prepared =
-                        state.bound_server_pane(pane).and_then(|sp| broadcast_grid_prepare(&state, sp));
+                    let prepared = state
+                        .bound_server_pane(pane)
+                        .and_then(|sp| broadcast_grid_prepare(&state, sp));
                     drop(state);
                     if let Some(broadcast) = prepared {
                         broadcast_grid_send(registry, broadcast).await;
                     }
                     Response::Ack
                 }
-                Err(err) => Response::Error { message: err.to_string() },
+                Err(err) => Response::Error {
+                    message: err.to_string(),
+                },
             }
         }
 
@@ -492,14 +600,21 @@ async fn dispatch(
                 Some(w) => {
                     let ws_id = match state.resolve_workspace(&w) {
                         Ok(id) => id,
-                        Err(err) => return Response::Error { message: err.to_string() },
+                        Err(err) => {
+                            return Response::Error {
+                                message: err.to_string(),
+                            };
+                        }
                     };
                     let panes: Vec<ClientPane> = state
                         .client_list(Some(ws_id))
                         .into_iter()
                         .map(|(_, pane)| pane)
                         .collect();
-                    Response::ClientPaneList { workspace: ws_id, panes }
+                    Response::ClientPaneList {
+                        workspace: ws_id,
+                        panes,
+                    }
                 }
                 None => {
                     // PROTOCOL SHAPE MISMATCH (flagged, not fixed here —
@@ -515,7 +630,7 @@ async fn dispatch(
                     // for "all these panes are in workspace X" — real ids
                     // come from `WorkspaceId::new_v4()`, which never
                     // yields nil) but callers that only look at `panes`
-                    // and ignore `workspace` are unaffected. `dimux
+                    // and ignore `workspace` are unaffected. `dimax
                     // client ls` (no arg) is exactly this path; a caller
                     // that cares which workspace each pane belongs to
                     // needs a per-workspace `ClientList` call instead.
@@ -527,7 +642,10 @@ async fn dispatch(
                         .into_iter()
                         .map(|(_, pane)| pane)
                         .collect();
-                    Response::ClientPaneList { workspace: Uuid::nil(), panes }
+                    Response::ClientPaneList {
+                        workspace: Uuid::nil(),
+                        panes,
+                    }
                 }
             }
         }
@@ -536,13 +654,21 @@ async fn dispatch(
             let mut state = state.lock().await;
             let ws_id = match state.resolve_or_create_workspace(&workspace) {
                 Ok(id) => id,
-                Err(err) => return Response::Error { message: err.to_string() },
+                Err(err) => {
+                    return Response::Error {
+                        message: err.to_string(),
+                    };
+                }
             };
             state.subscribe(subscriber_id, ws_id);
             *subscribed_workspace = Some(ws_id);
             let info = match state.workspace_info(ws_id) {
                 Ok(info) => info,
-                Err(err) => return Response::Error { message: err.to_string() },
+                Err(err) => {
+                    return Response::Error {
+                        message: err.to_string(),
+                    };
+                }
             };
             let grids = info
                 .tree
@@ -559,7 +685,10 @@ async fn dispatch(
                         .collect()
                 })
                 .unwrap_or_default();
-            Response::Snapshot { workspace: info, grids }
+            Response::Snapshot {
+                workspace: info,
+                grids,
+            }
         }
 
         Request::Unsubscribe { workspace } => {
@@ -575,7 +704,8 @@ async fn dispatch(
             let mut guard = state.lock().await;
             let affected = guard.bound_server_pane(pane);
             guard.resize_client_pane(pane, size);
-            let prepared = affected.and_then(|server_pane| broadcast_grid_prepare(&guard, server_pane));
+            let prepared =
+                affected.and_then(|server_pane| broadcast_grid_prepare(&guard, server_pane));
             // Drop the lock before the expensive serialize+push -- see
             // `broadcast_grid_prepare`'s doc comment.
             drop(guard);
@@ -599,18 +729,28 @@ async fn dispatch(
             Response::Ack
         }
 
-        Request::ResizeSplit { workspace, split, new_ratio } => {
+        Request::ResizeSplit {
+            workspace,
+            split,
+            new_ratio,
+        } => {
             let mut state = state.lock().await;
             let ws_id = match state.resolve_workspace(&workspace) {
                 Ok(id) => id,
-                Err(err) => return Response::Error { message: err.to_string() },
+                Err(err) => {
+                    return Response::Error {
+                        message: err.to_string(),
+                    };
+                }
             };
             match state.resize_split(ws_id, split, new_ratio) {
                 Ok(()) => {
                     broadcast_layout(&state, registry, ws_id).await;
                     Response::Ack
                 }
-                Err(err) => Response::Error { message: err.to_string() },
+                Err(err) => Response::Error {
+                    message: err.to_string(),
+                },
             }
         }
 
@@ -633,19 +773,33 @@ async fn dispatch(
             let state = state.lock().await;
             let id = match state.resolve_server_pane(&target) {
                 Ok(id) => id,
-                Err(err) => return Response::Error { message: err.to_string() },
+                Err(err) => {
+                    return Response::Error {
+                        message: err.to_string(),
+                    };
+                }
             };
             let server_pane = state
                 .server_pane(id)
                 .expect("resolve_server_pane only yields ids present in the pool");
-            Response::ServerReadOutput { text: server_pane.snapshot_text() }
+            Response::ServerReadOutput {
+                text: server_pane.snapshot_text(),
+            }
         }
 
-        Request::ServerSend { target, text, enter } => {
+        Request::ServerSend {
+            target,
+            text,
+            enter,
+        } => {
             let state = state.lock().await;
             let id = match state.resolve_server_pane(&target) {
                 Ok(id) => id,
-                Err(err) => return Response::Error { message: err.to_string() },
+                Err(err) => {
+                    return Response::Error {
+                        message: err.to_string(),
+                    };
+                }
             };
             let server_pane = state
                 .server_pane(id)
@@ -667,7 +821,9 @@ async fn dispatch(
 fn ok_or_err<T>(result: anyhow::Result<T>, f: impl FnOnce(T) -> Response) -> Response {
     match result {
         Ok(value) => f(value),
-        Err(err) => Response::Error { message: err.to_string() },
+        Err(err) => Response::Error {
+            message: err.to_string(),
+        },
     }
 }
 
@@ -680,7 +836,10 @@ async fn broadcast_layout(state: &State, registry: &SubscriberRegistry, workspac
     let Ok(info) = state.workspace_info(workspace) else {
         return;
     };
-    let event = ServerMessage::Event(Event::LayoutDelta { workspace, tree: info.tree });
+    let event = ServerMessage::Event(Event::LayoutDelta {
+        workspace,
+        tree: info.tree,
+    });
     let subscribers = state.subscribers_for_workspace(workspace);
     push_to_subscribers(registry, &subscribers, &event).await;
 }
@@ -717,7 +876,7 @@ struct GridBroadcast {
 /// to JSON is the actually expensive step (~22ms measured for the same
 /// 50x200 pane, roughly 10x the snapshot itself) — doing it while every
 /// other request in the daemon is blocked on the same global lock is
-/// what caused dimux to visibly freeze (stop responding to keystrokes in
+/// what caused dimax to visibly freeze (stop responding to keystrokes in
 /// any other pane) whenever a watched pane produced output rapidly
 /// enough (e.g. an animated startup banner).
 fn broadcast_grid_prepare(state: &State, server_pane: ServerPaneId) -> Option<GridBroadcast> {
@@ -736,7 +895,9 @@ fn broadcast_grid_prepare(state: &State, server_pane: ServerPaneId) -> Option<Gr
     let groups = by_offset
         .into_iter()
         .map(|(offset, subs)| {
-            let event = ServerMessage::Event(Event::GridDelta { snapshot: pane.snapshot(offset) });
+            let event = ServerMessage::Event(Event::GridDelta {
+                snapshot: pane.snapshot(offset),
+            });
             (event, subs)
         })
         .collect();
@@ -773,7 +934,7 @@ async fn push_to_subscribers(
 }
 
 fn tracing_lite_log(msg: &str) {
-    eprintln!("[dimux-daemon] {msg}");
+    eprintln!("[dimax-daemon] {msg}");
 }
 
 /// Integration tests per design doc "Testing" > Integration tier: the
@@ -787,8 +948,8 @@ mod tests {
     use crate::protocol::{Size, SplitDir};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
-    use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
     use tokio::net::UnixStream;
+    use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
     /// Owns the socket file path `run()` binds and removes it on drop.
     /// `UnixListener::bind` requires the path not to already exist, and
@@ -804,8 +965,10 @@ mod tests {
     }
 
     async fn start_daemon() -> SocketGuard {
-        let path = std::env::temp_dir().join(format!("dimux-test-{}.sock", Uuid::new_v4()));
-        run(path.clone()).await.expect("daemon should bind and start");
+        let path = std::env::temp_dir().join(format!("dimax-test-{}.sock", Uuid::new_v4()));
+        run(path.clone())
+            .await
+            .expect("daemon should bind and start");
         SocketGuard(path)
     }
 
@@ -816,7 +979,7 @@ mod tests {
     /// leftover socket file permanently blocking every subsequent start).
     #[tokio::test]
     async fn stale_socket_file_is_cleaned_up_before_binding() {
-        let path = std::env::temp_dir().join(format!("dimux-test-{}.sock", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("dimax-test-{}.sock", Uuid::new_v4()));
         let _guard = SocketGuard(path.clone());
 
         // Create a listener and immediately drop it without unlinking --
@@ -826,10 +989,15 @@ mod tests {
             let listener = UnixListener::bind(&path).unwrap();
             drop(listener);
         }
-        assert!(path.exists(), "the stale file should still be on disk after the listener drops");
+        assert!(
+            path.exists(),
+            "the stale file should still be on disk after the listener drops"
+        );
 
         // A real daemon must still be able to start at this path.
-        run(path.clone()).await.expect("daemon should clean up the stale file and bind");
+        run(path.clone())
+            .await
+            .expect("daemon should clean up the stale file and bind");
 
         // And a client must be able to connect to it.
         let mut conn = TestConn::connect(&path).await;
@@ -933,7 +1101,7 @@ mod tests {
                 name: None,
                 cmd: Some("printf hello".to_string()),
                 cwd: None,
-            workspace: None,
+                workspace: None,
             })
             .await
         {
@@ -983,13 +1151,20 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
 
-        assert_eq!(grids.len(), 1, "expected exactly one grid for the bound server-pane");
+        assert_eq!(
+            grids.len(),
+            1,
+            "expected exactly one grid for the bound server-pane"
+        );
         let text: String = grids[0]
             .lines
             .iter()
             .flat_map(|row| row.iter().map(|c| c.text.as_str()))
             .collect();
-        assert!(text.contains("hello"), "grid text did not contain \"hello\": {text:?}");
+        assert!(
+            text.contains("hello"),
+            "grid text did not contain \"hello\": {text:?}"
+        );
     }
 
     /// Two connections `Subscribe` to the same workspace; a third,
@@ -1029,7 +1204,7 @@ mod tests {
         }
 
         // A bare CLI-style request from a third, never-subscribed
-        // connection — simulates `dimux client spawn <ws> --split <pane>`.
+        // connection — simulates `dimax client spawn <ws> --split <pane>`.
         match cli
             .request(Request::ClientSpawn {
                 workspace: workspace.to_string(),
@@ -1049,9 +1224,15 @@ mod tests {
                 .await
                 .expect("expected a LayoutDelta push within 2s");
             match event {
-                Event::LayoutDelta { workspace: ws, tree } => {
+                Event::LayoutDelta {
+                    workspace: ws,
+                    tree,
+                } => {
                     assert_eq!(ws, workspace);
-                    assert!(tree.is_some(), "split should have produced a non-empty tree");
+                    assert!(
+                        tree.is_some(),
+                        "split should have produced a non-empty tree"
+                    );
                 }
                 other => panic!("expected LayoutDelta, got {other:?}"),
             }
@@ -1072,7 +1253,7 @@ mod tests {
                 name: None,
                 cmd: Some("cat".to_string()),
                 cwd: None,
-            workspace: None,
+                workspace: None,
             })
             .await
         {
@@ -1122,7 +1303,9 @@ mod tests {
                 })
                 .await
             {
-                Response::Snapshot { workspace: info, .. } => {
+                Response::Snapshot {
+                    workspace: info, ..
+                } => {
                     let tree = info.tree.expect("workspace should still have its pane");
                     let leaf = tree.find(pane).expect("client-pane should still exist");
                     assert_eq!(
@@ -1140,7 +1323,7 @@ mod tests {
     /// actions (see docs/superpowers/specs/2026-08-03-attach-menu-groups-
     /// and-shortcuts-design.md): both requests the menu now issues
     /// directly must still round-trip through the wire protocol exactly
-    /// as `dimux server kill`/`rename` already do. This is regression
+    /// as `dimax server kill`/`rename` already do. This is regression
     /// coverage for the wiring, not new daemon logic -- ServerKill and
     /// ServerRename's actual behavior is already covered by
     /// `server_kill_unbinds_client_panes_across_workspaces` above and by
@@ -1151,7 +1334,12 @@ mod tests {
         let mut conn = TestConn::connect(&guard.0).await;
 
         let server_pane = match conn
-            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None , workspace: None})
+            .request(Request::ServerSpawn {
+                name: None,
+                cmd: Some("cat".to_string()),
+                cwd: None,
+                workspace: None,
+            })
             .await
         {
             Response::ServerPane(info) => info.id,
@@ -1171,14 +1359,19 @@ mod tests {
 
         match conn.request(Request::ServerList).await {
             Response::ServerPaneList(list) => {
-                let pane = list.iter().find(|p| p.id == server_pane).expect("pane should still exist");
+                let pane = list
+                    .iter()
+                    .find(|p| p.id == server_pane)
+                    .expect("pane should still exist");
                 assert_eq!(pane.name.as_deref(), Some("renamed-from-menu"));
             }
             other => panic!("expected ServerPaneList, got {other:?}"),
         }
 
         match conn
-            .request(Request::ServerKill { target: server_pane.to_string() })
+            .request(Request::ServerKill {
+                target: server_pane.to_string(),
+            })
             .await
         {
             Response::Ack => {}
@@ -1209,7 +1402,12 @@ mod tests {
         let mut conn = TestConn::connect(&guard.0).await;
 
         let server_pane = match conn
-            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None , workspace: None})
+            .request(Request::ServerSpawn {
+                name: None,
+                cmd: Some("cat".to_string()),
+                cwd: None,
+                workspace: None,
+            })
             .await
         {
             Response::ServerPane(info) => info.id,
@@ -1232,7 +1430,12 @@ mod tests {
         // above should show up in the pane's screen shortly after.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
-            match conn.request(Request::ServerRead { target: server_pane.to_string() }).await {
+            match conn
+                .request(Request::ServerRead {
+                    target: server_pane.to_string(),
+                })
+                .await
+            {
                 Response::ServerReadOutput { text } => {
                     if text.contains("hello-from-server-send") {
                         break;
@@ -1240,7 +1443,10 @@ mod tests {
                 }
                 other => panic!("expected ServerReadOutput, got {other:?}"),
             }
-            assert!(std::time::Instant::now() < deadline, "cat never echoed the sent text back");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cat never echoed the sent text back"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
@@ -1260,7 +1466,7 @@ mod tests {
                 name: None,
                 cmd: Some("pwd".to_string()),
                 cwd: Some("/tmp".to_string()),
-            workspace: None,
+                workspace: None,
             })
             .await
         {
@@ -1270,7 +1476,12 @@ mod tests {
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
-            match conn.request(Request::ServerRead { target: server_pane.to_string() }).await {
+            match conn
+                .request(Request::ServerRead {
+                    target: server_pane.to_string(),
+                })
+                .await
+            {
                 // `/tmp` resolves to `/private/tmp` on macOS -- match on
                 // "tmp" (what `pwd` actually prints) rather than the
                 // literal path string passed in.
@@ -1278,7 +1489,10 @@ mod tests {
                 Response::ServerReadOutput { .. } => {}
                 other => panic!("expected ServerReadOutput, got {other:?}"),
             }
-            assert!(std::time::Instant::now() < deadline, "pwd never printed the /tmp cwd it was spawned with");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pwd never printed the /tmp cwd it was spawned with"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
@@ -1288,7 +1502,12 @@ mod tests {
         let guard = start_daemon().await;
         let mut conn = TestConn::connect(&guard.0).await;
 
-        match conn.request(Request::ServerRead { target: "no-such-pane".to_string() }).await {
+        match conn
+            .request(Request::ServerRead {
+                target: "no-such-pane".to_string(),
+            })
+            .await
+        {
             Response::Error { .. } => {}
             other => panic!("expected Error, got {other:?}"),
         }
@@ -1318,7 +1537,12 @@ mod tests {
         let mut conn = TestConn::connect(&guard.0).await;
 
         let server_pane = match conn
-            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None , workspace: None})
+            .request(Request::ServerSpawn {
+                name: None,
+                cmd: Some("cat".to_string()),
+                cwd: None,
+                workspace: None,
+            })
             .await
         {
             Response::ServerPane(info) => info.id,
@@ -1339,15 +1563,25 @@ mod tests {
         };
 
         match conn
-            .request(Request::ClientUnbind { workspace: workspace.to_string(), pane })
+            .request(Request::ClientUnbind {
+                workspace: workspace.to_string(),
+                pane,
+            })
             .await
         {
             Response::Ack => {}
             other => panic!("expected Ack, got {other:?}"),
         }
 
-        match conn.request(Request::Subscribe { workspace: workspace.to_string() }).await {
-            Response::Snapshot { workspace: info, .. } => {
+        match conn
+            .request(Request::Subscribe {
+                workspace: workspace.to_string(),
+            })
+            .await
+        {
+            Response::Snapshot {
+                workspace: info, ..
+            } => {
                 let tree = info.tree.expect("workspace should still have its pane");
                 let leaf = tree.find(pane).expect("client-pane should still exist");
                 assert_eq!(leaf.active_bound(), None, "client-pane should be unbound");
@@ -1382,8 +1616,8 @@ mod tests {
                     name: None,
                     cmd: Some("cat".to_string()),
                     cwd: None,
-                workspace: None,
-            })
+                    workspace: None,
+                })
                 .await
             {
                 Response::ServerPane(info) => info.id,
@@ -1413,8 +1647,15 @@ mod tests {
             workspace: WorkspaceId,
             pane: protocol::ClientPaneId,
         ) -> (Vec<ServerPaneId>, usize) {
-            match conn.request(Request::Subscribe { workspace: workspace.to_string() }).await {
-                Response::Snapshot { workspace: info, .. } => {
+            match conn
+                .request(Request::Subscribe {
+                    workspace: workspace.to_string(),
+                })
+                .await
+            {
+                Response::Snapshot {
+                    workspace: info, ..
+                } => {
                     let tree = info.tree.expect("workspace should have a tree");
                     let leaf = tree.find(pane).expect("client-pane should exist");
                     (leaf.tabs.clone(), leaf.active_tab)
@@ -1467,13 +1708,25 @@ mod tests {
                 other => panic!("expected Ack, got {other:?}"),
             }
             let (tabs, active) = tabs_of(&mut conn, workspace, pane).await;
-            assert_eq!(tabs, vec![first, second], "cycling must not change the tab list");
-            assert_eq!(active, expected_active, "cycle forward={forward} should wrap");
+            assert_eq!(
+                tabs,
+                vec![first, second],
+                "cycling must not change the tab list"
+            );
+            assert_eq!(
+                active, expected_active,
+                "cycle forward={forward} should wrap"
+            );
         }
 
         // Closing the active tab (`second`) leaves the other tab, and the
         // closed tab's server-pane, alive.
-        match conn.request(Request::ClientCloseTab { workspace: workspace.to_string(), pane }).await
+        match conn
+            .request(Request::ClientCloseTab {
+                workspace: workspace.to_string(),
+                pane,
+            })
+            .await
         {
             Response::Ack => {}
             other => panic!("expected Ack, got {other:?}"),
@@ -1493,13 +1746,25 @@ mod tests {
 
         // Closing the last tab closes the leaf itself (design doc: there is
         // no reachable 0-tab-but-present leaf state).
-        match conn.request(Request::ClientCloseTab { workspace: workspace.to_string(), pane }).await
+        match conn
+            .request(Request::ClientCloseTab {
+                workspace: workspace.to_string(),
+                pane,
+            })
+            .await
         {
             Response::Ack => {}
             other => panic!("expected Ack, got {other:?}"),
         }
-        match conn.request(Request::Subscribe { workspace: workspace.to_string() }).await {
-            Response::Snapshot { workspace: info, .. } => {
+        match conn
+            .request(Request::Subscribe {
+                workspace: workspace.to_string(),
+            })
+            .await
+        {
+            Response::Snapshot {
+                workspace: info, ..
+            } => {
                 assert!(
                     info.tree.is_none(),
                     "closing the last tab of the only leaf should empty the workspace"
@@ -1529,8 +1794,8 @@ mod tests {
                     name: None,
                     cmd: Some(format!("printf {text}")),
                     cwd: None,
-                workspace: None,
-            })
+                    workspace: None,
+                })
                 .await
             {
                 Response::ServerPane(info) => info.id,
@@ -1545,12 +1810,20 @@ mod tests {
             // "still starting up" from "the fix didn't work".
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             loop {
-                match conn.request(Request::ServerRead { target: id.to_string() }).await {
+                match conn
+                    .request(Request::ServerRead {
+                        target: id.to_string(),
+                    })
+                    .await
+                {
                     Response::ServerReadOutput { text: seen } if seen.contains(text) => break,
                     Response::ServerReadOutput { .. } => {}
                     other => panic!("expected ServerReadOutput, got {other:?}"),
                 }
-                assert!(std::time::Instant::now() < deadline, "pane never printed {text:?}");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "pane never printed {text:?}"
+                );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             id
@@ -1570,13 +1843,22 @@ mod tests {
             other => panic!("expected ClientPaneCreated, got {other:?}"),
         };
 
-        match subscriber.request(Request::Subscribe { workspace: workspace.to_string() }).await {
+        match subscriber
+            .request(Request::Subscribe {
+                workspace: workspace.to_string(),
+            })
+            .await
+        {
             Response::Snapshot { .. } => {}
             other => panic!("expected Snapshot, got {other:?}"),
         }
         // Drain whatever GridDelta(s) `first`'s own printf produced so
         // they can't be mistaken for the tab-add/cycle push below.
-        while subscriber.read_event(Duration::from_millis(100)).await.is_some() {}
+        while subscriber
+            .read_event(Duration::from_millis(100))
+            .await
+            .is_some()
+        {}
 
         // Spawn a *second* pane whose own output already happened and
         // finished well before it's ever added as a tab -- nothing about
@@ -1586,7 +1868,11 @@ mod tests {
         while conn.read_event(Duration::from_millis(50)).await.is_some() {}
 
         match conn
-            .request(Request::ClientAddTab { workspace: workspace.to_string(), pane, target: second.to_string() })
+            .request(Request::ClientAddTab {
+                workspace: workspace.to_string(),
+                pane,
+                target: second.to_string(),
+            })
             .await
         {
             Response::Ack => {}
@@ -1602,12 +1888,24 @@ mod tests {
                 _ => continue,
             }
         };
-        let text: String =
-            grid.lines.iter().flat_map(|row| row.iter().map(|c| c.text.as_str())).collect();
-        assert!(text.contains("second-output"), "pushed grid should be for the newly-active pane: {text:?}");
+        let text: String = grid
+            .lines
+            .iter()
+            .flat_map(|row| row.iter().map(|c| c.text.as_str()))
+            .collect();
+        assert!(
+            text.contains("second-output"),
+            "pushed grid should be for the newly-active pane: {text:?}"
+        );
 
         // Cycle back to `first` -- same requirement applies.
-        match conn.request(Request::ClientCycleTab { workspace: workspace.to_string(), pane, forward: false }).await
+        match conn
+            .request(Request::ClientCycleTab {
+                workspace: workspace.to_string(),
+                pane,
+                forward: false,
+            })
+            .await
         {
             Response::Ack => {}
             other => panic!("expected Ack, got {other:?}"),
@@ -1622,9 +1920,15 @@ mod tests {
                 _ => continue,
             }
         };
-        let text: String =
-            grid.lines.iter().flat_map(|row| row.iter().map(|c| c.text.as_str())).collect();
-        assert!(text.contains("first-output"), "pushed grid should be for the newly-active pane: {text:?}");
+        let text: String = grid
+            .lines
+            .iter()
+            .flat_map(|row| row.iter().map(|c| c.text.as_str()))
+            .collect();
+        assert!(
+            text.contains("first-output"),
+            "pushed grid should be for the newly-active pane: {text:?}"
+        );
     }
 
     /// `ResizeSplit` updates a divider's ratio (mouse-drag resizing,
@@ -1662,8 +1966,15 @@ mod tests {
             other => panic!("expected ClientPaneCreated, got {other:?}"),
         }
 
-        let split_id = match conn.request(Request::Subscribe { workspace: workspace.to_string() }).await {
-            Response::Snapshot { workspace: info, .. } => match info.tree.unwrap() {
+        let split_id = match conn
+            .request(Request::Subscribe {
+                workspace: workspace.to_string(),
+            })
+            .await
+        {
+            Response::Snapshot {
+                workspace: info, ..
+            } => match info.tree.unwrap() {
                 protocol::SplitTree::Split { id, .. } => id,
                 other => panic!("expected a split, got {other:?}"),
             },
@@ -1671,15 +1982,26 @@ mod tests {
         };
 
         match conn
-            .request(Request::ResizeSplit { workspace: workspace.to_string(), split: split_id, new_ratio: 0.25 })
+            .request(Request::ResizeSplit {
+                workspace: workspace.to_string(),
+                split: split_id,
+                new_ratio: 0.25,
+            })
             .await
         {
             Response::Ack => {}
             other => panic!("expected Ack, got {other:?}"),
         }
 
-        match conn.request(Request::Subscribe { workspace: workspace.to_string() }).await {
-            Response::Snapshot { workspace: info, .. } => match info.tree.unwrap() {
+        match conn
+            .request(Request::Subscribe {
+                workspace: workspace.to_string(),
+            })
+            .await
+        {
+            Response::Snapshot {
+                workspace: info, ..
+            } => match info.tree.unwrap() {
                 protocol::SplitTree::Split { ratio, .. } => assert_eq!(ratio, 0.25),
                 other => panic!("expected a split, got {other:?}"),
             },
@@ -1738,7 +2060,10 @@ mod tests {
         match conn
             .request(Request::ResizeClientPane {
                 pane,
-                size: Size { rows: 40, cols: 120 },
+                size: Size {
+                    rows: 40,
+                    cols: 120,
+                },
             })
             .await
         {
@@ -1746,7 +2071,12 @@ mod tests {
             other => panic!("expected Ack, got {other:?}"),
         }
 
-        match conn.request(Request::Subscribe { workspace: workspace.to_string() }).await {
+        match conn
+            .request(Request::Subscribe {
+                workspace: workspace.to_string(),
+            })
+            .await
+        {
             Response::Snapshot { grids, .. } => {
                 // No server-pane is bound yet in this test, so `grids`
                 // is empty -- this test only needs to confirm the
@@ -1762,7 +2092,12 @@ mod tests {
         }
 
         let server_pane = match conn
-            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None , workspace: None})
+            .request(Request::ServerSpawn {
+                name: None,
+                cmd: Some("cat".to_string()),
+                cwd: None,
+                workspace: None,
+            })
             .await
         {
             Response::ServerPane(info) => info.id,
@@ -1780,12 +2115,24 @@ mod tests {
             other => panic!("expected Ack, got {other:?}"),
         }
 
-        match conn.request(Request::Subscribe { workspace: workspace.to_string() }).await {
+        match conn
+            .request(Request::Subscribe {
+                workspace: workspace.to_string(),
+            })
+            .await
+        {
             Response::Snapshot { grids, .. } => {
-                assert_eq!(grids.len(), 1, "expected exactly one grid for the bound server-pane");
+                assert_eq!(
+                    grids.len(),
+                    1,
+                    "expected exactly one grid for the bound server-pane"
+                );
                 assert_eq!(
                     grids[0].size,
-                    Size { rows: 40, cols: 120 },
+                    Size {
+                        rows: 40,
+                        cols: 120
+                    },
                     "server-pane's grid size should reflect the earlier ResizeClientPane call"
                 );
             }
@@ -1804,7 +2151,12 @@ mod tests {
 
         let mut owner = TestConn::connect(&guard.0).await;
         let server_pane = match owner
-            .request(Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None , workspace: None})
+            .request(Request::ServerSpawn {
+                name: None,
+                cmd: Some("cat".to_string()),
+                cwd: None,
+                workspace: None,
+            })
             .await
         {
             Response::ServerPane(info) => info.id,
@@ -1823,7 +2175,10 @@ mod tests {
             other => panic!("expected ClientPaneCreated, got {other:?}"),
         };
         match owner
-            .request(Request::ResizeClientPane { pane, size: Size { rows: 5, cols: 80 } })
+            .request(Request::ResizeClientPane {
+                pane,
+                size: Size { rows: 5, cols: 80 },
+            })
             .await
         {
             Response::Ack => {}
@@ -1833,7 +2188,12 @@ mod tests {
         let mut scroller = TestConn::connect(&guard.0).await;
         let mut watcher = TestConn::connect(&guard.0).await;
         for conn in [&mut scroller, &mut watcher] {
-            match conn.request(Request::Subscribe { workspace: workspace.to_string() }).await {
+            match conn
+                .request(Request::Subscribe {
+                    workspace: workspace.to_string(),
+                })
+                .await
+            {
                 Response::Snapshot { .. } => {}
                 other => panic!("expected Snapshot, got {other:?}"),
             }
@@ -1841,7 +2201,10 @@ mod tests {
 
         for i in 0..20 {
             match owner
-                .request(Request::Input { pane, bytes: format!("line-{i}\n").into_bytes() })
+                .request(Request::Input {
+                    pane,
+                    bytes: format!("line-{i}\n").into_bytes(),
+                })
                 .await
             {
                 Response::Ack => {}
@@ -1850,22 +2213,39 @@ mod tests {
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
-            if scroller.read_event(Duration::from_millis(50)).await.is_none() {
+            if scroller
+                .read_event(Duration::from_millis(50))
+                .await
+                .is_none()
+            {
                 break;
             }
         }
         while std::time::Instant::now() < deadline {
-            if watcher.read_event(Duration::from_millis(50)).await.is_none() {
+            if watcher
+                .read_event(Duration::from_millis(50))
+                .await
+                .is_none()
+            {
                 break;
             }
         }
 
-        match scroller.request(Request::ScrollClientPane { pane, delta: 3 }).await {
+        match scroller
+            .request(Request::ScrollClientPane { pane, delta: 3 })
+            .await
+        {
             Response::Ack => {}
             other => panic!("expected Ack, got {other:?}"),
         }
 
-        match owner.request(Request::Input { pane, bytes: b"more\n".to_vec() }).await {
+        match owner
+            .request(Request::Input {
+                pane,
+                bytes: b"more\n".to_vec(),
+            })
+            .await
+        {
             Response::Ack => {}
             other => panic!("expected Ack, got {other:?}"),
         }
@@ -1881,19 +2261,25 @@ mod tests {
 
         match scroller_event {
             Event::GridDelta { snapshot } => {
-                assert!(snapshot.scroll_offset > 0, "scroller's snapshot should reflect its scrolled offset");
+                assert!(
+                    snapshot.scroll_offset > 0,
+                    "scroller's snapshot should reflect its scrolled offset"
+                );
             }
             other => panic!("expected GridDelta, got {other:?}"),
         }
         match watcher_event {
             Event::GridDelta { snapshot } => {
-                assert_eq!(snapshot.scroll_offset, 0, "watcher never scrolled -- should stay live");
+                assert_eq!(
+                    snapshot.scroll_offset, 0,
+                    "watcher never scrolled -- should stay live"
+                );
             }
             other => panic!("expected GridDelta, got {other:?}"),
         }
     }
 
-    /// Regression test for the "dimux hangs often" bug: a watched
+    /// Regression test for the "dimax hangs often" bug: a watched
     /// server-pane producing rapid output must not block an UNRELATED
     /// request on a separate connection. Before the
     /// `broadcast_grid_prepare`/`broadcast_grid_send` split, every
@@ -1912,7 +2298,12 @@ mod tests {
         // already-cheap "nobody's watching" early-out.
         let mut busy_conn = TestConn::connect(&guard.0).await;
         let busy_server = match busy_conn
-            .request(Request::ServerSpawn { name: None, cmd: Some("yes".to_string()), cwd: None , workspace: None})
+            .request(Request::ServerSpawn {
+                name: None,
+                cmd: Some("yes".to_string()),
+                cwd: None,
+                workspace: None,
+            })
             .await
         {
             Response::ServerPane(info) => info.id,
@@ -1930,7 +2321,12 @@ mod tests {
             Response::ClientPaneCreated { workspace, .. } => workspace,
             other => panic!("expected ClientPaneCreated, got {other:?}"),
         };
-        match busy_conn.request(Request::Subscribe { workspace: busy_workspace.to_string() }).await {
+        match busy_conn
+            .request(Request::Subscribe {
+                workspace: busy_workspace.to_string(),
+            })
+            .await
+        {
             Response::Snapshot { .. } => {}
             other => panic!("expected Snapshot, got {other:?}"),
         }
@@ -1949,7 +2345,12 @@ mod tests {
         let start = std::time::Instant::now();
         for i in 0..10 {
             match other_conn
-                .request(Request::ServerSpawn { name: Some(format!("unrelated-{i}")), cmd: None, cwd: None , workspace: None})
+                .request(Request::ServerSpawn {
+                    name: Some(format!("unrelated-{i}")),
+                    cmd: None,
+                    cwd: None,
+                    workspace: None,
+                })
                 .await
             {
                 Response::ServerPane(_) => {}
