@@ -62,7 +62,10 @@ struct Config;
 
 impl TerminalConfiguration for Config {
     fn color_palette(&self) -> wezterm_term::color::ColorPalette {
-        wezterm_term::color::ColorPalette::default()
+        // Shares `palette_256`'s cached table (see its doc comment) so
+        // this and `color_attr_to_rgb`'s `PaletteIndex` resolution can
+        // never disagree about what a given index means.
+        palette_256().clone()
     }
 }
 
@@ -142,6 +145,19 @@ impl ServerPane {
         if let Some(cwd) = cwd {
             builder.cwd(cwd);
         }
+        // `CommandBuilder`'s default env is whatever the *daemon*
+        // inherited when it started (see `daemon::ensure_running`'s doc
+        // comment -- it's a long-lived, auto-spawned background process,
+        // so that can be an arbitrarily stale `TERM`/`COLORTERM` from a
+        // completely different terminal session, not the one the client
+        // is actually attached from right now). What matters instead is
+        // what *this* emulator (the `wezterm_term::Terminal` below, via
+        // `Config::color_palette`) actually understands, which is full
+        // 256-color plus truecolor -- so advertise that unconditionally
+        // rather than forwarding a value that has nothing to do with the
+        // terminal the child process is really talking to.
+        builder.env("TERM", "xterm-256color");
+        builder.env("COLORTERM", "truecolor");
 
         let child = slave.spawn_command(builder)?;
         // Drop our copy of the slave fd once the child has inherited its
@@ -582,29 +598,21 @@ fn blank_cell() -> Cell {
     }
 }
 
-/// Standard xterm 16-color ANSI palette, used only as a v1 approximation
-/// for `ColorAttribute::PaletteIndex(0..16)`. Anything outside that range
-/// (256-color palette, or a palette entry the terminal app never set)
-/// resolves to `None` rather than growing a full 256-entry table here —
-/// an acceptable simplification for v1 per the module contract.
-const ANSI16: [(u8, u8, u8); 16] = [
-    (0, 0, 0),
-    (205, 0, 0),
-    (0, 205, 0),
-    (205, 205, 0),
-    (0, 0, 238),
-    (205, 0, 205),
-    (0, 205, 205),
-    (229, 229, 229),
-    (127, 127, 127),
-    (255, 0, 0),
-    (0, 255, 0),
-    (255, 255, 0),
-    (92, 92, 255),
-    (255, 0, 255),
-    (0, 255, 255),
-    (255, 255, 255),
-];
+/// The full 256-color palette `ColorAttribute::PaletteIndex` resolves
+/// against -- indices 0..16 are the same ANSI colors `Config::
+/// color_palette` (this module's `TerminalConfiguration` impl) already
+/// hands the `Terminal` model, 16..232 the 6x6x6 color cube, 232..256 the
+/// grayscale ramp. Reading it from `wezterm_term`'s own default rather
+/// than a hand-rolled table (the previous 16-entry `ANSI16`, now removed)
+/// keeps this permanently in sync with `Config::color_palette` -- both
+/// resolve `PaletteIndex` against the exact same table by construction,
+/// so they can never drift the way two independently hand-copied ANSI
+/// tables eventually did.
+fn palette_256() -> &'static wezterm_term::color::ColorPalette {
+    static PALETTE: std::sync::OnceLock<wezterm_term::color::ColorPalette> =
+        std::sync::OnceLock::new();
+    PALETTE.get_or_init(wezterm_term::color::ColorPalette::default)
+}
 
 fn color_attr_to_rgb(attr: ColorAttribute) -> Option<(u8, u8, u8)> {
     match attr {
@@ -614,7 +622,10 @@ fn color_attr_to_rgb(attr: ColorAttribute) -> Option<(u8, u8, u8)> {
             let (r, g, b, _a) = srgb.to_srgb_u8();
             Some((r, g, b))
         }
-        ColorAttribute::PaletteIndex(idx) => ANSI16.get(idx as usize).copied(),
+        ColorAttribute::PaletteIndex(idx) => {
+            let (r, g, b, _a) = palette_256().colors.0[idx as usize].to_srgb_u8();
+            Some((r, g, b))
+        }
     }
 }
 
@@ -651,6 +662,76 @@ mod tests {
             }
         }
         pred()
+    }
+
+    #[test]
+    fn color_attr_to_rgb_default_is_none() {
+        assert_eq!(color_attr_to_rgb(ColorAttribute::Default), None);
+    }
+
+    #[test]
+    fn color_attr_to_rgb_resolves_basic_ansi_index_from_the_real_palette() {
+        // Index 1 (ANSI red/"Maroon") -- must match `palette_256`'s own
+        // table exactly, not a separately hand-copied approximation.
+        let expected = palette_256().colors.0[1].to_srgb_u8();
+        assert_eq!(
+            color_attr_to_rgb(ColorAttribute::PaletteIndex(1)),
+            Some((expected.0, expected.1, expected.2))
+        );
+    }
+
+    #[test]
+    fn color_attr_to_rgb_resolves_extended_256_color_index() {
+        // Index 196 falls in the 6x6x6 color cube (16..232), well outside
+        // the old 16-entry ANSI table -- this is exactly the range that
+        // used to silently resolve to `None` (default color).
+        let expected = palette_256().colors.0[196].to_srgb_u8();
+        assert_eq!(
+            color_attr_to_rgb(ColorAttribute::PaletteIndex(196)),
+            Some((expected.0, expected.1, expected.2))
+        );
+    }
+
+    #[test]
+    fn color_attr_to_rgb_prefers_true_color_over_its_palette_fallback() {
+        let srgb = wezterm_term::color::SrgbaTuple(1.0, 0.0, 0.0, 1.0);
+        assert_eq!(
+            color_attr_to_rgb(ColorAttribute::TrueColorWithPaletteFallback(srgb, 1)),
+            Some((255, 0, 0))
+        );
+    }
+
+    #[test]
+    fn spawn_overrides_term_and_colorterm_regardless_of_the_daemons_own_env() {
+        // The bug this guards against: a daemon that inherited a
+        // stale/unset TERM from whenever it happened to start (see
+        // `spawn`'s doc comment on why that's irrelevant to what this
+        // emulator actually supports) would otherwise leak that value
+        // into every pane it spawns. `CommandBuilder::env` unconditionally
+        // overrides any inherited value for the same key, so this holds
+        // no matter what this test process's own env contains.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let id = Uuid::new_v4();
+        let pane = ServerPane::spawn(
+            id,
+            None,
+            Some("printf TERM=$TERM:COLORTERM=$COLORTERM".to_string()),
+            None,
+            Size { rows: 24, cols: 80 },
+            tx,
+            None,
+            "test-short-id".to_string(),
+        )
+        .unwrap();
+
+        let found = wait_until(&mut rx, || {
+            snapshot_text(&pane).contains("TERM=xterm-256color:COLORTERM=truecolor")
+        });
+        assert!(
+            found,
+            "expected spawned pane to see the overridden TERM/COLORTERM, got: {}",
+            snapshot_text(&pane)
+        );
     }
 
     #[test]
