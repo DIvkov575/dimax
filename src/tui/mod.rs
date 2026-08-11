@@ -1427,12 +1427,15 @@ impl App {
         });
     }
 
-    /// Submit the active rename field's current text: a no-op if empty
-    /// (stays in rename mode rather than sending an empty name), sends
-    /// `Request::ServerRename` otherwise. On success, re-fetches and
-    /// re-groups the server list and closes rename mode. On
-    /// `Response::Error` (e.g. a name collision), records the message in
-    /// `rename.error` and stays open for another attempt.
+    /// Submit the active rename field's current text: emptying the field
+    /// (e.g. backspacing out a pre-filled name -- see `start_rename`) and
+    /// confirming resets the pane to its default display, sending
+    /// `Request::ServerRename` with `new_name: None` rather than treating
+    /// the blank field as a no-op. Non-empty text sends `Some` as
+    /// before. On success, re-fetches and re-groups the server list and
+    /// closes rename mode. On `Response::Error` (e.g. a name collision),
+    /// records the message in `rename.error` and stays open for another
+    /// attempt.
     async fn confirm_rename(
         &mut self,
         write_half: &mut OwnedWriteHalf,
@@ -1444,11 +1447,12 @@ impl App {
         let Some(rename) = &menu.rename else {
             return Ok(());
         };
-        if rename.text.is_empty() {
-            return Ok(());
-        }
         let target = menu.servers[rename.index].1.id.to_string();
-        let new_name = rename.text.clone();
+        let new_name = if rename.text.is_empty() {
+            None
+        } else {
+            Some(rename.text.clone())
+        };
         let req = Request::ServerRename { target, new_name };
         match self.request(write_half, reader, req).await? {
             Response::Ack => {

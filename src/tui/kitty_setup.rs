@@ -58,6 +58,15 @@ fn render_dimax_conf_with(custom: &[(String, Vec<u8>)]) -> String {
          # (otherwise both send the same \\r byte).\n\
          map shift+enter send_text all \\x1b_Ds\\x1b\\\\\n",
     );
+    out.push_str(
+        "\n# Skip Kitty's \"this paste has terminal control codes\" confirmation\n\
+         # dialog -- dimax panes routinely paste multi-line shell output, and\n\
+         # it would otherwise interrupt every one of those. Swaps Kitty's\n\
+         # default `confirm` action for `replace-dangerous-control-codes`,\n\
+         # which still strips unsafe control codes, just without asking first;\n\
+         # `quote-urls-at-prompt` is kept from Kitty's own default.\n\
+         paste_actions quote-urls-at-prompt,replace-dangerous-control-codes\n",
+    );
     out
 }
 
@@ -216,6 +225,12 @@ mod tests {
     fn render_dimax_conf_includes_the_shift_enter_mapping() {
         let rendered = render_dimax_conf();
         assert!(rendered.contains("map shift+enter send_text all \\x1b_Ds\\x1b\\\\"));
+    }
+
+    #[test]
+    fn render_dimax_conf_disables_the_paste_confirmation_dialog() {
+        let rendered = render_dimax_conf();
+        assert!(rendered.contains("paste_actions quote-urls-at-prompt,replace-dangerous-control-codes"));
     }
 
     #[test]

@@ -339,9 +339,13 @@ pub enum Request {
     ServerKill {
         target: String,
     },
+    /// `new_name: None` clears any custom name, resetting the pane back
+    /// to its default display (its `short_id`, or a freshly re-derived
+    /// session name -- see `daemon::state::apply_pending_session_names`)
+    /// rather than being a no-op.
     ServerRename {
         target: String,
-        new_name: String,
+        new_name: Option<String>,
     },
     ServerList,
     /// Flip whether `dir` sorts to the top of the attach menu's

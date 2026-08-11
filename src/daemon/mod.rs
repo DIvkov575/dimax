@@ -1349,7 +1349,7 @@ mod tests {
         match conn
             .request(Request::ServerRename {
                 target: server_pane.to_string(),
-                new_name: "renamed-from-menu".to_string(),
+                new_name: Some("renamed-from-menu".to_string()),
             })
             .await
         {

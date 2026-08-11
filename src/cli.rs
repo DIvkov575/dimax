@@ -117,9 +117,11 @@ pub enum ServerCmd {
     Kill {
         target: String,
     },
+    /// Omit `new_name` to clear any custom name, resetting the pane back
+    /// to its default display (short id / auto-derived session name).
     Rename {
         target: String,
-        new_name: String,
+        new_name: Option<String>,
     },
     Ls,
     /// Print a server-pane's current on-screen contents as plain text.
@@ -506,7 +508,10 @@ async fn run_server(cmd: ServerCmd) -> anyhow::Result<()> {
             };
             match client.request(req).await? {
                 Response::Ack => {
-                    println!("renamed server-pane {target} to {new_name}");
+                    match &new_name {
+                        Some(new_name) => println!("renamed server-pane {target} to {new_name}"),
+                        None => println!("reset server-pane {target} to its default name"),
+                    }
                     Ok(())
                 }
                 other => Err(unexpected_response("server rename", other)),

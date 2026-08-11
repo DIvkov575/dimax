@@ -255,9 +255,10 @@ impl State {
         Ok(())
     }
 
-    pub fn server_rename(&mut self, target: &str, new_name: String) -> anyhow::Result<()> {
+    pub fn server_rename(&mut self, target: &str, new_name: Option<String>) -> anyhow::Result<()> {
         let id = self.resolve_server_pane(target)?;
-        if let Some(clash) = self.find_server_pane_by_name(&new_name)
+        if let Some(new_name) = &new_name
+            && let Some(clash) = self.find_server_pane_by_name(new_name)
             && clash != id
         {
             anyhow::bail!("server-pane named {new_name:?} already exists");
@@ -265,7 +266,7 @@ impl State {
         self.server_panes
             .get_mut(&id)
             .expect("resolve_server_pane only yields ids present in the pool")
-            .set_name(Some(new_name));
+            .set_name(new_name);
         Ok(())
     }
 
@@ -1176,7 +1177,7 @@ mod tests {
     fn server_rename_then_resolvable_under_new_name_only() {
         let mut state = State::new();
         let id = spawn_pane(&mut state, "old");
-        state.server_rename("old", "new".to_string()).unwrap();
+        state.server_rename("old", Some("new".to_string())).unwrap();
         assert_eq!(state.resolve_server_pane("new").unwrap(), id);
         assert!(state.resolve_server_pane("old").is_err());
     }
@@ -1186,7 +1187,7 @@ mod tests {
         let mut state = State::new();
         spawn_pane(&mut state, "a");
         let b = spawn_pane(&mut state, "b");
-        let err = state.server_rename("b", "a".to_string()).unwrap_err();
+        let err = state.server_rename("b", Some("a".to_string())).unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
         assert_eq!(state.resolve_server_pane("b").unwrap(), b);
     }
@@ -1195,14 +1196,34 @@ mod tests {
     fn server_rename_to_same_name_is_allowed() {
         let mut state = State::new();
         let id = spawn_pane(&mut state, "a");
-        state.server_rename("a", "a".to_string()).unwrap();
+        state.server_rename("a", Some("a".to_string())).unwrap();
         assert_eq!(state.resolve_server_pane("a").unwrap(), id);
     }
 
     #[test]
     fn server_rename_unknown_errors() {
         let mut state = State::new();
-        assert!(state.server_rename("ghost", "x".to_string()).is_err());
+        assert!(state.server_rename("ghost", Some("x".to_string())).is_err());
+    }
+
+    #[test]
+    fn server_rename_to_none_clears_the_custom_name() {
+        let mut state = State::new();
+        let id = spawn_pane(&mut state, "custom");
+        state.server_rename("custom", None).unwrap();
+        assert_eq!(state.server_panes.get(&id).unwrap().name(), None);
+        assert!(state.resolve_server_pane("custom").is_err());
+    }
+
+    #[test]
+    fn server_rename_to_none_never_clashes_with_other_unnamed_panes() {
+        let mut state = State::new();
+        state
+            .server_spawn(None, Some("cat".to_string()), None, None)
+            .unwrap();
+        let named = spawn_pane(&mut state, "custom");
+        state.server_rename("custom", None).unwrap();
+        assert_eq!(state.server_panes.get(&named).unwrap().name(), None);
     }
 
     #[test]

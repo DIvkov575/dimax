@@ -702,9 +702,16 @@ fn attach_menu_line(
     let just_detached_marker = if just_detached { "*" } else { " " };
 
     if let Some(rename) = renaming {
+        // An emptied field resets the name on confirm (see
+        // `App::confirm_rename`) rather than no-op'ing -- shown as a
+        // placeholder so that isn't a silent, undiscoverable behavior.
+        let field = if rename.text.is_empty() {
+            format!("reset to {}", server.short_id)
+        } else {
+            rename.text.clone()
+        };
         let text = format!(
-            "  {just_detached_marker}{marker} [{}] {:<process_w$} {} {}",
-            rename.text,
+            "  {just_detached_marker}{marker} [{field}] {:<process_w$} {} {}",
             truncate_end(process, PROCESS_COL_WIDTH),
             server.short_id,
             status,
@@ -2245,6 +2252,39 @@ mod tests {
             .unwrap();
         assert!(buffer_contains(&terminal, "new-name"));
         assert!(buffer_contains(&terminal, "name taken"));
+    }
+
+    #[test]
+    fn draw_attach_menu_shows_reset_placeholder_for_an_emptied_rename_field() {
+        let server = ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: Some("old-name".to_string()),
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+            foreground: None,
+            owner_workspace: None,
+            short_id: "aa".to_string(),
+        };
+        let menu = super::super::AttachMenu {
+            servers: vec![("Unknown".to_string(), server)],
+            selected: 0,
+            pending_delete: None,
+            rename: Some(super::super::RenameState {
+                index: 0,
+                text: String::new(),
+                cursor: 0,
+                error: None,
+            }),
+            previously_bound: None,
+            spawn_in_group: None,
+            adding_tab: false,
+        };
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .unwrap();
+        assert!(buffer_contains(&terminal, "reset to aa"));
     }
 
     #[test]
