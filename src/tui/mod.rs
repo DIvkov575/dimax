@@ -2867,12 +2867,27 @@ pub async fn run_with_reconnect() -> anyhow::Result<()> {
             // Could be "the very first `Client::connect` inside `run`
             // failed because nothing's listening yet" (plausible right
             // in the middle of a hot restart) or a genuinely unrelated
-            // error. Either way, retrying up to the deadline below is
-            // strictly better than giving up on the first blip during
-            // exactly the window this feature exists for; a real,
-            // persistent problem still surfaces via
+            // error (e.g. a bug hit during `App::bootstrap`). Either
+            // way, retrying up to the deadline below is strictly
+            // better than giving up on the first blip during exactly
+            // the window this feature exists for; a real, persistent
+            // connectivity problem still surfaces via
             // `wait_for_daemon_or_bail`'s own timeout below.
-            Err(_) => {}
+            //
+            // Unlike `ConnectionLost`, this case isn't guaranteed to
+            // cost any real time before `wait_for_daemon_or_bail`
+            // returns -- if the daemon socket is still perfectly
+            // reachable (the error had nothing to do with the
+            // connection), that call returns on its very first probe.
+            // Surface the error (raw mode/the alternate screen only
+            // affect stdout, so this still reaches the real terminal)
+            // and enforce a floor here so a deterministic, recurring
+            // bug retries at a human-visible rate instead of spinning
+            // the CPU in a tight re-init loop.
+            Err(err) => {
+                eprintln!("[dimax] attach loop exited unexpectedly, reconnecting: {err:#}");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
         }
         wait_for_daemon_or_bail(std::time::Duration::from_secs(10)).await?;
     }
