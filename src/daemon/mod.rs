@@ -13,6 +13,7 @@
 //! request; this is fine at the pane counts dimax targets (see design doc
 //! non-goals) and keeps the logic in `state` free of async concerns.
 
+pub mod handoff;
 pub mod pinned_dirs;
 pub mod session;
 pub mod state;
