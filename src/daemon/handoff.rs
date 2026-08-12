@@ -19,8 +19,8 @@
 //! reimplements every trait method the same way -- the ones dimax
 //! calls for real, plus `get_size`/`tty_name` the trait still requires.
 
-use portable_pty::{MasterPty, PtySize};
-use std::io::{Read, Write};
+use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
+use std::io::{Read, Result as IoResult, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 /// A `MasterPty` wrapping a raw fd this process didn't open itself
@@ -120,6 +120,64 @@ impl MasterPty for InheritedMasterPty {
     }
 }
 
+/// A `Child`/`ChildKiller` for a process this daemon didn't spawn and
+/// isn't the OS parent of (an adopted pane's process, reparented to
+/// init once the donor daemon exits). `kill` is a real signal delivery
+/// -- any process with permission can signal any pid, parent or not.
+/// `wait`/`try_wait` can't be real `waitpid()` calls (POSIX only lets
+/// the actual parent reap a child), so they degrade to a liveness
+/// probe (`kill(pid, 0)`); dimax's own code never calls either anyway
+/// (confirmed by grep against `src/term/mod.rs`), so this is a
+/// deliberate, harmless gap rather than a silent correctness loss.
+#[derive(Debug, Clone, Copy)]
+pub struct InheritedChild {
+    pid: libc::pid_t,
+}
+
+impl InheritedChild {
+    pub fn new(pid: libc::pid_t) -> Self {
+        Self { pid }
+    }
+
+    fn is_alive(&self) -> bool {
+        unsafe { libc::kill(self.pid, 0) == 0 }
+    }
+}
+
+impl ChildKiller for InheritedChild {
+    fn kill(&mut self) -> IoResult<()> {
+        if unsafe { libc::kill(self.pid, libc::SIGKILL) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+        Box::new(*self)
+    }
+}
+
+impl Child for InheritedChild {
+    fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
+        Ok(if self.is_alive() {
+            None
+        } else {
+            Some(ExitStatus::with_exit_code(0))
+        })
+    }
+
+    fn wait(&mut self) -> IoResult<ExitStatus> {
+        while self.is_alive() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        Ok(ExitStatus::with_exit_code(0))
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        Some(self.pid as u32)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +249,56 @@ mod tests {
 
         let size = master.get_size().unwrap();
         assert_eq!((size.rows, size.cols), (40, 100));
+    }
+
+    #[test]
+    fn inherited_child_kill_actually_terminates_the_process() {
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        let child = cmd.spawn().expect("spawn sleep 30");
+        let pid = child.id() as libc::pid_t;
+        // Detach std's own `Child` without killing it -- this test is
+        // specifically about `InheritedChild`'s *own* kill working on a
+        // process it never spawned itself, mirroring the real scenario
+        // (the acceptor daemon adopting a pid it isn't the OS parent
+        // of).
+        std::mem::forget(child);
+
+        let mut inherited = InheritedChild::new(pid);
+        inherited.kill().expect("kill should succeed");
+
+        // Verification note (deviates from a plain `kill(pid, 0)`
+        // liveness poll -- see below for why): this test process is
+        // still the *real* kernel-level parent of `pid` -- `mem::forget`
+        // only drops the Rust-side `std::process::Child` handle, it
+        // doesn't reparent the process to init. So once SIGKILL lands,
+        // `pid` becomes a zombie only *we* can reap, and a zombie still
+        // answers `kill(pid, 0)` with success (confirmed by manual
+        // repro on this machine: `ps` shows `STAT Z <defunct>` yet the
+        // liveness probe keeps returning 0 indefinitely) -- that
+        // liveness-poll version of this test fails 100% of the time
+        // here, not flakily, for a reason that has nothing to do with
+        // whether `kill()` worked (it does: the signal is delivered and
+        // the process is in fact dead, just unreaped). In the real
+        // scenario this wraps, the adopted process's actual parent is
+        // init, which reaps its children as they die, so no such
+        // permanent zombie is possible there and the liveness probe
+        // `try_wait`/`wait` use is accurate in production. Here, we
+        // instead reap the zombie ourselves via `waitpid` and assert it
+        // died specifically from the `SIGKILL` we just sent -- strictly
+        // stronger proof that `kill()` did its job than any liveness
+        // poll, and not dependent on reaping races.
+        let mut status: i32 = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid, "waitpid should reap the process we just killed");
+        assert!(
+            libc::WIFSIGNALED(status),
+            "process should have died from a signal, raw status = {status:#x}"
+        );
+        assert_eq!(
+            libc::WTERMSIG(status),
+            libc::SIGKILL,
+            "process should have died specifically from our SIGKILL"
+        );
     }
 }
