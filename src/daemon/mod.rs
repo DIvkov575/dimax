@@ -37,6 +37,7 @@ use crate::protocol::{
 use crate::term::ServerPaneEvent;
 use state::{CloseTabResult, State, SubscriberId};
 use std::collections::HashMap;
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
@@ -159,7 +160,13 @@ async fn run_with_state(
                     let state = state.clone();
                     let registry = registry.clone();
                     let id = next_subscriber_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    tokio::spawn(handle_connection(stream, state, registry, id));
+                    tokio::spawn(handle_connection(
+                        stream,
+                        state,
+                        registry,
+                        id,
+                        path_for_task.clone(),
+                    ));
                 }
                 Err(err) => {
                     tracing_lite_log(&format!("accept error on {path_for_task:?}: {err}"));
@@ -266,6 +273,7 @@ async fn handle_connection(
     state: Arc<Mutex<State>>,
     registry: SubscriberRegistry,
     subscriber_id: SubscriberId,
+    socket_path: PathBuf,
 ) {
     let (mut reader, writer) = stream.into_split();
     let mut subscribed_workspace: Option<protocol::WorkspaceId> = None;
@@ -301,6 +309,7 @@ async fn handle_connection(
             &registry,
             subscriber_id,
             &mut subscribed_workspace,
+            &socket_path,
             request,
         )
         .await;
@@ -334,6 +343,7 @@ async fn dispatch(
     registry: &SubscriberRegistry,
     subscriber_id: SubscriberId,
     subscribed_workspace: &mut Option<protocol::WorkspaceId>,
+    socket_path: &Path,
     request: Request,
 ) -> Response {
     let _ = subscriber_id;
@@ -705,13 +715,79 @@ async fn dispatch(
             }
         }
 
-        // TEMPORARY stub, replaced by Task 8's real dispatch handler
-        // later in this same execution pass -- exists only so the
-        // crate stays compilable (and testable) for Tasks 6/7 in
-        // between.
-        Request::BeginHandoff { .. } => Response::Error {
-            message: "not yet implemented".to_string(),
-        },
+        Request::BeginHandoff { datagram_path } => {
+            let mut state = state.lock().await;
+            let workspaces: Vec<handoff::HandoffWorkspace> = state
+                .workspace_ids()
+                .into_iter()
+                .filter_map(|id| {
+                    let info = state.workspace_info(id).ok()?;
+                    Some(handoff::HandoffWorkspace {
+                        id: info.id,
+                        number: info.number,
+                        name: info.name,
+                        tree: info.tree.map(split_tree_to_handoff_tree),
+                    })
+                })
+                .collect();
+
+            let panes: Vec<(handoff::HandoffPane, RawFd)> = state
+                .server_list()
+                .into_iter()
+                .filter_map(|info| {
+                    let pane = state.server_pane(info.id)?;
+                    let fd = pane.dup_master_fd().ok()?;
+                    let pid = pane.child_pid()?;
+                    Some((
+                        handoff::HandoffPane {
+                            id: info.id,
+                            name: info.name,
+                            size: info.size,
+                            short_id: info.short_id,
+                            owner_workspace: info.owner_workspace,
+                            pid,
+                        },
+                        fd,
+                    ))
+                })
+                .collect();
+            let pane_count = panes.len();
+            drop(state);
+
+            let path = std::path::PathBuf::from(datagram_path);
+            let own_socket_path = socket_path.to_path_buf();
+            tokio::spawn(async move {
+                match handoff::send_handoff(&path, workspaces, panes).await {
+                    Ok(()) => {
+                        // The transfer succeeded -- this daemon's job is
+                        // done and the new one is about to bind this
+                        // same socket path, so vacate it exactly like a
+                        // clean `SIGTERM` shutdown does (no session-file
+                        // save needed here: unlike that path, the live
+                        // state was *already* handed over, not lost).
+                        let _ = std::fs::remove_file(&own_socket_path);
+                        // A real donor process must actually terminate
+                        // here -- that's what fully vacates the socket
+                        // path/fds for the new daemon to take over.
+                        // `cargo test` instead runs every test as one
+                        // thread inside a single shared OS process (see
+                        // Task 9's test doc comment on this same
+                        // "faithful enough" simplification), where an
+                        // unconditional `process::exit` would kill the
+                        // entire test binary -- and every other test
+                        // running concurrently in it -- the instant any
+                        // test exercises a successful handoff.
+                        #[cfg(not(test))]
+                        std::process::exit(0);
+                    }
+                    Err(err) => {
+                        tracing_lite_log(&format!("send_handoff failed: {err:#}"));
+                    }
+                }
+            });
+
+            Response::HandoffStarting { pane_count }
+        }
 
         Request::Subscribe { workspace } => {
             let mut state = state.lock().await;
@@ -1031,6 +1107,30 @@ async fn push_to_subscribers(
 
 pub(crate) fn tracing_lite_log(msg: &str) {
     eprintln!("[dimax-daemon] {msg}");
+}
+
+/// The inverse of `state::State::handoff_tree_to_split_tree`: convert a
+/// live `protocol::SplitTree` (as returned by `workspace_info`) into the
+/// wire shape `handoff::send_handoff` streams to the acceptor daemon.
+/// A free function, not a method -- `dispatch` isn't a method on a type
+/// with a natural `Self`.
+fn split_tree_to_handoff_tree(tree: protocol::SplitTree) -> handoff::HandoffTree {
+    match tree {
+        protocol::SplitTree::Leaf(pane) => handoff::HandoffTree::Leaf {
+            id: pane.id,
+            name: pane.name,
+            tabs: pane.tabs,
+            active_tab: pane.active_tab,
+            short_id: pane.short_id,
+        },
+        protocol::SplitTree::Split { id, dir, ratio, a, b } => handoff::HandoffTree::Split {
+            id,
+            dir,
+            ratio,
+            a: Box::new(split_tree_to_handoff_tree(*a)),
+            b: Box::new(split_tree_to_handoff_tree(*b)),
+        },
+    }
 }
 
 /// Integration tests per design doc "Testing" > Integration tier: the
@@ -2703,5 +2803,123 @@ mod tests {
             }
             other => panic!("expected Snapshot, got {other:?}"),
         }
+    }
+
+    /// Short filename -- a full-uuid-named path under a long macOS temp
+    /// dir can exceed `AF_UNIX`'s `sun_path` limit (~104 bytes); this
+    /// stays well under it. Mirrors `tui::tests::app_against_real_daemon`'s
+    /// established pattern (pid + a per-process atomic counter, not a
+    /// uuid) for the same reason.
+    fn short_temp_socket_path(prefix: &str) -> PathBuf {
+        static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("{prefix}-{}-{id}.sock", std::process::id()))
+    }
+
+    /// Regression coverage for the donor side of a hot restart: a live
+    /// pane's fd genuinely survives the trip -- write through the
+    /// *original* pty after `BeginHandoff` completes, confirm the
+    /// *adopted* copy on the other end of the datagram channel
+    /// observes it. This only exercises the donor's half (this
+    /// dispatch handler); Task 9 covers the acceptor's
+    /// `run_taking_over_or_fresh` end-to-end, including this same
+    /// daemon actually exiting afterward.
+    #[tokio::test]
+    async fn begin_handoff_sends_every_live_pane_and_its_real_fd() {
+        let guard = start_daemon().await;
+        let mut conn = TestConn::connect(&guard.0).await;
+
+        let server = match conn
+            .request(Request::ServerSpawn {
+                name: Some("editor".to_string()),
+                cmd: Some("cat".to_string()),
+                cwd: None,
+                workspace: None,
+            })
+            .await
+        {
+            Response::ServerPane(info) => info.id,
+            other => panic!("expected ServerPane, got {other:?}"),
+        };
+        let (_ws, _pane) = match conn
+            .request(Request::ClientSpawn {
+                workspace: "1".to_string(),
+                split_of: None,
+                dir: None,
+                bind: Some(server.to_string()),
+            })
+            .await
+        {
+            Response::ClientPaneCreated { workspace, pane } => (workspace, pane),
+            other => panic!("expected ClientPaneCreated, got {other:?}"),
+        };
+
+        let datagram_path = short_temp_socket_path("dmx-hod");
+        let receiver_path = datagram_path.clone();
+        let receiver = tokio::spawn(async move {
+            crate::daemon::handoff::receive_handoff(&receiver_path).await.unwrap()
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        match conn
+            .request(Request::BeginHandoff {
+                datagram_path: datagram_path.to_string_lossy().into_owned(),
+            })
+            .await
+        {
+            Response::HandoffStarting { pane_count } => assert_eq!(pane_count, 1),
+            other => panic!("expected HandoffStarting, got {other:?}"),
+        }
+
+        let received = receiver.await.unwrap();
+        assert_eq!(received.workspaces.len(), 1);
+        assert_eq!(received.workspaces[0].number, 1);
+        assert_eq!(received.panes.len(), 1);
+        assert_eq!(received.panes[0].0.id, server);
+        assert_eq!(received.panes[0].0.name, Some("editor".to_string()));
+
+        // Write directly through the *received* fd (standing in for
+        // "the real child process produces output after the handoff
+        // completes") and confirm the pane's own on-screen contents
+        // pick it up, proving the received fd is a genuine live alias
+        // of the *same* pty the original `ServerPane` holds -- not a
+        // snapshot or an unrelated fd that happens to look right.
+        //
+        // Deliberately not a raw `libc::read` on the received fd:
+        // this pane's own background reader thread is a separate dup
+        // of the same master fd, already looping on reads against the
+        // exact same underlying open file description. Dup'd fds
+        // share one kernel-side stream, not independent copies, so a
+        // raw read here would race that thread for the same bytes --
+        // and the thread, already mid-poll, wins essentially every
+        // time, leaving a competing blocking `read` here to hang
+        // forever waiting for data that already got consumed
+        // elsewhere. Observing via `ServerRead` (the pane's normal,
+        // already-tested output path) sidesteps that race entirely.
+        unsafe {
+            let msg = b"hello\n";
+            libc::write(received.panes[0].1, msg.as_ptr() as *const _, msg.len());
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match conn
+                .request(Request::ServerRead {
+                    target: server.to_string(),
+                })
+                .await
+            {
+                Response::ServerReadOutput { text } if text.contains("hello") => break,
+                Response::ServerReadOutput { .. } => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "adopted fd's write never showed up in the pane's own output within 2s"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => panic!("expected ServerReadOutput, got {other:?}"),
+            }
+        }
+
+        let _ = std::fs::remove_file(&datagram_path);
     }
 }

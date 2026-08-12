@@ -353,6 +353,13 @@ impl ServerPane {
         self.name.as_deref()
     }
 
+    /// The child's pid, for `daemon::handoff::send_handoff` to include
+    /// in a pane's `HandoffPane` metadata -- the acceptor needs this to
+    /// build an `InheritedChild` (Task 3) around the adopted process.
+    pub fn child_pid(&self) -> Option<libc::pid_t> {
+        self.inner.lock().unwrap().master.process_group_leader()
+    }
+
     pub fn owner_workspace(&self) -> Option<WorkspaceId> {
         self.owner_workspace
     }
