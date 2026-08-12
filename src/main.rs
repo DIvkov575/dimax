@@ -8,7 +8,7 @@ async fn main() -> anyhow::Result<()> {
         Cli::Attach => dimax::tui::run().await,
         Cli::Daemon => {
             let daemon =
-                dimax::daemon::run_and_restore_session(dimax::protocol::socket_path()).await?;
+                dimax::daemon::run_taking_over_or_fresh(dimax::protocol::socket_path()).await?;
             let _ = daemon;
             std::future::pending::<()>().await;
             Ok(())
