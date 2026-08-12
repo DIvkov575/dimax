@@ -166,6 +166,10 @@ impl Child for InheritedChild {
         })
     }
 
+    /// No timeout: if `self.pid` is never observed dead (e.g. reused by
+    /// an unrelated long-lived process before this ever gets called --
+    /// currently impossible, since nothing in dimax calls `wait()` on
+    /// an adopted pane), this blocks the calling thread forever.
     fn wait(&mut self) -> IoResult<ExitStatus> {
         while self.is_alive() {
             std::thread::sleep(std::time::Duration::from_millis(50));
