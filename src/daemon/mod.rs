@@ -178,7 +178,12 @@ async fn try_take_over(socket_path: &Path) -> anyhow::Result<Option<State>> {
     );
 
     let mut state = State::new();
-    state.adopt_handoff(received.workspaces, received.panes);
+    state.adopt_handoff(
+        received.workspaces,
+        received.next_server_short_id,
+        received.next_client_short_id,
+        received.panes,
+    );
     Ok(Some(state))
 }
 
@@ -841,12 +846,21 @@ async fn dispatch(
                 })
                 .collect();
             let pane_count = panes.len();
+            let (next_server_short_id, next_client_short_id) = state.short_id_counters();
             drop(state);
 
             let path = std::path::PathBuf::from(datagram_path);
             let own_socket_path = socket_path.to_path_buf();
             tokio::spawn(async move {
-                match handoff::send_handoff(&path, workspaces, panes).await {
+                match handoff::send_handoff(
+                    &path,
+                    workspaces,
+                    next_server_short_id,
+                    next_client_short_id,
+                    panes,
+                )
+                .await
+                {
                     Ok(()) => {
                         // The transfer succeeded -- this daemon's job is
                         // done and the new one is about to bind this

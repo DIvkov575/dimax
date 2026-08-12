@@ -238,8 +238,20 @@ pub enum HandoffTree {
 /// transfer needs its own dedicated socket instead).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum HandoffMessage {
-    /// Sent exactly once, first: every workspace's layout.
-    Layout { workspaces: Vec<HandoffWorkspace> },
+    /// Sent exactly once, first: every workspace's layout, plus the
+    /// donor's own short-id counters (see `HandoffPane`/`HandoffTree`'s
+    /// `short_id` fields) -- `State::adopt_handoff` seeds its fresh
+    /// `State`'s counters from these rather than deriving them from the
+    /// adopted panes' own short ids, since a previously-killed pane
+    /// leaves a gap in the numeric sequence that a derived value could
+    /// collide with (short ids are sequential and never reused within
+    /// a daemon's lifetime, but "the highest surviving one" is not the
+    /// same as "the next one that would ever have been minted").
+    Layout {
+        workspaces: Vec<HandoffWorkspace>,
+        next_server_short_id: u64,
+        next_client_short_id: u64,
+    },
     /// Sent once per live pane; the fd travels as this same datagram's
     /// `SCM_RIGHTS` ancillary data, not in `meta` itself (a `RawFd` is
     /// just a small integer with no meaning in the *receiving*
@@ -305,12 +317,18 @@ async fn recv_with_fd_async(
 pub async fn send_handoff(
     datagram_path: &std::path::Path,
     workspaces: Vec<HandoffWorkspace>,
+    next_server_short_id: u64,
+    next_client_short_id: u64,
     panes: Vec<(HandoffPane, RawFd)>,
 ) -> anyhow::Result<()> {
     let sender = tokio::net::UnixDatagram::unbound()?;
     sender.connect(datagram_path)?;
 
-    let layout = encode(&HandoffMessage::Layout { workspaces });
+    let layout = encode(&HandoffMessage::Layout {
+        workspaces,
+        next_server_short_id,
+        next_client_short_id,
+    });
     send_with_fd_async(&sender, &layout, &[]).await?;
 
     for (meta, fd) in panes {
@@ -328,6 +346,8 @@ pub async fn send_handoff(
 /// `State::adopt_handoff` to turn into real `ServerPane`s.
 pub struct ReceivedHandoff {
     pub workspaces: Vec<HandoffWorkspace>,
+    pub next_server_short_id: u64,
+    pub next_client_short_id: u64,
     pub panes: Vec<(HandoffPane, RawFd)>,
 }
 
@@ -374,8 +394,12 @@ pub async fn receive_handoff_on(
     let mut fd_buf = [0 as RawFd; 1];
 
     let (n, _) = recv_with_fd_async(receiver, &mut buf, &mut fd_buf).await?;
-    let workspaces = match decode(&buf[..n])? {
-        HandoffMessage::Layout { workspaces } => workspaces,
+    let (workspaces, next_server_short_id, next_client_short_id) = match decode(&buf[..n])? {
+        HandoffMessage::Layout {
+            workspaces,
+            next_server_short_id,
+            next_client_short_id,
+        } => (workspaces, next_server_short_id, next_client_short_id),
         other => anyhow::bail!("expected Layout first, got {other:?}"),
     };
 
@@ -393,7 +417,12 @@ pub async fn receive_handoff_on(
     }
 
     let _ = std::fs::remove_file(datagram_path);
-    Ok(ReceivedHandoff { workspaces, panes })
+    Ok(ReceivedHandoff {
+        workspaces,
+        next_server_short_id,
+        next_client_short_id,
+        panes,
+    })
 }
 
 #[cfg(test)]
@@ -625,12 +654,14 @@ mod tests {
         // isolation.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        super::send_handoff(&path, workspaces.clone(), vec![(meta.clone(), read_fd)])
+        super::send_handoff(&path, workspaces.clone(), 3, 5, vec![(meta.clone(), read_fd)])
             .await
             .unwrap();
 
         let received = receiver.await.unwrap();
         assert_eq!(received.workspaces.len(), 1);
+        assert_eq!(received.next_server_short_id, 3);
+        assert_eq!(received.next_client_short_id, 5);
         assert_eq!(received.panes.len(), 1);
         assert_eq!(received.panes[0].0.id, pane_id);
 

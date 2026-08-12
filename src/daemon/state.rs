@@ -600,11 +600,23 @@ impl State {
     /// pane, exactly like `server_spawn` already does -- no external
     /// events sender needed, same as every other `ServerPane`-constructing
     /// method on `State`.
+    /// `next_server_short_id`/`next_client_short_id` are the donor's
+    /// own counters at the moment of handoff, not derived from the
+    /// adopted panes' own short ids: a pane killed before the handoff
+    /// leaves a gap in the numeric sequence, so "the highest surviving
+    /// short id" is not the same as "the next one that would ever have
+    /// been minted" -- only the donor's actual counter is guaranteed
+    /// collision-free for whatever this daemon spawns next.
     pub fn adopt_handoff(
         &mut self,
         workspaces: Vec<super::handoff::HandoffWorkspace>,
+        next_server_short_id: u64,
+        next_client_short_id: u64,
         panes: Vec<(super::handoff::HandoffPane, std::os::fd::RawFd)>,
     ) {
+        self.next_server_short_id = next_server_short_id;
+        self.next_client_short_id = next_client_short_id;
+
         for (meta, fd) in panes {
             let master = Box::new(super::handoff::InheritedMasterPty::new(fd));
             let child = Box::new(super::handoff::InheritedChild::new(meta.pid));
@@ -677,6 +689,15 @@ impl State {
     /// what to send.
     pub fn workspace_ids(&self) -> Vec<WorkspaceId> {
         self.workspaces.keys().copied().collect()
+    }
+
+    /// This daemon's current short-id counters -- for `daemon::mod`'s
+    /// `BeginHandoff` dispatch handler to include in the handoff so the
+    /// acceptor's `adopt_handoff` can seed its own counters from them
+    /// (see that method's doc comment for why deriving them from the
+    /// adopted panes' own short ids instead would be wrong).
+    pub fn short_id_counters(&self) -> (u64, u64) {
+        (self.next_server_short_id, self.next_client_short_id)
     }
 
     /// Implements `dimax client spawn`: create a new client-pane, either
@@ -2721,7 +2742,7 @@ mod tests {
         )];
 
         let mut state = State::new();
-        state.adopt_handoff(workspaces, panes);
+        state.adopt_handoff(workspaces, 7, 4, panes);
 
         assert!(state.workspaces.contains_key(&ws_id), "workspace id must be preserved");
         let ws = &state.workspaces[&ws_id];
@@ -2735,5 +2756,52 @@ mod tests {
         }
         assert!(state.server_panes.contains_key(&sp_id), "server-pane id must be preserved");
         assert_eq!(state.server_panes[&sp_id].name(), Some("editor"));
+        assert_eq!(
+            state.short_id_counters(),
+            (7, 4),
+            "adopt_handoff must seed its counters from the donor's, not derive them \
+             from the adopted panes' own short ids"
+        );
+    }
+
+    /// A pane killed in the donor before the handoff leaves a gap in
+    /// the short-id sequence (short ids are never reused, per
+    /// `next_server_short_id`'s doc comment) -- `adopt_handoff` must
+    /// still land on the donor's real next-counter value, not
+    /// something derived from the surviving panes' own short ids
+    /// (which would collide with the gap left by the killed one).
+    #[test]
+    fn adopt_handoff_seeds_counters_that_survive_a_gap_from_a_previously_killed_pane() {
+        use crate::daemon::handoff::HandoffPane;
+        use portable_pty::{PtySize, native_pty_system};
+
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+            .unwrap();
+        let dup_fd = unsafe { libc::dup(pair.master.as_raw_fd().unwrap()) };
+        assert!(dup_fd >= 0);
+
+        let sp_id = ServerPaneId::new_v4();
+        let panes = vec![(
+            HandoffPane {
+                id: sp_id,
+                name: None,
+                size: Size { rows: 24, cols: 80 },
+                // Only short id "01" survives (imagine "00" was killed
+                // before the handoff) -- if a fresh counter were
+                // derived from this alone, it would wrongly restart at
+                // 1 or 2, not the donor's real next value of 5.
+                short_id: "01".to_string(),
+                owner_workspace: None,
+                pid: unsafe { libc::getpid() },
+            },
+            dup_fd,
+        )];
+
+        let mut state = State::new();
+        state.adopt_handoff(Vec::new(), 5, 0, panes);
+
+        assert_eq!(state.short_id_counters(), (5, 0));
     }
 }
