@@ -353,11 +353,23 @@ impl ServerPane {
         self.name.as_deref()
     }
 
-    /// The child's pid, for `daemon::handoff::send_handoff` to include
-    /// in a pane's `HandoffPane` metadata -- the acceptor needs this to
-    /// build an `InheritedChild` (Task 3) around the adopted process.
+    /// The actual pid of the process this pane spawned (`Inner.child`
+    /// -- the shell/command dimax started, not whatever's currently in
+    /// its foreground like `foreground_info` reports), for
+    /// `daemon::handoff::send_handoff` to include in a pane's
+    /// `HandoffPane` metadata -- the acceptor needs this to build an
+    /// `InheritedChild` around the adopted process. Deliberately not
+    /// `master.process_group_leader()` (what `foreground_info` uses):
+    /// that returns whichever process currently owns the pty's
+    /// foreground process group -- e.g. `vim` if it's running in this
+    /// pane's shell -- which is the wrong pid to signal on kill/adopt.
     pub fn child_pid(&self) -> Option<libc::pid_t> {
-        self.inner.lock().unwrap().master.process_group_leader()
+        self.inner
+            .lock()
+            .unwrap()
+            .child
+            .process_id()
+            .map(|pid| pid as libc::pid_t)
     }
 
     pub fn owner_workspace(&self) -> Option<WorkspaceId> {
@@ -1276,5 +1288,68 @@ mod tests {
         // The process group leader is gone once killed; there's nothing
         // left to query.
         assert!(pane.foreground_info().is_none());
+    }
+
+    #[test]
+    fn child_pid_returns_the_spawned_process_not_the_foreground_process_group_leader() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let id = Uuid::new_v4();
+        // `cmd: None` spawns the real default login shell (not a
+        // one-shot `/bin/sh -c "..."`) -- only an actually-interactive
+        // shell enables job control, which is what puts a typed
+        // foreground command (`sleep 30` below) into a *new* process
+        // group distinct from the shell's own. A one-shot `sh -c`
+        // invocation (used by this file's other tests, e.g. `cmd:
+        // Some("cat")`) never exercises this: without job control,
+        // `sh -c`'s own children stay in the shell's original process
+        // group, so `process_group_leader` and the spawned shell's own
+        // pid never actually diverge there, even for a pipeline.
+        let mut pane = ServerPane::spawn(
+            id,
+            None,
+            None,
+            None,
+            Size { rows: 24, cols: 80 },
+            tx,
+            None,
+            "test-short-id".to_string(),
+        )
+        .unwrap();
+
+        let spawned_pid = pane.inner.lock().unwrap().child.process_id().map(|p| p as libc::pid_t);
+
+        pane.write_input(b"sleep 30\n").unwrap();
+
+        // Wait until the typed foreground job has actually started and
+        // its process group has diverged from the shell's own pid --
+        // the exact condition this test needs to exercise the bug.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let foreground_leader = loop {
+            let leader = pane.inner.lock().unwrap().master.process_group_leader();
+            if leader.is_some() && leader != spawned_pid {
+                break leader;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "typed foreground command never established its own process group"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+
+        assert_ne!(
+            spawned_pid, foreground_leader,
+            "test setup should produce a pane whose spawned shell differs from its \
+             pty's foreground process group leader -- otherwise this doesn't \
+             actually exercise the bug this test guards against"
+        );
+        assert_eq!(
+            pane.child_pid(),
+            spawned_pid,
+            "child_pid must report the actually-spawned shell, not whatever \
+             process is currently in the pty's foreground (that's what \
+             foreground_info is for)"
+        );
+
+        let _ = pane.kill();
     }
 }
