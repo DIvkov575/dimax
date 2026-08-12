@@ -201,3 +201,12 @@ Run `dimax` or `dimax attach` to open the TUI. CLI session control includes:
     dimax server read <name>
     dimax server rename <name> <new-name>
     dimax server kill <name>
+
+Restarting the daemon (e.g. after upgrading to a new build) tries to
+hand every live pane's actual process over to the new daemon instance
+first, so shells/editors/anything else you had running keeps running
+uninterrupted -- only the on-screen redraw resets (the new daemon
+starts each adopted pane's display blank until it next produces
+output). If a running daemon can't be found to take over from, it
+falls back to restoring just the workspace layout with fresh shells
+at each pane's last-known directory instead.

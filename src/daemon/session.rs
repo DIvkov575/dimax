@@ -14,6 +14,13 @@
 //! elsewhere without OS-level checkpoint/restore (e.g. Linux's CRIU,
 //! unavailable on macOS and not a dependency this crate takes on).
 //!
+//! `daemon::handoff` is the *other* restart path, for exactly the case
+//! this one can't help with: an already-attached client that wants
+//! the actual live process (not a fresh respawned shell) to survive a
+//! deliberate restart. `run_taking_over_or_fresh` always tries that
+//! first and only falls back to this module's plain layout replay if
+//! there's nothing to take over from.
+//!
 //! What *does* survive, and what [`SavedSession`] actually captures, is
 //! the layout: which workspace had which split structure, which leaf
 //! held which pane(s), each pane's custom name and last-known working
