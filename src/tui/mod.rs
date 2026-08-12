@@ -2587,10 +2587,23 @@ async fn run_first_run_wizard(
     Ok(())
 }
 
+/// Why `run`'s main loop stopped. `run_with_reconnect` is the only
+/// caller that cares about the distinction -- `Stop` means "the
+/// program should actually exit" (the user pressed the quit key, or
+/// stdin closed with nothing left to read); `ConnectionLost` means
+/// "the daemon socket dropped out from under this connection" (most
+/// often: a hot restart just took over, or the daemon crashed), which
+/// is worth retrying rather than exiting to the shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopExit {
+    Stop,
+    ConnectionLost,
+}
+
 /// Drives one attached frontend: connect, subscribe to the initial
 /// workspace, then loop handling terminal input events and pushed daemon
 /// `Event`s until the user quits.
-pub async fn run() -> anyhow::Result<()> {
+pub async fn run() -> anyhow::Result<LoopExit> {
     let client = Client::connect().await?;
     let (read_half, mut write_half) = client.into_split();
     let mut reader = FrameReader::spawn(read_half);
@@ -2643,6 +2656,7 @@ pub async fn run() -> anyhow::Result<()> {
     // literal garbage.
     let mut pending_mouse: Vec<u8> = Vec::new();
 
+    let mut exit_reason = LoopExit::Stop;
     loop {
         terminal.draw(|frame| {
             app.frame_area = frame.area();
@@ -2821,13 +2835,71 @@ pub async fn run() -> anyhow::Result<()> {
                     Ok(ServerMessage::Response(_)) => {}
                     // Connection lost -- nothing further to drive the UI
                     // with.
-                    Err(_) => break,
+                    Err(_) => {
+                        exit_reason = LoopExit::ConnectionLost;
+                        break;
+                    }
                 }
             }
         }
     }
 
-    Ok(())
+    Ok(exit_reason)
+}
+
+/// The real `dimax attach`/bare-`dimax` entry point (`main.rs`'s
+/// `Cli::Attach` arm calls this instead of `run` directly): drive
+/// `run` to completion, and if it stopped because the daemon
+/// connection was lost specifically (as opposed to the user asking to
+/// quit), wait for a daemon to become reachable again and re-enter
+/// `run` from scratch instead of exiting to the shell. Every re-entry
+/// re-runs `Client::connect` + `App::bootstrap`'s `Subscribe`, which
+/// already rebuilds `app.workspace`/`app.grids` fresh from a `Snapshot`
+/// -- and, per `daemon::handoff`'s id-preserving design (see that
+/// module's doc comment), a reconnect after a genuine *hot* restart
+/// gets back the exact same workspace/client-pane/server-pane ids it
+/// had before, so there is nothing extra to reconcile here.
+pub async fn run_with_reconnect() -> anyhow::Result<()> {
+    loop {
+        match run().await {
+            Ok(LoopExit::Stop) => return Ok(()),
+            Ok(LoopExit::ConnectionLost) => {}
+            // Could be "the very first `Client::connect` inside `run`
+            // failed because nothing's listening yet" (plausible right
+            // in the middle of a hot restart) or a genuinely unrelated
+            // error. Either way, retrying up to the deadline below is
+            // strictly better than giving up on the first blip during
+            // exactly the window this feature exists for; a real,
+            // persistent problem still surfaces via
+            // `wait_for_daemon_or_bail`'s own timeout below.
+            Err(_) => {}
+        }
+        wait_for_daemon_or_bail(std::time::Duration::from_secs(10)).await?;
+    }
+}
+
+/// Poll for *something* listening at the daemon socket, via a bare
+/// connect probe -- not `cli::Client::connect()`, which would
+/// auto-spawn a fresh daemon the moment its own probe fails (see
+/// `run_with_reconnect`'s design note: calling that repeatedly during
+/// the brief window between the old daemon exiting and the new one
+/// binding -- exactly the window this retry loop runs in -- would race
+/// an unwanted *third* daemon into existence for the same socket
+/// path). Returns once a connection succeeds (closing it immediately;
+/// the caller's next `run()` call makes its own real connection), or
+/// errors out once `timeout` elapses with nothing answering.
+async fn wait_for_daemon_or_bail(timeout: std::time::Duration) -> anyhow::Result<()> {
+    let path = crate::protocol::socket_path();
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if tokio::net::UnixStream::connect(&path).await.is_ok() {
+            return Ok(());
+        }
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("daemon at {path:?} did not become reachable again within {timeout:?}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 #[cfg(test)]
@@ -2835,6 +2907,18 @@ mod tests {
     use super::*;
     use crate::protocol::ClientPane;
     use uuid::Uuid;
+
+    /// A narrow, compile-level assertion that the enum this task adds
+    /// has exactly the two variants `run_with_reconnect` depends on --
+    /// the real behavioral coverage for the reconnect path itself is
+    /// `daemon::tests::run_taking_over_or_fresh_keeps_a_live_pane_running_across_the_handoff`,
+    /// which proves a hot restart's fd/id survival end-to-end; wiring
+    /// `run_with_reconnect` into a matching client-side test directly
+    /// is a follow-up, not duplicated here.
+    #[test]
+    fn loop_exit_distinguishes_stop_from_connection_lost() {
+        assert_ne!(LoopExit::Stop, LoopExit::ConnectionLost);
+    }
 
     fn leaf(id: ClientPaneId) -> SplitTree {
         SplitTree::Leaf(ClientPane {

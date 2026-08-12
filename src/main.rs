@@ -5,7 +5,7 @@ use dimax::cli::{self, Args, Cli};
 async fn main() -> anyhow::Result<()> {
     let cli = Args::parse().command.unwrap_or(Cli::Attach);
     match cli {
-        Cli::Attach => dimax::tui::run().await,
+        Cli::Attach => dimax::tui::run_with_reconnect().await,
         Cli::Daemon => {
             let daemon =
                 dimax::daemon::run_taking_over_or_fresh(dimax::protocol::socket_path()).await?;
