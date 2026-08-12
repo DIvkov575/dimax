@@ -16,10 +16,11 @@
 //! `MasterPty` method dimax actually calls (`resize`, `try_clone_reader`,
 //! `take_writer`, `process_group_leader`, `as_raw_fd`) is a pure kernel
 //! syscall keyed only by the fd number, so [`InheritedMasterPty`] below
-//! reimplements exactly those, and only those.
+//! reimplements every trait method the same way -- the ones dimax
+//! calls for real, plus `get_size`/`tty_name` the trait still requires.
 
-use portable_pty::{Child, ChildKiller, ExitStatus, MasterPty, PtySize};
-use std::io::{Read, Result as IoResult, Write};
+use portable_pty::{MasterPty, PtySize};
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 /// A `MasterPty` wrapping a raw fd this process didn't open itself
@@ -87,6 +88,14 @@ impl MasterPty for InheritedMasterPty {
         Ok(Box::new(std::fs::File::from(self.dup()?)))
     }
 
+    /// Deliberately simpler than upstream `UnixMasterPty::take_writer`:
+    /// that impl (a) guards against being called more than once (bails
+    /// rather than letting two writers race to send EOT on drop), and
+    /// (b) sends an EOT byte on drop so a foreground shell sees a clean
+    /// EOF. Neither is replicated here -- dimax only ever calls this
+    /// once per pane (confirmed by grep) and tears panes down via
+    /// `Child::kill()`, not writer-drop, so both gaps are currently
+    /// inert. Revisit if a future caller starts relying on either.
     fn take_writer(&self) -> anyhow::Result<Box<dyn Write + Send>> {
         Ok(Box::new(std::fs::File::from(self.dup()?)))
     }
