@@ -7,6 +7,11 @@
 //!   that reads PTY output as it arrives. That thread updates the pane's
 //!   internal grid and, on every change, sends a [`ServerPaneEvent`] on
 //!   the `events` channel passed in — the daemon does not poll.
+//!   [`ServerPane::from_inherited`] shares this exact same contract for a
+//!   pane built around an already-open master/child pair (e.g. one
+//!   adopted from another daemon process via `daemon::handoff`) instead
+//!   of a freshly-opened PTY — `spawn` itself is just `openpty()` plus a
+//!   call to `from_inherited`.
 //! - All other `ServerPane` methods are synchronous and safe to call from
 //!   an async context (they only briefly lock an internal mutex, never
 //!   block on I/O) except `write_input`, which does a non-blocking PTY
@@ -184,7 +189,7 @@ impl ServerPane {
     /// directly for a pane adopted from another daemon process (see
     /// that module's doc comment for why `openpty()` isn't an option
     /// there: there's no live pty to open, only an inherited fd).
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // shared internal helper with multiple callers (spawn, and daemon::handoff's adopt path); a params struct would only add indirection
     pub fn from_inherited(
         id: ServerPaneId,
         name: Option<String>,
@@ -862,6 +867,57 @@ mod tests {
         );
 
         let mut pane = pane;
+        pane.kill().unwrap();
+    }
+
+    /// `dup_master_fd` exists specifically for `daemon::handoff::
+    /// send_handoff` to hand a *real*, live pty master fd off to
+    /// another process -- so this exercises it end to end against a
+    /// pane built the normal way (`ServerPane::spawn`), not a
+    /// synthetic fd, and confirms the returned fd is a genuine alias
+    /// of the same open file description rather than, say, a closed
+    /// or unrelated one: writing through it must show up in the
+    /// pane's own live-reading grid, exactly as if the write had gone
+    /// through `write_input` instead.
+    #[test]
+    fn dup_master_fd_returns_a_live_fd_observing_the_same_pty_traffic() {
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let id = Uuid::new_v4();
+        let mut pane = ServerPane::spawn(
+            id,
+            None,
+            Some("cat".to_string()),
+            None,
+            Size { rows: 24, cols: 80 },
+            tx,
+            None,
+            "test-short-id".to_string(),
+        )
+        .unwrap();
+
+        let dup_fd = pane.dup_master_fd().unwrap();
+        assert!(dup_fd >= 0);
+
+        // Wrap the duplicated fd in a `File` (taking ownership -- it
+        // closes on drop at the end of this test) and write through
+        // *that*, standing in for what `send_handoff`'s receiving
+        // daemon would do with the fd it gets over `SCM_RIGHTS`. The
+        // pane's own reader thread is still reading its own separate
+        // fd the whole time; if the two aren't real aliases of the
+        // same pty, this write would never reach it.
+        let mut dup_writer = unsafe { std::fs::File::from_raw_fd(dup_fd) };
+        dup_writer.write_all(b"ping\n").unwrap();
+
+        let found = wait_until(&mut rx, || snapshot_text(&pane).contains("ping"));
+        assert!(
+            found,
+            "expected the pane's own snapshot to observe output written through dup_master_fd's fd, got: {}",
+            snapshot_text(&pane)
+        );
+
         pane.kill().unwrap();
     }
 
