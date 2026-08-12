@@ -23,3 +23,7 @@ sysinfo = { version = "0.39.6", default-features = false, features = ["system"] 
 tokio = { version = "1.53.1", features = ["full"] }
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
 wezterm-term = { version = "0.1.0-fork.5", package = "tattoy-wezterm-term" }
+
+[[bin]]
+name = "bench_hot_paths"
+path = "src/bin/bench_hot_paths.rs"

@@ -347,6 +347,15 @@ struct App {
     /// daemon, not a second source of truth.
     pane_sizes: HashMap<ClientPaneId, Size>,
     focused: Option<ClientPaneId>,
+    /// The server-pane `run`'s loop last told the daemon this frontend
+    /// has keyboard focus on (`Request::SetFocus`), so it only sends a
+    /// new one when the currently-focused leaf's binding has actually
+    /// changed since the last frame -- same "remember what was last
+    /// reported, diff every tick" shape as `pane_sizes` just above,
+    /// applied to `focused`'s *bound server-pane* rather than its
+    /// on-screen size. `None` covers both "nothing focused yet" and
+    /// "the focused leaf is unbound".
+    last_focus_sent: Option<ServerPaneId>,
     /// `Some` while the `cmd-shift-z` attach menu is open; input routes to
     /// `handle_attach_menu_input` instead of the normal keymap while set.
     attach_menu: Option<AttachMenu>,
@@ -454,6 +463,7 @@ impl App {
                         grids: grids.into_iter().map(|g| (g.server_pane, g)).collect(),
                         pane_sizes: HashMap::new(),
                         focused,
+                        last_focus_sent: None,
                         attach_menu: None,
                         frame_area: ratatui::layout::Rect::default(),
                         dragging_split: None,
@@ -2106,6 +2116,19 @@ fn changed_pane_sizes(
         .collect()
 }
 
+/// Which server-pane (if any) `focused` is currently bound to within
+/// `workspace` -- what `run`'s loop diffs against `App::last_focus_sent`
+/// to decide whether a fresh `Request::SetFocus` is due (see that call
+/// site). `None` covers both "nothing focused" and "the focused leaf is
+/// unbound".
+fn focused_server_pane(
+    workspace: &WorkspaceInfo,
+    focused: Option<ClientPaneId>,
+) -> Option<ServerPaneId> {
+    let pane = focused?;
+    workspace.tree.as_ref()?.find(pane)?.active_bound()
+}
+
 /// Sort `servers` into cwd-bucket order for the attach menu's grouped
 /// display: ascending by cwd string, with a synthetic `"Unknown"` bucket
 /// (no resolvable foreground `cwd` — a `Dead` pane, or a live one whose
@@ -2677,6 +2700,24 @@ pub async fn run() -> anyhow::Result<()> {
             }
         }
 
+        // Tell the daemon when the focused leaf's bound server-pane has
+        // changed since the last frame -- same "diff against what was
+        // last reported" shape as the size report just above, driving
+        // `State::throttled_subscribers_for_server_pane`'s focus-aware
+        // broadcast throttle. Piggybacking on the render loop's cadence
+        // (rather than a send at every one of `focused`'s many mutation
+        // sites -- split, detach, spawn, tab-cycle, mouse click, ...)
+        // means this can never miss one: whatever the loop just drew is
+        // authoritative for what's actually focused this frame.
+        let currently_focused = focused_server_pane(&app.workspace, app.focused);
+        if currently_focused != app.last_focus_sent {
+            let req = Request::SetFocus {
+                server_pane: currently_focused,
+            };
+            let _ = app.request(&mut write_half, &mut reader, req).await?;
+            app.last_focus_sent = currently_focused;
+        }
+
         tokio::select! {
             result = stdin.read(&mut buf) => {
                 let n = result?;
@@ -3063,6 +3104,49 @@ mod tests {
         current.insert(id, crate::protocol::Size { rows: 23, cols: 80 });
         let changed = changed_pane_sizes(&current, &tree, area);
         assert_eq!(changed.len(), 0);
+    }
+
+    fn workspace_with_tree(tree: Option<SplitTree>) -> WorkspaceInfo {
+        WorkspaceInfo {
+            id: Uuid::new_v4(),
+            number: 1,
+            name: None,
+            tree,
+        }
+    }
+
+    #[test]
+    fn focused_server_pane_resolves_the_bound_server_pane() {
+        let pane_id = Uuid::new_v4();
+        let server_pane = Uuid::new_v4();
+        let tree = SplitTree::Leaf(ClientPane {
+            id: pane_id,
+            name: None,
+            tabs: vec![server_pane],
+            active_tab: 0,
+            short_id: "aa".to_string(),
+        });
+        let workspace = workspace_with_tree(Some(tree));
+        assert_eq!(focused_server_pane(&workspace, Some(pane_id)), Some(server_pane));
+    }
+
+    #[test]
+    fn focused_server_pane_is_none_when_nothing_is_focused() {
+        let workspace = workspace_with_tree(Some(leaf(Uuid::new_v4())));
+        assert_eq!(focused_server_pane(&workspace, None), None);
+    }
+
+    #[test]
+    fn focused_server_pane_is_none_for_an_unbound_leaf() {
+        let pane_id = Uuid::new_v4();
+        let workspace = workspace_with_tree(Some(leaf(pane_id)));
+        assert_eq!(focused_server_pane(&workspace, Some(pane_id)), None);
+    }
+
+    #[test]
+    fn focused_server_pane_is_none_for_an_empty_workspace() {
+        let workspace = workspace_with_tree(None);
+        assert_eq!(focused_server_pane(&workspace, Some(Uuid::new_v4())), None);
     }
 
     #[test]
@@ -3459,6 +3543,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
+            last_focus_sent: None,
             attach_menu: Some(AttachMenu {
                 servers,
                 selected: 0,
@@ -3501,6 +3586,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
+            last_focus_sent: None,
             attach_menu: Some(AttachMenu {
                 servers,
                 selected: 3,
@@ -3542,6 +3628,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
+            last_focus_sent: None,
             attach_menu: Some(AttachMenu {
                 servers,
                 selected: 3,
@@ -3579,6 +3666,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
+            last_focus_sent: None,
             attach_menu: Some(AttachMenu {
                 servers,
                 selected: 1,
@@ -3613,6 +3701,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
+            last_focus_sent: None,
             attach_menu: Some(AttachMenu {
                 servers,
                 selected: 0,
@@ -3649,6 +3738,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
+            last_focus_sent: None,
             attach_menu: Some(AttachMenu {
                 servers,
                 selected: spawn_index,
@@ -3769,6 +3859,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
+            last_focus_sent: None,
             attach_menu: Some(AttachMenu {
                 servers,
                 selected: 1,
@@ -3806,6 +3897,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
+            last_focus_sent: None,
             attach_menu: Some(AttachMenu {
                 servers,
                 selected: 0,
@@ -3842,6 +3934,7 @@ mod tests {
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
+            last_focus_sent: None,
             attach_menu: Some(AttachMenu {
                 servers,
                 selected: spawn_index,

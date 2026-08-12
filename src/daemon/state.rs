@@ -22,8 +22,20 @@ use crate::protocol::{
 };
 use crate::term::{ServerPane, ServerPaneEvent};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
+
+/// How long a subscriber not currently focused on a server-pane must
+/// wait between `Changed`-driven `GridDelta` broadcasts for it -- see
+/// [`State::throttled_subscribers_for_server_pane`]. 100ms (~10fps) is
+/// fast enough that catching up (e.g. after switching focus away and
+/// back) never feels laggy, while still cutting a flooding unfocused
+/// pane's snapshot+serialize cost (the two most expensive steps in the
+/// broadcast path) by roughly an order of magnitude versus the
+/// unthrottled ~8ms `BATCH_WINDOW` cadence `ServerPane::spawn`'s reader
+/// thread otherwise drives it at.
+const UNFOCUSED_BROADCAST_THROTTLE: Duration = Duration::from_millis(100);
 
 /// One live subscriber: a connection that has `Subscribe`d to a
 /// workspace. Identified by an opaque id the connection handler mints
@@ -106,6 +118,22 @@ pub struct State {
     /// wire at all. Absent means 0 (live). A zero-result store is
     /// removed rather than kept as an explicit `0` entry.
     scroll_offsets: HashMap<(SubscriberId, ServerPaneId), usize>,
+    /// Which server-pane (if any) each subscriber's TUI currently has
+    /// keyboard focus on -- set via `Request::SetFocus`, read by
+    /// [`Self::throttled_subscribers_for_server_pane`] to decide who
+    /// gets a `Changed`-driven broadcast right now versus who waits out
+    /// [`UNFOCUSED_BROADCAST_THROTTLE`]. Absent means "nothing focused",
+    /// same as scroll offset's "absent means 0" convention above.
+    focused_server_pane: HashMap<SubscriberId, ServerPaneId>,
+    /// Per-`(subscriber, server_pane)` timestamp of the last broadcast
+    /// let through while that pane was *not* focused by that
+    /// subscriber -- what
+    /// [`Self::throttled_subscribers_for_server_pane`] checks against
+    /// [`UNFOCUSED_BROADCAST_THROTTLE`]. Never consulted for a
+    /// currently-focused pane, so a subscriber who focuses a pane right
+    /// after being throttled on it still gets `set_focus`'s immediate
+    /// catch-up, not a wait for this entry to age out.
+    last_unfocused_broadcast: HashMap<(SubscriberId, ServerPaneId), Instant>,
     /// Cloned into every [`ServerPane::spawn`] so its reader thread can
     /// report output/exit.
     pane_events: UnboundedSender<ServerPaneEvent>,
@@ -163,6 +191,8 @@ impl State {
             subscribers: HashMap::new(),
             client_pane_sizes: HashMap::new(),
             scroll_offsets: HashMap::new(),
+            focused_server_pane: HashMap::new(),
+            last_unfocused_broadcast: HashMap::new(),
             pane_events,
             pane_events_rx: Some(pane_events_rx),
             pinned_dirs: super::pinned_dirs::load(),
@@ -855,6 +885,80 @@ impl State {
     /// once a connection closes.
     pub fn clear_scroll_offsets_for_subscriber(&mut self, subscriber: SubscriberId) {
         self.scroll_offsets.retain(|(sub, _), _| *sub != subscriber);
+    }
+
+    /// Record `subscriber`'s current focus for `Request::SetFocus`.
+    /// Also drops any throttle timestamp for the newly-focused pane, so
+    /// the very next `Changed` for it (after `daemon::dispatch`'s
+    /// immediate catch-up push, which happens outside `State` since it
+    /// needs the registry) is judged fresh rather than still governed
+    /// by whatever throttle window was already ticking before focus
+    /// moved here.
+    pub fn set_focus(&mut self, subscriber: SubscriberId, server_pane: Option<ServerPaneId>) {
+        match server_pane {
+            Some(id) => {
+                self.focused_server_pane.insert(subscriber, id);
+                self.last_unfocused_broadcast.remove(&(subscriber, id));
+            }
+            None => {
+                self.focused_server_pane.remove(&subscriber);
+            }
+        }
+    }
+
+    /// The subset of [`Self::subscribers_for_server_pane`] who should
+    /// receive *this* `Changed`-driven broadcast for `server_pane`
+    /// right now: everyone currently focused on it (never throttled),
+    /// plus everyone else who hasn't been sent one for it within
+    /// [`UNFOCUSED_BROADCAST_THROTTLE`]. Letting an unfocused subscriber
+    /// through here bumps their timestamp, so the next one waits out
+    /// the same window again -- coalescing a flooding backgrounded
+    /// pane's broadcasts to roughly `1 / UNFOCUSED_BROADCAST_THROTTLE`
+    /// per unfocused subscriber instead of one per `Changed` event.
+    ///
+    /// Only ever call this for `ServerPaneEvent::Changed` -- a `Died`
+    /// event is a one-time, important state change every subscriber
+    /// (focused or not) needs to learn about immediately, so
+    /// `daemon::mod`'s drain loop uses the untouched, always-unthrottled
+    /// [`Self::subscribers_for_server_pane`] for that case instead.
+    ///
+    /// Never permanently drops a subscriber: a throttled-away update is
+    /// only ever briefly delayed, since the next `Changed` a few
+    /// hundred ms later (routine while a pane is actively producing
+    /// output) re-checks and lets it through, and `set_focus` forces an
+    /// immediate catch-up the moment they focus this pane regardless.
+    pub fn throttled_subscribers_for_server_pane(
+        &mut self,
+        server_pane: ServerPaneId,
+    ) -> Vec<SubscriberId> {
+        let now = Instant::now();
+        self.subscribers_for_server_pane(server_pane)
+            .into_iter()
+            .filter(|&sub| {
+                if self.focused_server_pane.get(&sub) == Some(&server_pane) {
+                    return true;
+                }
+                let key = (sub, server_pane);
+                let allow = self
+                    .last_unfocused_broadcast
+                    .get(&key)
+                    .is_none_or(|&last| now.duration_since(last) >= UNFOCUSED_BROADCAST_THROTTLE);
+                if allow {
+                    self.last_unfocused_broadcast.insert(key, now);
+                }
+                allow
+            })
+            .collect()
+    }
+
+    /// Remove every focus/throttle entry belonging to `subscriber` --
+    /// called from `daemon::mod`'s `handle_connection` teardown path
+    /// alongside `clear_scroll_offsets_for_subscriber`, once a
+    /// connection closes.
+    pub fn clear_focus_for_subscriber(&mut self, subscriber: SubscriberId) {
+        self.focused_server_pane.remove(&subscriber);
+        self.last_unfocused_broadcast
+            .retain(|(sub, _), _| *sub != subscriber);
     }
 
     /// Dimension-wise minimum on-screen size across every client-pane
@@ -2019,6 +2123,66 @@ mod tests {
         // the disconnect path can't tell whether Unsubscribe was sent.
         state.unsubscribe(8, ws);
         assert!(state.subscribers_for_workspace(ws).is_empty());
+    }
+
+    #[test]
+    fn throttled_subscribers_always_includes_the_focused_one() {
+        let mut state = State::new();
+        let sp = spawn_pane(&mut state, "shared");
+        let (ws, _) = workspace_with_bound_pane(&mut state, "1", sp);
+        state.subscribe(1, ws);
+        state.subscribe(2, ws);
+        state.set_focus(1, Some(sp));
+
+        // Two rapid-fire calls: subscriber 1 (focused) must get through
+        // both times; subscriber 2 (unfocused) gets through once (no
+        // prior timestamp) then throttled on the immediate repeat.
+        let first = state.throttled_subscribers_for_server_pane(sp);
+        assert!(first.contains(&1));
+        assert!(first.contains(&2));
+
+        let second = state.throttled_subscribers_for_server_pane(sp);
+        assert!(second.contains(&1), "focused subscriber must never be throttled");
+        assert!(
+            !second.contains(&2),
+            "unfocused subscriber should be throttled on a rapid repeat"
+        );
+    }
+
+    #[test]
+    fn set_focus_clears_the_throttle_timestamp_for_the_newly_focused_pane() {
+        let mut state = State::new();
+        let sp = spawn_pane(&mut state, "shared");
+        let (ws, _) = workspace_with_bound_pane(&mut state, "1", sp);
+        state.subscribe(1, ws);
+
+        // Prime the throttle while unfocused: first call passes, the
+        // immediate second is throttled.
+        state.throttled_subscribers_for_server_pane(sp);
+        assert!(!state.throttled_subscribers_for_server_pane(sp).contains(&1));
+
+        // Focus then immediately unfocus: `set_focus`'s throttle-
+        // timestamp clear means the pane is judged fresh again on the
+        // next check, not still inside the window primed above.
+        state.set_focus(1, Some(sp));
+        state.set_focus(1, None);
+        assert!(state.throttled_subscribers_for_server_pane(sp).contains(&1));
+    }
+
+    #[test]
+    fn clear_focus_for_subscriber_removes_focus_and_throttle_state() {
+        let mut state = State::new();
+        let sp = spawn_pane(&mut state, "shared");
+        let (ws, _) = workspace_with_bound_pane(&mut state, "1", sp);
+        state.subscribe(1, ws);
+        state.set_focus(1, Some(sp));
+
+        state.clear_focus_for_subscriber(1);
+
+        // No longer focused, so back to being throttled like any other
+        // unfocused subscriber: one pass-through, then throttled.
+        assert!(state.throttled_subscribers_for_server_pane(sp).contains(&1));
+        assert!(!state.throttled_subscribers_for_server_pane(sp).contains(&1));
     }
 
     #[test]

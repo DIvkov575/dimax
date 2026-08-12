@@ -444,6 +444,22 @@ pub enum Request {
     Subscribe {
         workspace: String,
     },
+    /// Tell the daemon which server-pane (if any) this connection's TUI
+    /// currently has keyboard focus on. Purely a broadcast-scheduling
+    /// hint (see `daemon::state::State::throttled_subscribers_for_server_pane`):
+    /// a focused pane's `GridDelta`s are never throttled; an unfocused
+    /// one's are coalesced to a lower rate, since nobody is watching it
+    /// in real time. The daemon always answers with one immediate,
+    /// unthrottled catch-up push for the newly-focused pane (if any),
+    /// so focusing a previously-throttled pane never shows stale
+    /// content. Send `None` when nothing is focused (e.g. an empty
+    /// workspace) and again whenever the focused leaf's binding
+    /// changes -- a stale value only ever makes throttling slightly
+    /// less effective, never wrong, so there's no need to resend on
+    /// every keystroke, just on every *binding* change.
+    SetFocus {
+        server_pane: Option<ServerPaneId>,
+    },
     Unsubscribe {
         workspace: WorkspaceId,
     },

@@ -80,8 +80,15 @@ pub async fn run(socket_path: std::path::PathBuf) -> anyhow::Result<Daemon> {
     let drain_registry = registry.clone();
     tokio::spawn(async move {
         while let Some(event) = pane_events.recv().await {
-            let id = match event {
-                ServerPaneEvent::Changed(id) | ServerPaneEvent::Died(id) => id,
+            // `Died` is a one-time, important state change every
+            // subscriber (focused or not) needs to learn about
+            // immediately, so it always uses the unthrottled subscriber
+            // list; only routine `Changed` output goes through
+            // `throttled_subscribers_for_server_pane` (see that
+            // method's doc comment for why this distinction matters).
+            let (id, is_died) = match event {
+                ServerPaneEvent::Changed(id) => (id, false),
+                ServerPaneEvent::Died(id) => (id, true),
             };
             // Lock only long enough to check subscribers + snapshot (see
             // `broadcast_grid_prepare`'s doc comment); the lock is
@@ -90,8 +97,13 @@ pub async fn run(socket_path: std::path::PathBuf) -> anyhow::Result<Daemon> {
             // other request the daemon is handling for the whole
             // duration of each broadcast.
             let prepared = {
-                let state = drain_state.lock().await;
-                broadcast_grid_prepare(&state, id)
+                let mut state = drain_state.lock().await;
+                let subscribers = if is_died {
+                    state.subscribers_for_server_pane(id)
+                } else {
+                    state.throttled_subscribers_for_server_pane(id)
+                };
+                broadcast_grid_prepare_for(&state, id, subscribers)
             };
             if let Some(broadcast) = prepared {
                 broadcast_grid_send(&drain_registry, broadcast).await;
@@ -264,10 +276,9 @@ async fn handle_connection(
     if let Some(ws) = subscribed_workspace {
         state.lock().await.unsubscribe(subscriber_id, ws);
     }
-    state
-        .lock()
-        .await
-        .clear_scroll_offsets_for_subscriber(subscriber_id);
+    let mut state = state.lock().await;
+    state.clear_scroll_offsets_for_subscriber(subscriber_id);
+    state.clear_focus_for_subscriber(subscriber_id);
 }
 
 /// Apply one request to `state` and produce its response, pushing any
@@ -691,6 +702,25 @@ async fn dispatch(
             }
         }
 
+        Request::SetFocus { server_pane } => {
+            let mut state = state.lock().await;
+            state.set_focus(subscriber_id, server_pane);
+            // Immediate, unthrottled catch-up for the newly-focused
+            // pane (if any) -- see `SetFocus`'s and `set_focus`'s doc
+            // comments for why this is what keeps throttling an
+            // unfocused pane's broadcasts always safe, never stale:
+            // whatever its last throttled broadcast looked like, this
+            // pushes the true current grid right now, to just this one
+            // subscriber.
+            let prepared = server_pane
+                .and_then(|sp| broadcast_grid_prepare_for(&state, sp, vec![subscriber_id]));
+            drop(state);
+            if let Some(broadcast) = prepared {
+                broadcast_grid_send(registry, broadcast).await;
+            }
+            Response::Ack
+        }
+
         Request::Unsubscribe { workspace } => {
             let mut state = state.lock().await;
             state.unsubscribe(subscriber_id, workspace);
@@ -880,7 +910,21 @@ struct GridBroadcast {
 /// any other pane) whenever a watched pane produced output rapidly
 /// enough (e.g. an animated startup banner).
 fn broadcast_grid_prepare(state: &State, server_pane: ServerPaneId) -> Option<GridBroadcast> {
-    let subscribers = state.subscribers_for_server_pane(server_pane);
+    broadcast_grid_prepare_for(state, server_pane, state.subscribers_for_server_pane(server_pane))
+}
+
+/// Same as [`broadcast_grid_prepare`], but for an explicit, already-
+/// decided `subscribers` list rather than every current viewer --
+/// what the drain loop uses to apply
+/// `State::throttled_subscribers_for_server_pane`'s focus-aware
+/// filtering to a `Changed` broadcast without changing behavior for
+/// every other (always-unthrottled) caller of `broadcast_grid_prepare`
+/// itself.
+fn broadcast_grid_prepare_for(
+    state: &State,
+    server_pane: ServerPaneId,
+    subscribers: Vec<SubscriberId>,
+) -> Option<GridBroadcast> {
     if subscribers.is_empty() {
         return None;
     }
@@ -2373,5 +2417,140 @@ mod tests {
              flooding output -- expected well under 2s if broadcasts aren't holding the \
              global lock during serialization"
         );
+    }
+
+    /// Collect every `Event` `conn` receives within `window`, bounded by
+    /// wall-clock time rather than "until a gap appears between
+    /// events" -- required against a continuously-flooding pane like
+    /// `yes`, since the whole point of an unthrottled/focused
+    /// subscriber is that it never actually goes idle while the flood
+    /// continues. An earlier version of this helper (inlined, "loop
+    /// while `read_event` keeps returning `Some`") could run for
+    /// minutes against real `yes` output before a scheduling gap wider
+    /// than its own per-read timeout finally appeared by chance.
+    async fn collect_events_for(conn: &mut TestConn, window: Duration) -> Vec<Event> {
+        let deadline = std::time::Instant::now() + window;
+        let mut events = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match conn.read_event(remaining).await {
+                Some(event) => events.push(event),
+                None => break,
+            }
+        }
+        events
+    }
+
+    /// Regression coverage for the focus-aware throttle
+    /// (`State::throttled_subscribers_for_server_pane`): a subscriber
+    /// who never `SetFocus`es the flooding pane must receive
+    /// meaningfully fewer `GridDelta`s for it than one who did, over
+    /// the same burst of output -- the whole point of throttling
+    /// unfocused broadcasts. And once the unfocused subscriber does
+    /// focus it, the very next thing they see must be a fresh grid, not
+    /// a stale one left over from throttling (`SetFocus`'s immediate
+    /// catch-up push).
+    #[tokio::test]
+    async fn unfocused_subscriber_gets_fewer_broadcasts_and_catches_up_on_focus() {
+        let guard = start_daemon().await;
+        let mut spawner = TestConn::connect(&guard.0).await;
+
+        let server = match spawner
+            .request(Request::ServerSpawn {
+                name: None,
+                cmd: Some("yes".to_string()),
+                cwd: None,
+                workspace: None,
+            })
+            .await
+        {
+            Response::ServerPane(info) => info.id,
+            other => panic!("expected ServerPane, got {other:?}"),
+        };
+        let workspace = match spawner
+            .request(Request::ClientSpawn {
+                workspace: "1".to_string(),
+                split_of: None,
+                dir: None,
+                bind: Some(server.to_string()),
+            })
+            .await
+        {
+            Response::ClientPaneCreated { workspace, .. } => workspace,
+            other => panic!("expected ClientPaneCreated, got {other:?}"),
+        };
+
+        let mut focused = TestConn::connect(&guard.0).await;
+        let mut unfocused = TestConn::connect(&guard.0).await;
+        for conn in [&mut focused, &mut unfocused] {
+            match conn
+                .request(Request::Subscribe {
+                    workspace: workspace.to_string(),
+                })
+                .await
+            {
+                Response::Snapshot { .. } => {}
+                other => panic!("expected Snapshot, got {other:?}"),
+            }
+        }
+        match focused
+            .request(Request::SetFocus {
+                server_pane: Some(server),
+            })
+            .await
+        {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+        // `unfocused` deliberately never sends `SetFocus` at all --
+        // exercising the common case (a client that never bothers, or a
+        // pane in a workspace nobody's looking at right now) rather than
+        // only the explicit "focused elsewhere" case.
+
+        // Same fixed window for both: `yes` keeps flooding throughout,
+        // so this compares broadcast counts over identical wall-clock
+        // time rather than draining either side to (an unreachable)
+        // quiescence.
+        let window = Duration::from_millis(500);
+        let focused_events = collect_events_for(&mut focused, window).await;
+        let unfocused_events = collect_events_for(&mut unfocused, window).await;
+        assert!(
+            unfocused_events.len() < focused_events.len(),
+            "unfocused subscriber ({} events) should receive noticeably fewer broadcasts than \
+             the focused one ({} events) over the same flood",
+            unfocused_events.len(),
+            focused_events.len()
+        );
+
+        // Flush anything already in flight for `unfocused` (up to one
+        // throttle window's worth) so the very next event it sees after
+        // `SetFocus` is unambiguously that request's own catch-up push.
+        collect_events_for(&mut unfocused, Duration::from_millis(150)).await;
+
+        // Focus it from the previously-unfocused connection: the very
+        // next event must be a fresh `GridDelta` for `server`,
+        // delivered immediately rather than waiting for the next
+        // `Changed` (which, per the throttle, could otherwise be up to
+        // 100ms away).
+        match unfocused
+            .request(Request::SetFocus {
+                server_pane: Some(server),
+            })
+            .await
+        {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+        match unfocused
+            .read_event(Duration::from_secs(1))
+            .await
+            .expect("SetFocus should push an immediate catch-up GridDelta")
+        {
+            Event::GridDelta { snapshot } => assert_eq!(snapshot.server_pane, server),
+            other => panic!("expected GridDelta, got {other:?}"),
+        }
     }
 }
