@@ -705,6 +705,14 @@ async fn dispatch(
             }
         }
 
+        // TEMPORARY stub, replaced by Task 8's real dispatch handler
+        // later in this same execution pass -- exists only so the
+        // crate stays compilable (and testable) for Tasks 6/7 in
+        // between.
+        Request::BeginHandoff { .. } => Response::Error {
+            message: "not yet implemented".to_string(),
+        },
+
         Request::Subscribe { workspace } => {
             let mut state = state.lock().await;
             let ws_id = match state.resolve_or_create_workspace(&workspace) {
