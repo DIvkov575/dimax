@@ -166,6 +166,35 @@ impl ServerPane {
         // would never observe `Died`.
         drop(slave);
 
+        Self::from_inherited(
+            id,
+            name,
+            master,
+            child,
+            size,
+            events,
+            owner_workspace,
+            short_id,
+        )
+    }
+
+    /// Build a `ServerPane` around an already-open master/child pair
+    /// instead of calling `openpty()` -- what `spawn` itself now does
+    /// internally, and what `daemon::handoff::receive_handoff` uses
+    /// directly for a pane adopted from another daemon process (see
+    /// that module's doc comment for why `openpty()` isn't an option
+    /// there: there's no live pty to open, only an inherited fd).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_inherited(
+        id: ServerPaneId,
+        name: Option<String>,
+        master: Box<dyn MasterPty + Send>,
+        child: Box<dyn Child + Send + Sync>,
+        size: Size,
+        events: UnboundedSender<ServerPaneEvent>,
+        owner_workspace: Option<WorkspaceId>,
+        short_id: String,
+    ) -> anyhow::Result<Self> {
         let writer = SharedWriter(Arc::new(Mutex::new(master.take_writer()?)));
         let terminal = Terminal::new(
             TerminalSize {
@@ -293,6 +322,22 @@ impl ServerPane {
             short_id,
             inner,
         })
+    }
+
+    /// A fresh `dup()` of this pane's master fd, for
+    /// `daemon::handoff::send_handoff` to hand off via `SCM_RIGHTS`
+    /// without disturbing this daemon's own copy (which it keeps using
+    /// normally until the moment it actually exits).
+    pub fn dup_master_fd(&self) -> anyhow::Result<RawFd> {
+        let guard = self.inner.lock().unwrap();
+        let Some(fd) = guard.master.as_raw_fd() else {
+            anyhow::bail!("this platform's MasterPty has no raw fd to duplicate");
+        };
+        let dup = unsafe { libc::dup(fd) };
+        if dup < 0 {
+            anyhow::bail!("dup failed: {:?}", std::io::Error::last_os_error());
+        }
+        Ok(dup)
     }
 
     pub fn id(&self) -> ServerPaneId {
@@ -761,6 +806,63 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(pane.status(), ServerPaneStatus::Dead);
+    }
+
+    #[test]
+    fn from_inherited_reads_output_already_flowing_through_the_adopted_fd() {
+        use crate::daemon::handoff::{InheritedChild, InheritedMasterPty};
+        use portable_pty::{PtySize, native_pty_system};
+        use std::io::Write;
+
+        // Simulate "a pane the donor already spawned": a real pty with
+        // `cat` running in it, plus a *separate* dup'd fd standing in
+        // for what the acceptor daemon would receive over the wire.
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let cmd = portable_pty::CommandBuilder::new("cat");
+        let child = pair.slave.spawn_command(cmd).unwrap();
+        drop(pair.slave);
+        let dup_fd = unsafe { libc::dup(pair.master.as_raw_fd().unwrap()) };
+        assert!(dup_fd >= 0);
+        let pid = child.process_id().unwrap() as libc::pid_t;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let id = Uuid::new_v4();
+        let pane = ServerPane::from_inherited(
+            id,
+            None,
+            Box::new(InheritedMasterPty::new(dup_fd)),
+            Box::new(InheritedChild::new(pid)),
+            Size { rows: 24, cols: 80 },
+            tx,
+            None,
+            "bench".to_string(),
+        )
+        .unwrap();
+
+        // Write through the *original* master (standing in for "output
+        // that arrives after the handoff completes") and confirm the
+        // adopted pane's own reader thread observes it.
+        pair.master
+            .take_writer()
+            .unwrap()
+            .write_all(b"hi\n")
+            .unwrap();
+        let found = wait_until(&mut rx, || snapshot_text(&pane).contains("hi"));
+        assert!(
+            found,
+            "adopted pane should observe output on the inherited fd"
+        );
+
+        let mut pane = pane;
+        pane.kill().unwrap();
     }
 
     #[test]
