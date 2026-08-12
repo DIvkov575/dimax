@@ -344,12 +344,10 @@ pub async fn receive_handoff(datagram_path: &std::path::Path) -> anyhow::Result<
     let mut buf = [0u8; 65536];
     let mut fd_buf = [0 as RawFd; 1];
 
-    let workspaces = loop {
-        let (n, _) = recv_with_fd_async(&receiver, &mut buf, &mut fd_buf).await?;
-        match decode(&buf[..n])? {
-            HandoffMessage::Layout { workspaces } => break workspaces,
-            other => anyhow::bail!("expected Layout first, got {other:?}"),
-        }
+    let (n, _) = recv_with_fd_async(&receiver, &mut buf, &mut fd_buf).await?;
+    let workspaces = match decode(&buf[..n])? {
+        HandoffMessage::Layout { workspaces } => workspaces,
+        other => anyhow::bail!("expected Layout first, got {other:?}"),
     };
 
     let mut panes = Vec::new();
