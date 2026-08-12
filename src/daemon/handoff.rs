@@ -182,6 +182,193 @@ impl Child for InheritedChild {
     }
 }
 
+use crate::protocol::{ClientPaneId, ServerPaneId, Size, SplitDir, SplitId, WorkspaceId};
+
+/// Everything about one live server-pane the donor sends alongside its
+/// fd, over one `HandoffMessage::Pane` datagram. Unlike
+/// `daemon::session::SavedServerPane`, this keeps the *real* id --
+/// preserving it is the entire point of a hot restart: an already-
+/// attached client's held `ServerPaneId`s stay valid after
+/// reconnecting, with no fresh-id remapping needed anywhere.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HandoffPane {
+    pub id: ServerPaneId,
+    pub name: Option<String>,
+    pub size: Size,
+    pub short_id: String,
+    pub owner_workspace: Option<WorkspaceId>,
+    pub pid: libc::pid_t,
+}
+
+/// The full layout (every workspace's split tree, with real ids) sent
+/// once as `HandoffMessage::Layout`, before any `Pane` messages --
+/// mirrors `protocol::WorkspaceInfo`/`SplitTree`/`ClientPane` exactly
+/// (this is the one place ids *should* travel with the tree, unlike
+/// `daemon::session`'s intentionally id-less `SavedTree`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HandoffWorkspace {
+    pub id: WorkspaceId,
+    pub number: u8,
+    pub name: Option<String>,
+    pub tree: Option<HandoffTree>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum HandoffTree {
+    Leaf {
+        id: ClientPaneId,
+        name: Option<String>,
+        tabs: Vec<ServerPaneId>,
+        active_tab: usize,
+        short_id: String,
+    },
+    Split {
+        id: SplitId,
+        dir: SplitDir,
+        ratio: f32,
+        a: Box<HandoffTree>,
+        b: Box<HandoffTree>,
+    },
+}
+
+/// One datagram's worth of the handoff exchange. `serde_json`, for
+/// consistency with `protocol::framing`'s existing choice, even though
+/// the handoff channel doesn't reuse that module's framing itself (see
+/// `protocol::Request::BeginHandoff`'s doc comment for why the fd
+/// transfer needs its own dedicated socket instead).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum HandoffMessage {
+    /// Sent exactly once, first: every workspace's layout.
+    Layout { workspaces: Vec<HandoffWorkspace> },
+    /// Sent once per live pane; the fd travels as this same datagram's
+    /// `SCM_RIGHTS` ancillary data, not in `meta` itself (a `RawFd` is
+    /// just a small integer with no meaning in the *receiving*
+    /// process -- only the ancillary-data transfer makes it valid
+    /// there).
+    Pane { meta: HandoffPane },
+    /// Sent once, last: every pane has been sent.
+    Done,
+}
+
+fn encode(msg: &HandoffMessage) -> Vec<u8> {
+    serde_json::to_vec(msg).expect("HandoffMessage always serializes")
+}
+
+fn decode(bytes: &[u8]) -> anyhow::Result<HandoffMessage> {
+    Ok(serde_json::from_slice(bytes)?)
+}
+
+/// `sendfd`'s tokio-feature impls of `send_with_fd`/`recv_with_fd` are
+/// plain (non-async) methods internally built on `try_io` -- they
+/// return `WouldBlock` immediately rather than waiting, so a caller
+/// must await the socket's own readiness first and retry on
+/// `WouldBlock` to get real async behavior out of them.
+async fn send_with_fd_async(
+    socket: &tokio::net::UnixDatagram,
+    bytes: &[u8],
+    fds: &[RawFd],
+) -> std::io::Result<usize> {
+    use sendfd::SendWithFd;
+    loop {
+        socket.writable().await?;
+        match socket.send_with_fd(bytes, fds) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            result => return result,
+        }
+    }
+}
+
+async fn recv_with_fd_async(
+    socket: &tokio::net::UnixDatagram,
+    bytes: &mut [u8],
+    fds: &mut [RawFd],
+) -> std::io::Result<(usize, usize)> {
+    use sendfd::RecvWithFd;
+    loop {
+        socket.readable().await?;
+        match socket.recv_with_fd(bytes, fds) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            result => return result,
+        }
+    }
+}
+
+/// Donor side: connect to `datagram_path` (where the requesting daemon
+/// has already bound its receiver) and stream `workspaces`, then every
+/// pane in `panes` (each with a freshly-dup'd fd -- see
+/// `ServerPane::dup_master_fd`), then a final `Done`. Closing this
+/// process's *own* copy of each fd afterward (the caller's job, not
+/// this function's) is safe once this returns `Ok`: the receiving
+/// daemon already holds its own independent copy from the `SCM_RIGHTS`
+/// transfer, so closing this side's copy never drops the fd's
+/// reference count to zero and never triggers `SIGHUP`.
+pub async fn send_handoff(
+    datagram_path: &std::path::Path,
+    workspaces: Vec<HandoffWorkspace>,
+    panes: Vec<(HandoffPane, RawFd)>,
+) -> anyhow::Result<()> {
+    let sender = tokio::net::UnixDatagram::unbound()?;
+    sender.connect(datagram_path)?;
+
+    let layout = encode(&HandoffMessage::Layout { workspaces });
+    send_with_fd_async(&sender, &layout, &[]).await?;
+
+    for (meta, fd) in panes {
+        let bytes = encode(&HandoffMessage::Pane { meta });
+        send_with_fd_async(&sender, &bytes, &[fd]).await?;
+    }
+
+    let done = encode(&HandoffMessage::Done);
+    send_with_fd_async(&sender, &done, &[]).await?;
+    Ok(())
+}
+
+/// What the acceptor gets back from a completed handoff: the layout,
+/// plus every `(metadata, inherited fd)` pair -- ready for
+/// `State::adopt_handoff` to turn into real `ServerPane`s.
+pub struct ReceivedHandoff {
+    pub workspaces: Vec<HandoffWorkspace>,
+    pub panes: Vec<(HandoffPane, RawFd)>,
+}
+
+/// Acceptor side: bind `datagram_path` fresh, then read messages until
+/// `Done`. Binds the path itself (rather than taking an already-bound
+/// socket) so callers only need to pick a path, matching
+/// `send_handoff`'s "you already bound it" contract on the other end.
+pub async fn receive_handoff(datagram_path: &std::path::Path) -> anyhow::Result<ReceivedHandoff> {
+    if datagram_path.exists() {
+        std::fs::remove_file(datagram_path)?;
+    }
+    let receiver = tokio::net::UnixDatagram::bind(datagram_path)?;
+
+    let mut buf = [0u8; 65536];
+    let mut fd_buf = [0 as RawFd; 1];
+
+    let workspaces = loop {
+        let (n, _) = recv_with_fd_async(&receiver, &mut buf, &mut fd_buf).await?;
+        match decode(&buf[..n])? {
+            HandoffMessage::Layout { workspaces } => break workspaces,
+            other => anyhow::bail!("expected Layout first, got {other:?}"),
+        }
+    };
+
+    let mut panes = Vec::new();
+    loop {
+        let (n, fd_count) = recv_with_fd_async(&receiver, &mut buf, &mut fd_buf).await?;
+        match decode(&buf[..n])? {
+            HandoffMessage::Pane { meta } => {
+                anyhow::ensure!(fd_count == 1, "Pane message arrived with no fd");
+                panes.push((meta, fd_buf[0]));
+            }
+            HandoffMessage::Done => break,
+            other => anyhow::bail!("unexpected message mid-transfer: {other:?}"),
+        }
+    }
+
+    let _ = std::fs::remove_file(datagram_path);
+    Ok(ReceivedHandoff { workspaces, panes })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,5 +491,131 @@ mod tests {
             libc::SIGKILL,
             "process should have died specifically from our SIGKILL"
         );
+    }
+
+    /// Short filename -- a full-uuid-named path under a long macOS temp
+    /// dir can exceed `AF_UNIX`'s `sun_path` limit (~104 bytes); this
+    /// stays well under it. Mirrors `tui::tests::app_against_real_daemon`'s
+    /// established pattern (pid + a per-process atomic counter, not a
+    /// uuid) for the same reason.
+    fn short_temp_socket_path(prefix: &str) -> std::path::PathBuf {
+        static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("{prefix}-{}-{id}.sock", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn send_then_receive_one_pane_message_carries_its_fd() {
+        let path = short_temp_socket_path("dmx-ho1");
+
+        let receiver = tokio::net::UnixDatagram::bind(&path).unwrap();
+        let sender = tokio::net::UnixDatagram::unbound().unwrap();
+        sender.connect(&path).unwrap();
+
+        // Stand in for "a real pty master fd" with a throwaway pipe --
+        // this test is only about the fd surviving the transfer
+        // *itself*, not pty semantics (Task 2's tests already cover
+        // those against a real pty).
+        let (read_fd, write_fd) = unsafe {
+            let mut fds = [0i32; 2];
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            (fds[0], fds[1])
+        };
+
+        let meta = HandoffPane {
+            id: uuid::Uuid::new_v4(),
+            name: Some("editor".to_string()),
+            size: crate::protocol::Size { rows: 24, cols: 80 },
+            short_id: "aa".to_string(),
+            owner_workspace: None,
+            pid: 4242,
+        };
+        let msg = HandoffMessage::Pane { meta: meta.clone() };
+        let bytes = super::encode(&msg);
+        super::send_with_fd_async(&sender, &bytes, &[read_fd]).await.unwrap();
+
+        let mut buf = [0u8; 4096];
+        let mut recv_fds = [0i32; 1];
+        let (n, fd_count) = super::recv_with_fd_async(&receiver, &mut buf, &mut recv_fds)
+            .await
+            .unwrap();
+        assert_eq!(fd_count, 1);
+
+        let received = super::decode(&buf[..n]).unwrap();
+        match received {
+            HandoffMessage::Pane { meta: received_meta } => assert_eq!(received_meta.id, meta.id),
+            other => panic!("expected Pane, got {other:?}"),
+        }
+
+        // Prove the received fd is genuinely a duplicate reference to
+        // the *same* pipe, not just an equal-looking one: write via the
+        // original write end, read via the *received* fd.
+        let received_fd = recv_fds[0];
+        unsafe {
+            libc::write(write_fd, b"ok".as_ptr() as *const _, 2);
+            let mut out = [0u8; 2];
+            let got = libc::read(received_fd, out.as_mut_ptr() as *mut _, 2);
+            assert_eq!(got, 2);
+            assert_eq!(&out, b"ok");
+            libc::close(write_fd);
+            libc::close(read_fd);
+            libc::close(received_fd);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn send_handoff_then_receive_handoff_round_trips_layout_and_panes() {
+        let path = short_temp_socket_path("dmx-ho2");
+
+        let workspaces = vec![super::HandoffWorkspace {
+            id: uuid::Uuid::new_v4(),
+            number: 1,
+            name: None,
+            tree: None,
+        }];
+        let pane_id = uuid::Uuid::new_v4();
+        let meta = super::HandoffPane {
+            id: pane_id,
+            name: Some("editor".to_string()),
+            size: crate::protocol::Size { rows: 24, cols: 80 },
+            short_id: "aa".to_string(),
+            owner_workspace: None,
+            pid: 4242,
+        };
+        let (read_fd, write_fd) = unsafe {
+            let mut fds = [0i32; 2];
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            (fds[0], fds[1])
+        };
+
+        let recv_path = path.clone();
+        let receiver = tokio::spawn(async move { super::receive_handoff(&recv_path).await.unwrap() });
+        // Give the receiver a moment to actually bind before the donor
+        // connects -- a real hot restart negotiates this via
+        // `Response::HandoffStarting` (Task 8) instead of a sleep; this
+        // test only exercises `send_handoff`/`receive_handoff` in
+        // isolation.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        super::send_handoff(&path, workspaces.clone(), vec![(meta.clone(), read_fd)])
+            .await
+            .unwrap();
+
+        let received = receiver.await.unwrap();
+        assert_eq!(received.workspaces.len(), 1);
+        assert_eq!(received.panes.len(), 1);
+        assert_eq!(received.panes[0].0.id, pane_id);
+
+        unsafe {
+            libc::write(write_fd, b"ok".as_ptr() as *const _, 2);
+            let mut out = [0u8; 2];
+            assert_eq!(libc::read(received.panes[0].1, out.as_mut_ptr() as *mut _, 2), 2);
+            assert_eq!(&out, b"ok");
+            libc::close(write_fd);
+            libc::close(read_fd);
+            libc::close(received.panes[0].1);
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }
