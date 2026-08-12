@@ -524,6 +524,17 @@ pub enum Request {
         text: String,
         enter: bool,
     },
+    /// Sent by a *new* daemon process to an already-running one, over a
+    /// normal client connection to the existing socket -- the start of
+    /// a hot restart (see `daemon::handoff` module doc). `datagram_path`
+    /// is where the sender has already bound a fresh `UnixDatagram`;
+    /// the receiving (old) daemon connects to it and streams every live
+    /// pane's fd + metadata there, entirely outside this JSON-framed
+    /// protocol (ancillary fd data can't ride along with a buffered
+    /// stream frame safely -- see `daemon::handoff`).
+    BeginHandoff {
+        datagram_path: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -563,6 +574,14 @@ pub enum Response {
     /// SGR codes).
     ServerReadOutput {
         text: String,
+    },
+    /// Reply to `BeginHandoff`: the old daemon is about to start
+    /// streaming `pane_count` panes to the requested datagram path,
+    /// then exit once done. `pane_count` lets the new daemon know
+    /// exactly how many `HandoffMessage::Pane`s to expect before the
+    /// final `HandoffMessage::Done` (see `daemon::handoff`).
+    HandoffStarting {
+        pane_count: usize,
     },
 }
 
