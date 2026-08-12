@@ -93,6 +93,95 @@ pub async fn run_and_restore_session(socket_path: std::path::PathBuf) -> anyhow:
     run_with_state(socket_path, initial_state).await
 }
 
+/// The real `dimax daemon` entry point (`main.rs`'s `Cli::Daemon` arm
+/// calls this instead of `run_and_restore_session` directly): try to
+/// take over a currently-running daemon's live panes first (see
+/// `handoff` module doc); if there's nothing listening at
+/// `socket_path`, or the takeover attempt fails for any reason, fall
+/// back to the plain layout-replay restore every earlier restart used.
+/// Never fails to start just because a hot restart wasn't possible --
+/// that would make this strictly worse than what already existed.
+pub async fn run_taking_over_or_fresh(socket_path: PathBuf) -> anyhow::Result<Daemon> {
+    match try_take_over(&socket_path).await {
+        Ok(Some(state)) => run_with_state(socket_path, state).await,
+        Ok(None) => run_and_restore_session(socket_path).await,
+        Err(err) => {
+            tracing_lite_log(&format!(
+                "hot-restart handoff failed ({err:#}), falling back to plain restore"
+            ));
+            run_and_restore_session(socket_path).await
+        }
+    }
+}
+
+/// `Ok(Some(state))` if a live daemon was found and handed everything
+/// over; `Ok(None)` if nothing is listening at `socket_path` at all
+/// (the common case -- most daemon starts have no predecessor to take
+/// over from); `Err` for a genuine failure partway through an attempt
+/// that *did* find a live daemon (logged and treated as "fall back",
+/// not propagated, by the caller above).
+async fn try_take_over(socket_path: &Path) -> anyhow::Result<Option<State>> {
+    let stream = match UnixStream::connect(socket_path).await {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    let (mut reader, mut writer) = stream.into_split();
+
+    let handoff_dir = socket_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    // Short filename -- a full-uuid-named path under a long temp dir
+    // can exceed `AF_UNIX`'s `sun_path` limit (~104 bytes); pid + a
+    // per-process atomic counter stays well under it regardless of how
+    // long `handoff_dir` itself is (see `tests::short_temp_socket_path`
+    // for the same convention used by this module's own tests).
+    static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let datagram_path = handoff_dir.join(format!("dmx-h-{}-{id}.sock", std::process::id()));
+
+    // Bind the receiver *before* telling the donor about the path --
+    // see `bind_handoff_receiver`'s doc comment. Announcing the path
+    // first and binding afterward races the donor's own attempt to
+    // connect to it, which fails silently on the donor's side and
+    // leaves this side waiting forever for messages that were already
+    // dropped.
+    let receiver = handoff::bind_handoff_receiver(&datagram_path)?;
+
+    protocol::framing::write_frame(
+        &mut writer,
+        &Request::BeginHandoff {
+            datagram_path: datagram_path.to_string_lossy().into_owned(),
+        },
+    )
+    .await?;
+
+    let pane_count = loop {
+        match protocol::framing::read_frame::<_, ServerMessage>(&mut reader).await? {
+            ServerMessage::Response(Response::HandoffStarting { pane_count }) => break pane_count,
+            ServerMessage::Response(other) => {
+                anyhow::bail!("unexpected response to BeginHandoff: {other:?}")
+            }
+            // No `Subscribe` has happened on this connection, so a
+            // pushed `Event` genuinely shouldn't arrive -- tolerate it
+            // rather than treat it as a protocol error, same rationale
+            // as `App::bootstrap`'s identical tolerance in `tui/mod.rs`.
+            ServerMessage::Event(_) => continue,
+        }
+    };
+
+    let received = handoff::receive_handoff_on(&receiver, &datagram_path).await?;
+    anyhow::ensure!(
+        received.panes.len() == pane_count,
+        "donor reported {pane_count} panes but sent {}",
+        received.panes.len()
+    );
+
+    let mut state = State::new();
+    state.adopt_handoff(received.workspaces, received.panes);
+    Ok(Some(state))
+}
+
 async fn run_with_state(
     socket_path: std::path::PathBuf,
     mut inner_state: State,
@@ -2921,5 +3010,130 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&datagram_path);
+    }
+
+    /// End-to-end coverage for the whole hot-restart path: a real
+    /// `cat` process, alive under a first daemon, must *keep running*
+    /// (same pid, still echoing fresh input) after a second daemon
+    /// process takes over via `run_taking_over_or_fresh` -- the one
+    /// property none of Tasks 2-8's narrower tests can prove on their
+    /// own, since each of those only exercises one half of the
+    /// exchange in isolation.
+    ///
+    /// This test runs both "daemons" as async tasks within the same
+    /// OS process (the test binary), not as two separate `exec`'d
+    /// processes -- but the handoff mechanism itself (fd passing over
+    /// a real `SCM_RIGHTS`-carrying `UnixDatagram`, a real spawned
+    /// `cat` child process with its own real pid) doesn't know or care
+    /// whether the two ends are different OS processes or just
+    /// different tasks in the same one; `libc::dup`/`sendmsg`/`recvmsg`
+    /// operate on real kernel fd tables regardless. This is a faithful
+    /// test of the mechanism. A fully end-to-end smoke test against two
+    /// truly separate `dimax daemon` processes is Task 12's manual
+    /// step.
+    #[tokio::test]
+    async fn run_taking_over_or_fresh_keeps_a_live_pane_running_across_the_handoff() {
+        let old_guard = start_daemon().await;
+        let mut conn = TestConn::connect(&old_guard.0).await;
+
+        let server = match conn
+            .request(Request::ServerSpawn {
+                name: Some("editor".to_string()),
+                cmd: Some("cat".to_string()),
+                cwd: None,
+                workspace: None,
+            })
+            .await
+        {
+            Response::ServerPane(info) => info.id,
+            other => panic!("expected ServerPane, got {other:?}"),
+        };
+        let (ws, pane) = match conn
+            .request(Request::ClientSpawn {
+                workspace: "1".to_string(),
+                split_of: None,
+                dir: None,
+                bind: Some(server.to_string()),
+            })
+            .await
+        {
+            Response::ClientPaneCreated { workspace, pane } => (workspace, pane),
+            other => panic!("expected ClientPaneCreated, got {other:?}"),
+        };
+        conn.request(Request::Input {
+            pane,
+            bytes: b"before-handoff\n".to_vec(),
+        })
+        .await;
+
+        // The *same* socket path -- this is what makes it a takeover
+        // rather than an independent fresh daemon.
+        let socket_path = old_guard.0.clone();
+        let new_daemon = run_taking_over_or_fresh(socket_path.clone())
+            .await
+            .expect("takeover should succeed");
+        // `old_guard` would try to remove the same path on drop, which
+        // is harmless (the donor already removed it itself once the
+        // handoff completed -- see the dispatch handler's shutdown
+        // step) but no longer needed to track; let it drop normally
+        // regardless.
+
+        let mut new_conn = TestConn::connect(&new_daemon.socket_path).await;
+        match new_conn.request(Request::ServerList).await {
+            Response::ServerPaneList(list) => {
+                assert_eq!(list.len(), 1);
+                assert_eq!(list[0].id, server, "server-pane id must survive the handoff");
+                assert_eq!(list[0].name, Some("editor".to_string()));
+            }
+            other => panic!("expected ServerPaneList, got {other:?}"),
+        }
+        match new_conn
+            .request(Request::Subscribe { workspace: ws.to_string() })
+            .await
+        {
+            Response::Snapshot { workspace, .. } => {
+                assert_eq!(workspace.id, ws, "workspace id must survive the handoff");
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+
+        // Prove it's the *same* live `cat` process, not a respawned
+        // one: input sent to the pre-handoff pane id, after the
+        // handoff, must echo back through the post-handoff connection.
+        new_conn
+            .request(Request::Input {
+                pane,
+                bytes: b"after-handoff\n".to_vec(),
+            })
+            .await;
+        // Deliberately not asserting "before-handoff" is still visible
+        // on screen: only the fd/process survives the handoff, never
+        // the old daemon's in-memory `wezterm_term::Terminal` state
+        // (module doc comment's "no screen redraw" limitation) --
+        // `from_inherited` always starts a brand-new blank terminal, so
+        // the pre-handoff grid content is gone regardless of how live
+        // the underlying process still is. What actually distinguishes
+        // this from a fallback plain restore (which mints fresh ids) is
+        // the *id* staying `server` above, plus the process actually
+        // being alive and responsive to new input right now.
+        let found = loop {
+            match new_conn.read_event(Duration::from_secs(2)).await {
+                Some(Event::GridDelta { snapshot }) if snapshot.server_pane == server => {
+                    let text: String = snapshot
+                        .lines
+                        .iter()
+                        .flat_map(|row| row.iter().map(|c| c.text.as_str()))
+                        .collect();
+                    if text.contains("after-handoff") {
+                        break true;
+                    }
+                }
+                Some(_) => continue,
+                None => panic!("no GridDelta observed \"after-handoff\" within 2s"),
+            }
+        };
+        assert!(found);
+
+        let _ = std::fs::remove_file(&new_daemon.socket_path);
     }
 }

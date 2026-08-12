@@ -331,20 +331,49 @@ pub struct ReceivedHandoff {
     pub panes: Vec<(HandoffPane, RawFd)>,
 }
 
+/// Bind `datagram_path` fresh (removing a stale file at that path
+/// first, if any) without yet reading anything from it -- split out
+/// from `receive_handoff` so a caller that also needs to *tell* the
+/// donor which path to send to (over a separate request/response
+/// channel, e.g. `daemon::mod`'s `try_take_over`) can bind first and
+/// only then announce the path, instead of announcing it and binding
+/// afterward. Announcing before binding is a real race: the donor can
+/// process the request and try to connect to `datagram_path` before
+/// this side has bound it, which fails immediately (`ENOENT`, nothing
+/// listening yet) and leaves a caller who *does* bind afterward
+/// waiting forever for messages that were already silently dropped.
+pub fn bind_handoff_receiver(
+    datagram_path: &std::path::Path,
+) -> anyhow::Result<tokio::net::UnixDatagram> {
+    if datagram_path.exists() {
+        std::fs::remove_file(datagram_path)?;
+    }
+    Ok(tokio::net::UnixDatagram::bind(datagram_path)?)
+}
+
 /// Acceptor side: bind `datagram_path` fresh, then read messages until
 /// `Done`. Binds the path itself (rather than taking an already-bound
 /// socket) so callers only need to pick a path, matching
 /// `send_handoff`'s "you already bound it" contract on the other end.
+/// Callers that need to bind *before* announcing the path to avoid the
+/// race described on [`bind_handoff_receiver`] should call that
+/// directly and then [`receive_handoff_on`] instead of this function.
 pub async fn receive_handoff(datagram_path: &std::path::Path) -> anyhow::Result<ReceivedHandoff> {
-    if datagram_path.exists() {
-        std::fs::remove_file(datagram_path)?;
-    }
-    let receiver = tokio::net::UnixDatagram::bind(datagram_path)?;
+    let receiver = bind_handoff_receiver(datagram_path)?;
+    receive_handoff_on(&receiver, datagram_path).await
+}
 
+/// The read side of [`receive_handoff`], taking an already-bound
+/// receiver -- see [`bind_handoff_receiver`]'s doc comment for why a
+/// caller would want to bind separately from reading.
+pub async fn receive_handoff_on(
+    receiver: &tokio::net::UnixDatagram,
+    datagram_path: &std::path::Path,
+) -> anyhow::Result<ReceivedHandoff> {
     let mut buf = [0u8; 65536];
     let mut fd_buf = [0 as RawFd; 1];
 
-    let (n, _) = recv_with_fd_async(&receiver, &mut buf, &mut fd_buf).await?;
+    let (n, _) = recv_with_fd_async(receiver, &mut buf, &mut fd_buf).await?;
     let workspaces = match decode(&buf[..n])? {
         HandoffMessage::Layout { workspaces } => workspaces,
         other => anyhow::bail!("expected Layout first, got {other:?}"),
@@ -352,7 +381,7 @@ pub async fn receive_handoff(datagram_path: &std::path::Path) -> anyhow::Result<
 
     let mut panes = Vec::new();
     loop {
-        let (n, fd_count) = recv_with_fd_async(&receiver, &mut buf, &mut fd_buf).await?;
+        let (n, fd_count) = recv_with_fd_async(receiver, &mut buf, &mut fd_buf).await?;
         match decode(&buf[..n])? {
             HandoffMessage::Pane { meta } => {
                 anyhow::ensure!(fd_count == 1, "Pane message arrived with no fd");
