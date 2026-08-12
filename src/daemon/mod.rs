@@ -14,7 +14,21 @@
 //! non-goals) and keeps the logic in `state` free of async concerns.
 
 pub mod pinned_dirs;
+pub mod session;
 pub mod state;
+
+/// Serializes every test across this crate that mutates
+/// `$XDG_CONFIG_HOME` (or `$HOME`) -- both `pinned_dirs` and `session`
+/// resolve their on-disk path from it, and it's process-global, so two
+/// such tests from *different* modules running concurrently (the
+/// default under `cargo test`) could each see the other's env mutation
+/// mid-test even though each module already serializes its own tests
+/// against each other. A single shared lock is what actually prevents
+/// that cross-module race; two separate per-module locks (this
+/// started as one in each of `pinned_dirs`/`session` before they were
+/// observed to race one another) do not.
+#[cfg(test)]
+pub(crate) static XDG_CONFIG_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 use crate::protocol::{
     self, ClientPane, Event, Request, Response, ServerMessage, ServerPaneId, WorkspaceId,
@@ -51,22 +65,47 @@ pub struct Daemon {
 /// installs a `SIGTERM`/`SIGINT` handler that unlinks `socket_path` before
 /// letting the process actually exit, so a *graceful* shutdown leaves no
 /// file behind at all -- [`bind_socket`]'s stale-detection is the
-/// fallback for the crash case this handler can't catch. Used both by
-/// `dimax attach`'s auto-spawn path and directly by integration tests
-/// with a temp path.
+/// fallback for the crash case this handler can't catch. Starts from a
+/// deterministically empty `State`, session file on disk or not --
+/// every caller of this specific function (directly, `dimax attach`'s
+/// auto-spawn path and every integration test in this module) wants
+/// that. The real `dimax daemon` entry point calls
+/// [`run_and_restore_session`] instead, so a session file left by a
+/// previous clean shutdown never reaches this one.
 pub async fn run(socket_path: std::path::PathBuf) -> anyhow::Result<Daemon> {
+    run_with_state(socket_path, State::new()).await
+}
+
+/// Same as [`run`], but replays a previously-saved [`session`] into
+/// `initial_state` before serving any connections -- what a *deliberate*
+/// restart (picking up a rebuilt binary, the whole reason this exists)
+/// can use to bring workspace layout back. Kept as a separate function
+/// rather than a parameter on `run` itself so no existing test needs to
+/// opt out of a behavior it never asked for; see `session` module doc
+/// for exactly what this can and can't restore.
+pub async fn run_and_restore_session(socket_path: std::path::PathBuf) -> anyhow::Result<Daemon> {
+    let mut initial_state = State::new();
+    if let Some(saved) = session::take() {
+        initial_state.restore_session(saved);
+    }
+    run_with_state(socket_path, initial_state).await
+}
+
+async fn run_with_state(
+    socket_path: std::path::PathBuf,
+    mut inner_state: State,
+) -> anyhow::Result<Daemon> {
     let listener = bind_socket(&socket_path).await?;
-    spawn_cleanup_on_signal(socket_path.clone())?;
-    let mut inner_state = State::new();
     // Claim the pane-event stream exactly once, right here at start-up
     // (module doc / `state::State::take_pane_events` doc comment) — this
     // is the *only* caller, so `expect` is warranted: a `None` here would
     // mean this function ran twice against the same `State`, which can't
-    // happen since `State::new()` is constructed fresh above.
+    // happen since each caller passes in its own freshly constructed one.
     let mut pane_events = inner_state
         .take_pane_events()
         .expect("freshly constructed State always has its pane-event receiver available");
     let state = Arc::new(Mutex::new(inner_state));
+    spawn_cleanup_on_signal(socket_path.clone(), state.clone())?;
     let registry: SubscriberRegistry = Arc::new(Mutex::new(HashMap::new()));
     let next_subscriber_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
@@ -155,14 +194,17 @@ async fn bind_socket(socket_path: &Path) -> anyhow::Result<UnixListener> {
     Ok(UnixListener::bind(socket_path)?)
 }
 
-/// Install a `SIGTERM`/`SIGINT` handler that unlinks `socket_path` before
-/// the process exits, so a graceful shutdown (a normal `kill`, or
-/// `Ctrl-C` to a foreground `dimax daemon`) leaves no stale file for
-/// `bind_socket`'s fallback to need to clean up next time. Spawns a
-/// background task that waits for either signal once, removes the file
-/// (best-effort — nothing further to do if that fails), and exits the
-/// process.
-fn spawn_cleanup_on_signal(socket_path: PathBuf) -> anyhow::Result<()> {
+/// Install a `SIGTERM`/`SIGINT` handler that saves the current
+/// workspace layout (see `session` module doc) and unlinks
+/// `socket_path` before the process exits, so a graceful shutdown (a
+/// normal `kill`, or `Ctrl-C` to a foreground `dimax daemon`) leaves no
+/// stale file for `bind_socket`'s fallback to need to clean up next
+/// time, and leaves a session file the next `run_and_restore_session`
+/// can replay. Spawns a background task that waits for either signal
+/// once, saves (best-effort — see `session::save`'s doc comment for why
+/// this never blocks or fails shutdown), removes the socket file
+/// (also best-effort), and exits the process.
+fn spawn_cleanup_on_signal(socket_path: PathBuf, state: Arc<Mutex<State>>) -> anyhow::Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     tokio::spawn(async move {
@@ -170,6 +212,7 @@ fn spawn_cleanup_on_signal(socket_path: PathBuf) -> anyhow::Result<()> {
             _ = sigterm.recv() => {}
             _ = sigint.recv() => {}
         }
+        session::save(&state.lock().await.snapshot_for_session_save());
         let _ = std::fs::remove_file(&socket_path);
         std::process::exit(0);
     });
@@ -2513,8 +2556,15 @@ mod tests {
         // Same fixed window for both: `yes` keeps flooding throughout,
         // so this compares broadcast counts over identical wall-clock
         // time rather than draining either side to (an unreachable)
-        // quiescence.
-        let window = Duration::from_millis(500);
+        // quiescence. 2s (20x the 100ms throttle window) rather than
+        // something tighter -- under a fully loaded `cargo test` run
+        // (every other test's real PTYs competing for CPU), a short
+        // window can let the flood produce so few batches overall that
+        // none happen to be >100ms apart yet, making the two counts
+        // come out equal by coincidence rather than by a broken
+        // throttle. More headroom is cheap; this test still finishes
+        // in ~2s either way.
+        let window = Duration::from_millis(2000);
         let focused_events = collect_events_for(&mut focused, window).await;
         let unfocused_events = collect_events_for(&mut unfocused, window).await;
         assert!(
@@ -2551,6 +2601,98 @@ mod tests {
         {
             Event::GridDelta { snapshot } => assert_eq!(snapshot.server_pane, server),
             other => panic!("expected GridDelta, got {other:?}"),
+        }
+    }
+
+    /// End-to-end coverage for `session`: a daemon started via
+    /// `run_and_restore_session` picks up a session file (the exact
+    /// scenario motivating the whole module -- restarting to pick up a
+    /// rebuilt binary without losing every workspace) and the pane it
+    /// respawns is reachable over the real wire protocol with its saved
+    /// name, unlike a plain `run()`. Verified against the actual daemon
+    /// entry point every other test in this module uses, not just
+    /// against `State::restore_session` in isolation (already covered
+    /// by `daemon::state`'s own tests).
+    #[tokio::test]
+    async fn run_and_restore_session_brings_back_a_saved_workspace() {
+        let dir = std::env::temp_dir().join(format!("dimax-session-restore-test-{}", Uuid::new_v4()));
+
+        // Everything that touches `$XDG_CONFIG_HOME` (saving, and
+        // `session::take` reading it back) happens synchronously in
+        // this block, guard held throughout -- then the guard drops
+        // before the first `.await` below. Holding a blocking
+        // `std::sync::Mutex` across an await point is its own hazard
+        // (clippy's `await_holding_lock`) independent of what the lock
+        // protects; this avoids it entirely rather than relying on
+        // exactly when `run_and_restore_session`'s own internal
+        // `session::take()` call happens to run relative to its first
+        // real await. `run_and_restore_session` itself is a thin,
+        // directly-inspectable wrapper over exactly this
+        // take-then-restore-then-serve sequence (see its doc comment),
+        // so replicating it here to keep the lock synchronous doesn't
+        // lose meaningful coverage.
+        let restored_state = {
+            // Shared across every module that mutates
+            // `$XDG_CONFIG_HOME` -- see `XDG_CONFIG_HOME_TEST_LOCK`'s
+            // doc comment.
+            let _env_guard = XDG_CONFIG_HOME_TEST_LOCK.lock().unwrap();
+            let prev = std::env::var_os("XDG_CONFIG_HOME");
+            unsafe {
+                std::env::set_var("XDG_CONFIG_HOME", &dir);
+            }
+
+            let mut prior = State::new();
+            let sp = prior
+                .server_spawn(Some("editor".to_string()), Some("cat".to_string()), None, None)
+                .unwrap()
+                .id;
+            let ws = prior.resolve_or_create_workspace("3").unwrap();
+            prior.client_spawn(ws, None, None, Some(sp)).unwrap();
+            session::save(&prior.snapshot_for_session_save());
+            // Nothing further needed from the live pane -- the
+            // snapshot above is already plain owned data, independent
+            // of the process from here on. Kill it explicitly rather
+            // than just dropping `prior`: `ServerPane` has no `Drop`
+            // impl (by design -- the daemon owns that lifecycle via
+            // `State::server_kill`), so an un-killed pane would
+            // otherwise leak its `cat` process and reader thread for
+            // the rest of the test run.
+            prior.server_kill(&sp.to_string()).unwrap();
+
+            let mut fresh = State::new();
+            if let Some(saved) = session::take() {
+                fresh.restore_session(saved);
+            }
+
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            fresh
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let path = std::env::temp_dir().join(format!("dimax-test-{}.sock", Uuid::new_v4()));
+        let _socket_guard = SocketGuard(path.clone());
+        run_with_state(path.clone(), restored_state)
+            .await
+            .expect("daemon should bind, restore, and start");
+
+        let mut conn = TestConn::connect(&path).await;
+        match conn.request(Request::ServerList).await {
+            Response::ServerPaneList(list) => {
+                assert_eq!(list.len(), 1);
+                assert_eq!(list[0].name, Some("editor".to_string()));
+            }
+            other => panic!("expected ServerPaneList, got {other:?}"),
+        }
+        match conn.request(Request::Subscribe { workspace: "3".to_string() }).await {
+            Response::Snapshot { workspace, .. } => {
+                assert_eq!(workspace.number, 3, "restore should keep the original workspace number");
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
         }
     }
 }

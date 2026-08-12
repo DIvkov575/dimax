@@ -476,6 +476,122 @@ impl State {
         })
     }
 
+    // -- session persistence (see `super::session` module doc) ----------
+
+    /// Build a point-in-time [`super::session::SavedSession`] from every
+    /// current workspace's layout and each bound server-pane's name +
+    /// last-known cwd -- what `daemon::mod`'s shutdown handler calls
+    /// right before exiting.
+    pub fn snapshot_for_session_save(&self) -> super::session::SavedSession {
+        let workspaces = self
+            .workspaces
+            .values()
+            .map(|ws| super::session::SavedWorkspace {
+                number: ws.info_number,
+                name: ws.name.clone(),
+                tree: ws.tree.as_ref().map(|tree| self.save_tree(tree)),
+            })
+            .collect();
+        super::session::SavedSession { workspaces }
+    }
+
+    fn save_tree(&self, tree: &SplitTree) -> super::session::SavedTree {
+        match tree {
+            SplitTree::Leaf(pane) => super::session::SavedTree::Leaf {
+                name: pane.name.clone(),
+                tabs: pane
+                    .tabs
+                    .iter()
+                    .map(|sp| super::session::SavedServerPane {
+                        name: self
+                            .server_panes
+                            .get(sp)
+                            .and_then(ServerPane::name)
+                            .map(str::to_string),
+                        cwd: self
+                            .server_panes
+                            .get(sp)
+                            .and_then(ServerPane::foreground_info)
+                            .and_then(|info| info.cwd),
+                    })
+                    .collect(),
+                active_tab: pane.active_tab,
+            },
+            SplitTree::Split { dir, ratio, a, b, .. } => super::session::SavedTree::Split {
+                dir: *dir,
+                ratio: *ratio,
+                a: Box::new(self.save_tree(a)),
+                b: Box::new(self.save_tree(b)),
+            },
+        }
+    }
+
+    /// Replay `saved` into this `State`, right after `State::new()` --
+    /// respawning a fresh default shell for every saved pane at its
+    /// last-known cwd and rebuilding the same split structure and
+    /// names. See `super::session` module doc for exactly what can and
+    /// can't come back this way, and why this is only ever called from
+    /// `daemon::run_and_restore_session`, never plain
+    /// `State::new()`/`daemon::run` (every other caller -- overwhelmingly
+    /// tests -- wants a deterministically empty starting `State`
+    /// regardless of what's on disk on the machine running them).
+    pub fn restore_session(&mut self, saved: super::session::SavedSession) {
+        for ws in saved.workspaces {
+            let ws_id = WorkspaceId::new_v4();
+            self.workspaces.insert(
+                ws_id,
+                Workspace {
+                    info_number: ws.number,
+                    name: ws.name,
+                    tree: None,
+                },
+            );
+            let tree = ws.tree.map(|t| self.restore_tree(t, ws_id));
+            self.workspaces.get_mut(&ws_id).expect("just inserted above").tree = tree;
+        }
+    }
+
+    fn restore_tree(&mut self, saved: super::session::SavedTree, owner: WorkspaceId) -> SplitTree {
+        match saved {
+            super::session::SavedTree::Leaf {
+                name,
+                tabs,
+                active_tab,
+            } => {
+                let tab_ids: Vec<ServerPaneId> = tabs
+                    .into_iter()
+                    .filter_map(|saved_pane| {
+                        // A spawn failure here (shell binary missing, a
+                        // saved cwd since deleted, ...) drops just this
+                        // one tab rather than aborting the whole
+                        // restore -- the rest of the layout still
+                        // coming back mostly-right beats none of it
+                        // coming back at all.
+                        self.server_spawn(saved_pane.name, None, saved_pane.cwd, Some(owner))
+                            .ok()
+                            .map(|info| info.id)
+                    })
+                    .collect();
+                let short_id = encode_short_id(self.next_client_short_id);
+                self.next_client_short_id += 1;
+                SplitTree::Leaf(ClientPane {
+                    id: ClientPaneId::new_v4(),
+                    name,
+                    tabs: tab_ids,
+                    active_tab,
+                    short_id,
+                })
+            }
+            super::session::SavedTree::Split { dir, ratio, a, b } => SplitTree::Split {
+                id: SplitId::new_v4(),
+                dir,
+                ratio,
+                a: Box::new(self.restore_tree(*a, owner)),
+                b: Box::new(self.restore_tree(*b, owner)),
+            },
+        }
+    }
+
     /// Implements `dimax client spawn`: create a new client-pane, either
     /// as the sole leaf of an empty workspace (`split_of: None`) or by
     /// splitting an existing leaf (`split_of: Some(pane)`). Errors if
@@ -2370,5 +2486,111 @@ mod tests {
         match event {
             ServerPaneEvent::Changed(id) | ServerPaneEvent::Died(id) => assert_eq!(id, info.id),
         }
+    }
+
+    use crate::daemon::session;
+
+    #[test]
+    fn snapshot_for_session_save_captures_workspace_number_and_pane_names() {
+        let mut state = State::new();
+        let sp = spawn_pane(&mut state, "editor");
+        workspace_with_bound_pane(&mut state, "3", sp);
+
+        let saved = state.snapshot_for_session_save();
+        assert_eq!(saved.workspaces.len(), 1);
+        let ws = &saved.workspaces[0];
+        assert_eq!(ws.number, 3);
+        match ws.tree.as_ref().unwrap() {
+            session::SavedTree::Leaf { name, tabs, .. } => {
+                assert_eq!(*name, None); // the client-pane itself was never renamed
+                assert_eq!(tabs.len(), 1);
+                assert_eq!(tabs[0].name, Some("editor".to_string()));
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_for_session_save_preserves_an_empty_workspace() {
+        let mut state = State::new();
+        state.resolve_or_create_workspace("scratch").unwrap();
+
+        let saved = state.snapshot_for_session_save();
+        assert_eq!(saved.workspaces.len(), 1);
+        assert_eq!(saved.workspaces[0].name, Some("scratch".to_string()));
+        assert!(saved.workspaces[0].tree.is_none());
+    }
+
+    #[test]
+    fn restore_session_mints_fresh_ids_but_keeps_workspace_number_and_pane_name() {
+        let mut state = State::new();
+        let sp = spawn_pane(&mut state, "editor");
+        let (ws_id, pane_id) = workspace_with_bound_pane(&mut state, "3", sp);
+        let saved = state.snapshot_for_session_save();
+
+        let mut restored = State::new();
+        restored.restore_session(saved);
+
+        assert_eq!(restored.workspaces.len(), 1);
+        let (&new_ws_id, ws) = restored.workspaces.iter().next().unwrap();
+        assert_ne!(new_ws_id, ws_id, "restore must mint a fresh WorkspaceId");
+        assert_eq!(ws.info_number, 3);
+        match ws.tree.as_ref().unwrap() {
+            SplitTree::Leaf(pane) => {
+                assert_ne!(pane.id, pane_id, "restore must mint a fresh ClientPaneId");
+                assert_eq!(pane.tabs.len(), 1);
+                let new_sp = pane.tabs[0];
+                assert_ne!(new_sp, sp, "restore must mint a fresh ServerPaneId");
+                assert_eq!(restored.server_pane(new_sp).unwrap().name(), Some("editor"));
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_session_rebuilds_a_split_trees_shape_and_names() {
+        let mut state = State::new();
+        let left = spawn_pane(&mut state, "left");
+        let (ws_id, left_pane) = workspace_with_bound_pane(&mut state, "1", left);
+        let right = spawn_pane(&mut state, "right");
+        state
+            .client_spawn(ws_id, Some(left_pane), Some(SplitDir::Vertical), Some(right))
+            .unwrap();
+
+        let saved = state.snapshot_for_session_save();
+        let mut restored = State::new();
+        restored.restore_session(saved);
+
+        let leaf_name = |leaf: &SplitTree, restored: &State| match leaf {
+            SplitTree::Leaf(pane) => restored
+                .server_pane(pane.tabs[0])
+                .and_then(ServerPane::name)
+                .map(str::to_string),
+            _ => panic!("expected a Leaf"),
+        };
+        let ws = restored.workspaces.values().next().unwrap();
+        match ws.tree.as_ref().unwrap() {
+            SplitTree::Split { dir, a, b, .. } => {
+                assert_eq!(*dir, SplitDir::Vertical);
+                assert_eq!(leaf_name(a, &restored), Some("left".to_string()));
+                assert_eq!(leaf_name(b, &restored), Some("right".to_string()));
+            }
+            other => panic!("expected Split, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_session_preserves_an_empty_workspace() {
+        let mut state = State::new();
+        state.resolve_or_create_workspace("scratch").unwrap();
+        let saved = state.snapshot_for_session_save();
+
+        let mut restored = State::new();
+        restored.restore_session(saved);
+
+        assert_eq!(restored.workspaces.len(), 1);
+        let ws = restored.workspaces.values().next().unwrap();
+        assert_eq!(ws.name, Some("scratch".to_string()));
+        assert!(ws.tree.is_none());
     }
 }
