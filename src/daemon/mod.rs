@@ -1029,7 +1029,7 @@ async fn push_to_subscribers(
     }
 }
 
-fn tracing_lite_log(msg: &str) {
+pub(crate) fn tracing_lite_log(msg: &str) {
     eprintln!("[dimax-daemon] {msg}");
 }
 

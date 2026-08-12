@@ -592,6 +592,93 @@ impl State {
         }
     }
 
+    /// Rebuild this (freshly constructed, still-empty) `State` from a
+    /// completed `daemon::handoff::receive_handoff` -- every workspace
+    /// and pane keeps the *exact* id it had in the donor daemon (see
+    /// `daemon::handoff`'s module doc for why), unlike `restore_session`'s
+    /// fresh-minted ids. Uses `self.pane_events.clone()` for each adopted
+    /// pane, exactly like `server_spawn` already does -- no external
+    /// events sender needed, same as every other `ServerPane`-constructing
+    /// method on `State`.
+    pub fn adopt_handoff(
+        &mut self,
+        workspaces: Vec<super::handoff::HandoffWorkspace>,
+        panes: Vec<(super::handoff::HandoffPane, std::os::fd::RawFd)>,
+    ) {
+        for (meta, fd) in panes {
+            let master = Box::new(super::handoff::InheritedMasterPty::new(fd));
+            let child = Box::new(super::handoff::InheritedChild::new(meta.pid));
+            match ServerPane::from_inherited(
+                meta.id,
+                meta.name,
+                master,
+                child,
+                meta.size,
+                self.pane_events.clone(),
+                meta.owner_workspace,
+                meta.short_id,
+            ) {
+                Ok(pane) => {
+                    self.server_panes.insert(meta.id, pane);
+                }
+                Err(err) => {
+                    // One bad fd (already closed, or some transient
+                    // error) drops just this pane rather than aborting
+                    // the whole handoff -- the rest of the session
+                    // still coming back beats none of it.
+                    super::tracing_lite_log(&format!(
+                        "adopt_handoff: failed to adopt server-pane {}: {err:#}",
+                        meta.id
+                    ));
+                }
+            }
+        }
+
+        for ws in workspaces {
+            let tree = ws.tree.map(Self::handoff_tree_to_split_tree);
+            self.workspaces.insert(
+                ws.id,
+                Workspace {
+                    info_number: ws.number,
+                    name: ws.name,
+                    tree,
+                },
+            );
+        }
+    }
+
+    fn handoff_tree_to_split_tree(tree: super::handoff::HandoffTree) -> SplitTree {
+        match tree {
+            super::handoff::HandoffTree::Leaf {
+                id,
+                name,
+                tabs,
+                active_tab,
+                short_id,
+            } => SplitTree::Leaf(ClientPane {
+                id,
+                name,
+                tabs,
+                active_tab,
+                short_id,
+            }),
+            super::handoff::HandoffTree::Split { id, dir, ratio, a, b } => SplitTree::Split {
+                id,
+                dir,
+                ratio,
+                a: Box::new(Self::handoff_tree_to_split_tree(*a)),
+                b: Box::new(Self::handoff_tree_to_split_tree(*b)),
+            },
+        }
+    }
+
+    /// Every currently-registered workspace's id -- for
+    /// `daemon::mod`'s `BeginHandoff` dispatch handler to enumerate
+    /// what to send.
+    pub fn workspace_ids(&self) -> Vec<WorkspaceId> {
+        self.workspaces.keys().copied().collect()
+    }
+
     /// Implements `dimax client spawn`: create a new client-pane, either
     /// as the sole leaf of an empty workspace (`split_of: None`) or by
     /// splitting an existing leaf (`split_of: Some(pane)`). Errors if
@@ -2592,5 +2679,61 @@ mod tests {
         let ws = restored.workspaces.values().next().unwrap();
         assert_eq!(ws.name, Some("scratch".to_string()));
         assert!(ws.tree.is_none());
+    }
+
+    #[test]
+    fn adopt_handoff_preserves_every_id_and_registers_the_inherited_pane() {
+        use crate::daemon::handoff::{HandoffPane, HandoffTree, HandoffWorkspace};
+        use portable_pty::{PtySize, native_pty_system};
+
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+            .unwrap();
+        let dup_fd = unsafe { libc::dup(pair.master.as_raw_fd().unwrap()) };
+        assert!(dup_fd >= 0);
+
+        let ws_id = WorkspaceId::new_v4();
+        let pane_id = ClientPaneId::new_v4();
+        let sp_id = ServerPaneId::new_v4();
+        let workspaces = vec![HandoffWorkspace {
+            id: ws_id,
+            number: 3,
+            name: None,
+            tree: Some(HandoffTree::Leaf {
+                id: pane_id,
+                name: None,
+                tabs: vec![sp_id],
+                active_tab: 0,
+                short_id: "aa".to_string(),
+            }),
+        }];
+        let panes = vec![(
+            HandoffPane {
+                id: sp_id,
+                name: Some("editor".to_string()),
+                size: Size { rows: 24, cols: 80 },
+                short_id: "aa".to_string(),
+                owner_workspace: Some(ws_id),
+                pid: unsafe { libc::getpid() },
+            },
+            dup_fd,
+        )];
+
+        let mut state = State::new();
+        state.adopt_handoff(workspaces, panes);
+
+        assert!(state.workspaces.contains_key(&ws_id), "workspace id must be preserved");
+        let ws = &state.workspaces[&ws_id];
+        assert_eq!(ws.info_number, 3);
+        match ws.tree.as_ref().unwrap() {
+            SplitTree::Leaf(leaf) => {
+                assert_eq!(leaf.id, pane_id, "client-pane id must be preserved");
+                assert_eq!(leaf.tabs, vec![sp_id]);
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+        assert!(state.server_panes.contains_key(&sp_id), "server-pane id must be preserved");
+        assert_eq!(state.server_panes[&sp_id].name(), Some("editor"));
     }
 }
