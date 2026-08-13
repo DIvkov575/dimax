@@ -17,8 +17,8 @@
 //! that never claims it will render nothing.
 
 use crate::protocol::{
-    ClientPane, ClientPaneId, ServerPaneId, ServerPaneInfo, Size, SplitDir, SplitId, SplitTree,
-    WorkspaceId, WorkspaceInfo,
+    AttachedBinding, ClientPane, ClientPaneId, ServerPaneId, ServerPaneInfo, Size, SplitDir,
+    SplitId, SplitTree, WorkspaceId, WorkspaceInfo,
 };
 use crate::term::{ServerPane, ServerPaneEvent};
 use serde::{Deserialize, Serialize};
@@ -296,6 +296,10 @@ impl State {
             foreground: pane.foreground_info(),
             owner_workspace: pane.owner_workspace(),
             short_id,
+            // A pane is never attached at spawn time -- `client_bind`/
+            // `client_add_tab` haven't run yet. Populated live by
+            // `server_list` for every subsequent lookup.
+            attached_to: Vec::new(),
         };
         self.server_panes.insert(id, pane);
         Ok(info)
@@ -388,6 +392,30 @@ impl State {
     /// new background task.
     pub fn server_list(&mut self) -> Vec<ServerPaneInfo> {
         self.apply_pending_session_names();
+        // Reverse-map every server-pane to the client-pane(s) currently
+        // holding it as a tab (see `ServerPaneInfo::attached_to`'s doc).
+        // One pass across every workspace's tree is fine here -- `server_
+        // list` is only called on menu-open cadence, not per-frame, and
+        // the pane counts involved are tiny.
+        let mut attached_to: HashMap<ServerPaneId, Vec<AttachedBinding>> = HashMap::new();
+        for ws in self.workspaces.values() {
+            let Some(tree) = ws.tree.as_ref() else {
+                continue;
+            };
+            for leaf in tree.leaves() {
+                let active = leaf.active_bound();
+                for &server_pane in &leaf.tabs {
+                    attached_to
+                        .entry(server_pane)
+                        .or_default()
+                        .push(AttachedBinding {
+                            workspace_number: ws.info_number,
+                            client_short_id: leaf.short_id.clone(),
+                            active: Some(server_pane) == active,
+                        });
+                }
+            }
+        }
         let mut panes: Vec<ServerPaneInfo> = self
             .server_panes
             .values()
@@ -399,6 +427,7 @@ impl State {
                 foreground: p.foreground_info(),
                 owner_workspace: p.owner_workspace(),
                 short_id: p.short_id().to_string(),
+                attached_to: attached_to.remove(&p.id()).unwrap_or_default(),
             })
             .collect();
         // HashMap order is unspecified; sort so `dimax server ls` output
@@ -1540,6 +1569,63 @@ mod tests {
                 Some("b".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn server_list_reports_attached_bindings_across_workspaces() {
+        // Two panes; the first is the active tab of workspace 1's leaf,
+        // the second is a background tab of workspace 2's leaf. Both
+        // `attached_to` entries must land on the right pane, with `active`
+        // reflecting whether that binding is the leaf's currently-shown
+        // tab -- see `AttachedBinding` docs and the attached-column
+        // rendering in `tui::render`.
+        let mut state = State::new();
+        let sp1 = spawn_pane(&mut state, "one");
+        let sp2 = spawn_pane(&mut state, "two");
+        let (_ws1, _cp1) = workspace_with_bound_pane(&mut state, "1", sp1);
+        let (ws2, cp2) = workspace_with_bound_pane(&mut state, "2", sp2);
+        // Add sp1 as a second (now-active) tab on ws2's leaf, then flip
+        // back so sp2 is once again the active tab -- gives sp1 a
+        // background binding into ws2 to distinguish from its active
+        // binding into ws1.
+        state.client_add_tab(ws2, cp2, sp1).unwrap();
+        state.client_cycle_tab(ws2, cp2, false).unwrap();
+
+        let list = state.server_list();
+        let sp1_info = list.iter().find(|p| p.id == sp1).unwrap();
+        let sp2_info = list.iter().find(|p| p.id == sp2).unwrap();
+
+        let sp1_bindings: Vec<(u8, bool)> = sp1_info
+            .attached_to
+            .iter()
+            .map(|b| (b.workspace_number, b.active))
+            .collect();
+        assert!(
+            sp1_bindings.contains(&(1, true)),
+            "sp1 is the active tab of ws1's leaf"
+        );
+        assert!(
+            sp1_bindings.contains(&(2, false)),
+            "sp1 is a background tab of ws2's leaf"
+        );
+        assert_eq!(sp1_bindings.len(), 2);
+
+        assert_eq!(sp2_info.attached_to.len(), 1);
+        assert_eq!(sp2_info.attached_to[0].workspace_number, 2);
+        assert!(sp2_info.attached_to[0].active);
+    }
+
+    #[test]
+    fn server_list_reports_empty_attached_to_for_unbound_panes() {
+        // A server-pane with no client-pane binding anywhere must come
+        // back with `attached_to` empty -- what the attach menu's
+        // `attached` column renders as `-` and the CLI's `dimax server
+        // ls` renders as `-` in its trailing column.
+        let mut state = State::new();
+        let orphan = spawn_pane(&mut state, "orphan");
+        let list = state.server_list();
+        let info = list.iter().find(|p| p.id == orphan).unwrap();
+        assert!(info.attached_to.is_empty());
     }
 
     #[test]

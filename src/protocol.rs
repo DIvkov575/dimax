@@ -265,6 +265,38 @@ pub struct ServerPaneInfo {
     /// -- resets to `"aa"` on every daemon restart, so it is not stable
     /// across restarts the way a real name is.
     pub short_id: String,
+    /// Every client-pane, across every workspace, that currently has this
+    /// server-pane in its `tabs` list -- lets the attach menu (and `dimax
+    /// server ls`) answer "where is this pane attached?" without the
+    /// caller having to fetch every workspace's tree and reverse-map the
+    /// bindings itself. Empty when the pane is unattached (still running,
+    /// but no client-pane is showing it or holding it as a background
+    /// tab). Rebuilt fresh every `server_list()` call, so it reflects the
+    /// current binding state at the moment the attach menu opened, not
+    /// some cached snapshot.
+    pub attached_to: Vec<AttachedBinding>,
+}
+
+/// See [`ServerPaneInfo::attached_to`]. Identifies one client-pane
+/// binding on this server-pane, in a form the frontend can render
+/// directly (`workspace_number/client_short_id`, e.g. `1/aa`) without
+/// needing to look either up itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttachedBinding {
+    /// The workspace this client-pane lives in (1-9), matching
+    /// `WorkspaceInfo::number` and the numbers `dimax attach`'s
+    /// portable-mode `1..=9` chords address.
+    pub workspace_number: u8,
+    /// Short id of the specific client-pane holding this binding (see
+    /// `ClientPane::short_id`).
+    pub client_short_id: String,
+    /// `true` if this server-pane is the client-pane's *active* tab (the
+    /// one currently being displayed); `false` if it's just one of the
+    /// client-pane's tabs sitting in the background. Distinguishing the
+    /// two matters for the attach menu -- an inactive tab is bound but
+    /// not visible anywhere, so it reads differently from an on-screen
+    /// pane.
+    pub active: bool,
 }
 
 /// See [`ServerPaneInfo::foreground`].

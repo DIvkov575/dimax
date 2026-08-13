@@ -3577,6 +3577,7 @@ mod tests {
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         }
     }
 

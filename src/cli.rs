@@ -351,9 +351,32 @@ fn format_server_pane_line(info: &ServerPaneInfo) -> String {
         .as_ref()
         .and_then(|f| f.session_kind)
         .map_or("-", SessionKind::as_str);
+    // Trailing `attached` column: comma-joined `<ws>/<client-short>`
+    // (with a `+` suffix on any binding that's a background tab rather
+    // than the client-pane's currently displayed one), or a lone `-`
+    // when the pane is unattached. Same reverse-mapping the attach
+    // menu shows -- surfacing it here too so scripted callers don't
+    // have to walk every workspace's tree to answer "where is this
+    // pane bound right now?" themselves.
+    let attached = if info.attached_to.is_empty() {
+        "-".to_string()
+    } else {
+        info.attached_to
+            .iter()
+            .map(|b| {
+                format!(
+                    "{}/{}{}",
+                    b.workspace_number,
+                    b.client_short_id,
+                    if b.active { "" } else { "+" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     format!(
-        "{}\t{}\t{}\t{}x{}\t{}\t{}\t{}",
-        info.id, name, status, info.size.rows, info.size.cols, process, cwd, kind
+        "{}\t{}\t{}\t{}x{}\t{}\t{}\t{}\t{}",
+        info.id, name, status, info.size.rows, info.size.cols, process, cwd, kind, attached
     )
 }
 
@@ -991,11 +1014,15 @@ mod tests {
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let line = format_server_pane_line(&info);
         assert_eq!(
             line,
-            format!("{}\teditor\trunning\t24x80\tvim\t/home/dev\t-", Uuid::nil())
+            format!(
+                "{}\teditor\trunning\t24x80\tvim\t/home/dev\t-\t-",
+                Uuid::nil()
+            )
         );
     }
 
@@ -1009,9 +1036,10 @@ mod tests {
             foreground: None,
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let line = format_server_pane_line(&info);
-        assert_eq!(line, format!("{}\t-\tdead\t10x20\t-\t-\t-", Uuid::nil()));
+        assert_eq!(line, format!("{}\t-\tdead\t10x20\t-\t-\t-\t-", Uuid::nil()));
     }
 
     #[test]
@@ -1028,12 +1056,13 @@ mod tests {
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let line = format_server_pane_line(&info);
         assert_eq!(
             line,
             format!(
-                "{}\t-\trunning\t24x80\tclaude\t/home/dev\tclaude",
+                "{}\t-\trunning\t24x80\tclaude\t/home/dev\tclaude\t-",
                 Uuid::nil()
             )
         );
