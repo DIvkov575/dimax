@@ -4971,6 +4971,130 @@ mod tests {
         );
     }
 
+    /// `cmd-w` on a leaf with more than one tab must drop only the active
+    /// tab (killing that tab's bound server-pane) and leave the leaf, its
+    /// other tab, and that other tab's server-pane untouched -- this is
+    /// the multi-tab case `close_tab`'s `ClientCloseTab` call is meant to
+    /// handle, as opposed to the whole-leaf-closes path already covered by
+    /// `close_tab_kills_the_bound_server_pane` (single tab).
+    #[tokio::test]
+    async fn close_tab_on_a_multi_tab_pane_drops_only_the_active_tab() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+
+        let Response::ServerPane(sp1) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: None,
+                    workspace: None,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        let Response::ServerPane(sp2) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: None,
+                    workspace: None,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        let Response::ClientPaneCreated { pane, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientSpawn {
+                    workspace: "1".to_string(),
+                    split_of: None,
+                    dir: None,
+                    bind: Some(sp1.id.to_string()),
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneCreated");
+        };
+        // Appending activates the new tab (`client_add_tab_appends_and_
+        // activates`), so `sp2` is the active tab `close_tab` will drop.
+        let _ = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientAddTab {
+                    workspace: "1".to_string(),
+                    pane,
+                    target: sp2.id.to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        app.focused = Some(pane);
+        if let Response::Snapshot { workspace, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::Subscribe {
+                    workspace: "1".to_string(),
+                },
+            )
+            .await
+            .unwrap()
+        {
+            app.workspace = workspace;
+        }
+
+        app.close_tab(&mut write_half, &mut reader).await.unwrap();
+
+        let Response::ClientPaneList { panes, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientList {
+                    workspace: Some("1".to_string()),
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneList");
+        };
+        assert!(
+            panes.iter().any(|p| p.id == pane),
+            "the leaf must survive closing one of its two tabs"
+        );
+
+        let Response::ServerPaneList(servers) = app
+            .request(&mut write_half, &mut reader, Request::ServerList)
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPaneList");
+        };
+        assert!(
+            !servers.iter().any(|s| s.id == sp2.id),
+            "the dropped tab's bound server-pane should have been killed"
+        );
+        assert!(
+            servers.iter().any(|s| s.id == sp1.id),
+            "the remaining tab's server-pane must survive"
+        );
+    }
+
     /// `cmd-shift-z` end to end: the picker it opens must already have
     /// the just-detached pane's own row selected, so reattaching to the
     /// same pane is a single Enter press rather than having to hunt for
