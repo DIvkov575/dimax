@@ -317,7 +317,20 @@ impl State {
             .ok_or_else(|| anyhow::anyhow!("unknown server-pane {target:?}"))
     }
 
-    pub fn server_kill(&mut self, target: &str) -> anyhow::Result<()> {
+    /// Kill `target` and unbind it everywhere it was bound. Returns every
+    /// workspace whose tree actually changed as a result -- the same
+    /// server-pane can be bound into more than one client-pane (even
+    /// across different workspaces: nothing stops two `ClientBind`/
+    /// `ClientAddTab` calls from pointing at the same target), so a kill
+    /// can ripple beyond whichever single workspace the caller happens
+    /// to be subscribed to. The caller (`daemon::mod`'s dispatch) must
+    /// broadcast a `LayoutDelta` for each returned id -- skipping that
+    /// leaves every *other* affected client-pane showing a dangling
+    /// reference to a pane that no longer exists in the pool: cycling
+    /// onto it renders nothing (there's no grid to fetch), and it can
+    /// never show up again in `server_list`/the attach menu, since both
+    /// only ever look at panes still in the pool.
+    pub fn server_kill(&mut self, target: &str) -> anyhow::Result<Vec<WorkspaceId>> {
         let id = self.resolve_server_pane(target)?;
         let mut pane = self
             .server_panes
@@ -329,15 +342,18 @@ impl State {
         // Design doc "Error handling": a killed server-pane leaves every
         // client-pane bound to it as an unbound placeholder — not closed,
         // not rebound.
-        for ws in self.workspaces.values_mut() {
-            if let Some(tree) = &mut ws.tree {
-                unbind_all(tree, id);
+        let mut affected = Vec::new();
+        for (&ws_id, ws) in self.workspaces.iter_mut() {
+            if let Some(tree) = &mut ws.tree
+                && unbind_all(tree, id)
+            {
+                affected.push(ws_id);
             }
         }
         // No point remembering a scroll position into a server-pane
         // that no longer exists.
         self.scroll_offsets.retain(|(_, sp), _| *sp != id);
-        Ok(())
+        Ok(affected)
     }
 
     pub fn server_rename(&mut self, target: &str, new_name: String) -> anyhow::Result<()> {
@@ -1195,7 +1211,12 @@ fn chord_number(target: &str) -> Option<u8> {
     }
 }
 
-fn unbind_all(tree: &mut SplitTree, server_pane: ServerPaneId) {
+/// Returns whether any occurrence was actually removed -- callers that
+/// span multiple workspaces (`server_kill`) need to know which ones
+/// actually changed, so they broadcast a `LayoutDelta` only to those
+/// (see that method's doc comment for why silently skipping the
+/// broadcast entirely is the bug this return value exists to prevent).
+fn unbind_all(tree: &mut SplitTree, server_pane: ServerPaneId) -> bool {
     match tree {
         SplitTree::Leaf(pane) => {
             // Background tabs bind the killed pane just as much as the
@@ -1208,15 +1229,18 @@ fn unbind_all(tree: &mut SplitTree, server_pane: ServerPaneId) {
                 .iter()
                 .filter(|&&id| id == server_pane)
                 .count();
+            let had_any = pane.tabs.contains(&server_pane);
             pane.tabs.retain(|&id| id != server_pane);
             pane.active_tab = pane.active_tab.saturating_sub(removed_before);
             if !pane.tabs.is_empty() && pane.active_tab >= pane.tabs.len() {
                 pane.active_tab = pane.tabs.len() - 1;
             }
+            had_any
         }
         SplitTree::Split { a, b, .. } => {
-            unbind_all(a, server_pane);
-            unbind_all(b, server_pane);
+            let a_changed = unbind_all(a, server_pane);
+            let b_changed = unbind_all(b, server_pane);
+            a_changed || b_changed
         }
     }
 }

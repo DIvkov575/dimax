@@ -539,7 +539,23 @@ async fn dispatch(
 
         Request::ServerKill { target } => {
             let mut state = state.lock().await;
-            ok_or_err(state.server_kill(&target), |()| Response::Ack)
+            match state.server_kill(&target) {
+                // `server_kill` can unbind a leaf in *any* workspace, not
+                // just whichever one the caller happens to be subscribed
+                // to (see its doc comment) -- every affected workspace
+                // needs its own `LayoutDelta`, or a client viewing one of
+                // the others keeps showing a dangling reference to a
+                // pane that no longer exists.
+                Ok(affected) => {
+                    for ws_id in affected {
+                        broadcast_layout(&state, registry, ws_id).await;
+                    }
+                    Response::Ack
+                }
+                Err(err) => Response::Error {
+                    message: err.to_string(),
+                },
+            }
         }
 
         Request::ServerRename { target, new_name } => {
@@ -1546,6 +1562,107 @@ mod tests {
                 }
                 other => panic!("expected Snapshot, got {other:?}"),
             }
+        }
+    }
+
+    /// The state-level unbind above is necessary but not sufficient: a
+    /// connection that was *already* subscribed to the other affected
+    /// workspace -- and never re-subscribes -- must also be told live,
+    /// via a pushed `LayoutDelta`, or its cached tree keeps showing a
+    /// dangling reference to a pane that no longer exists: cycling onto
+    /// that tab renders nothing (there's no grid to fetch), and the pane
+    /// can never show up again in `server_list`/the attach menu, since
+    /// both only ever look at panes still in the pool. Regression test
+    /// for exactly that gap: `ServerKill`'s dispatch used to call
+    /// `state.server_kill` and return `Ack` without broadcasting
+    /// anything at all, so only a workspace the *caller* happened to be
+    /// subscribed to (or a fresh `Subscribe`, as in the test above) ever
+    /// saw the change.
+    #[tokio::test]
+    async fn server_kill_broadcasts_layout_delta_to_every_affected_workspace() {
+        let guard = start_daemon().await;
+        let mut conn = TestConn::connect(&guard.0).await;
+
+        let server_pane = match conn
+            .request(Request::ServerSpawn {
+                name: None,
+                cmd: Some("cat".to_string()),
+                cwd: None,
+                workspace: None,
+            })
+            .await
+        {
+            Response::ServerPane(info) => info.id,
+            other => panic!("expected ServerPane, got {other:?}"),
+        };
+
+        // Bind the same server-pane into two different workspaces --
+        // e.g. viewing one session from two windows at once. Nothing
+        // stops this: `client_spawn`/`client_bind`/`client_add_tab`
+        // never check whether `target` is already bound elsewhere.
+        let _ = conn
+            .request(Request::ClientSpawn {
+                workspace: "1".to_string(),
+                split_of: None,
+                dir: None,
+                bind: Some(server_pane.to_string()),
+            })
+            .await;
+        let (ws2, pane2) = match conn
+            .request(Request::ClientSpawn {
+                workspace: "2".to_string(),
+                split_of: None,
+                dir: None,
+                bind: Some(server_pane.to_string()),
+            })
+            .await
+        {
+            Response::ClientPaneCreated { workspace, pane } => (workspace, pane),
+            other => panic!("expected ClientPaneCreated, got {other:?}"),
+        };
+
+        // A passive viewer of workspace 2 -- never the one issuing the
+        // kill below, and never re-subscribing afterward, so the only
+        // way it can learn its leaf just got unbound is a pushed event.
+        let mut viewer = TestConn::connect(&guard.0).await;
+        match viewer
+            .request(Request::Subscribe {
+                workspace: ws2.to_string(),
+            })
+            .await
+        {
+            Response::Snapshot { .. } => {}
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+
+        // `conn` never subscribed to ws2 at all -- matching a bare
+        // `dimax server kill` call with no workspace context of its own.
+        match conn
+            .request(Request::ServerKill {
+                target: server_pane.to_string(),
+            })
+            .await
+        {
+            Response::Ack => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+
+        let event = viewer
+            .read_event(Duration::from_secs(2))
+            .await
+            .expect("expected a LayoutDelta push for workspace 2 within 2s");
+        match event {
+            Event::LayoutDelta { workspace, tree } => {
+                assert_eq!(workspace, ws2);
+                let tree = tree.expect("workspace 2 should still have its pane");
+                let leaf = tree.find(pane2).expect("client-pane should still exist");
+                assert_eq!(
+                    leaf.active_bound(),
+                    None,
+                    "viewer must see the leaf unbound live, not just on a fresh Subscribe"
+                );
+            }
+            other => panic!("expected LayoutDelta, got {other:?}"),
         }
     }
 
