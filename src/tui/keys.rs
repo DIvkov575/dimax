@@ -232,6 +232,7 @@ pub fn action_name(action: Action) -> &'static str {
         Action::FocusRight => "focus-right",
         Action::FocusUp => "focus-up",
         Action::FocusDown => "focus-down",
+        Action::Quit => "quit",
         Action::SwitchWorkspace(_) | Action::JumpSession(_) | Action::PassThrough => "unsupported",
     }
 }
@@ -590,6 +591,17 @@ pub const BINDINGS: &[Binding] = &[
         action: Action::CycleTabBackward,
         description: "previous tab",
     },
+    Binding {
+        // Deliberately not `cmd+q` -- that's macOS/Kitty's own
+        // "quit the application" shortcut; overriding it here would
+        // silently repurpose a shortcut most users' muscle memory
+        // expects to close the whole terminal, not just dimax.
+        kitty: "cmd+shift+q",
+        portable: b"q",
+        tag: b"q",
+        action: Action::Quit,
+        description: "quit dimax",
+    },
 ];
 
 fn action_for_tag(tag: &[u8]) -> Option<Action> {
@@ -830,6 +842,24 @@ mod tests {
     #[test]
     fn cycle_tab_backward() {
         assert_eq!(parse(&chord_bytes(b'[')), Action::CycleTabBackward);
+    }
+
+    #[test]
+    fn quit_kitty_chord() {
+        assert_eq!(parse(&chord_bytes(b'q')), Action::Quit);
+    }
+
+    #[test]
+    fn quit_portable_binding() {
+        let mut parser = PortableParser::default();
+        assert_eq!(
+            parser.parse(b"\0", BindingMode::Portable),
+            ParsedInput::Pending
+        );
+        assert_eq!(
+            parser.parse(b"q", BindingMode::Portable),
+            ParsedInput::Action(Action::Quit)
+        );
     }
 
     #[test]

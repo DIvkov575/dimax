@@ -125,6 +125,7 @@ Press Ctrl-Space, release it, then press the listed key:
     h/j/k/l focus left/down/up/right
     t       add a tab
     ]/[     next/previous tab
+    q       quit dimax (return to the shell)
 
 Press Ctrl-Space twice to send a literal Ctrl-Space to the focused process.
 Session numbers use the same stable, name-sorted order shown by
@@ -149,7 +150,9 @@ Kitty integration
 -----------------
 
 Kitty mode keeps the Cmd bindings and adds Cmd+Alt+1..9 for jumping to
-existing sessions. Installation:
+existing sessions, plus Cmd+Shift+Q to quit dimax -- deliberately not
+Cmd+Q, which macOS/Kitty already use to quit the whole terminal.
+Installation:
 
 1. Generates `dimax.conf` in Kitty's config directory.
 2. Adds one exact `include dimax.conf` line to `kitty.conf`.
@@ -193,7 +196,12 @@ no separate uninstall command; remove the directory by hand if needed:
 Usage
 -----
 
-Run `dimax` or `dimax attach` to open the TUI. CLI session control includes:
+Run `dimax` or `dimax attach` to open the TUI. `Ctrl-Q` always exits it and
+returns to the shell, in every keybinding mode -- including before any mode
+has been chosen. `q` (portable) / `Cmd+Shift+Q` (kitty) do the same once a
+mode is configured; see "Portable bindings" and "Kitty integration" above.
+
+CLI session control includes:
 
     dimax server spawn <name>
     dimax server ls

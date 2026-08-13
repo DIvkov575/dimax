@@ -41,19 +41,19 @@
 //!   `crossterm::event::poll` in a blocking task bridged through a
 //!   channel, per this task's constraints (no `Cargo.toml` edits). Reading
 //!   raw bytes sidesteps that fallback entirely.
-//! - **Quit key: `Ctrl-Q` (byte `0x11`), not `Ctrl-C`.** The design doc's
-//!   keybind table has no quit binding at all — every other chord is a
-//!   Kitty-forwarded Cmd-sequence, and there was never a "how does the
-//!   user leave `dimax attach`" decision made. `Ctrl-C` was deliberately
-//!   *not* picked: it needs to `PassThrough` to whatever's running in the
-//!   focused pane (interrupting a stuck program is one of the most common
-//!   reasons to press it), and stealing it globally would make that
-//!   impossible. `Ctrl-Q` is rarely bound by interactive programs and (in
-//!   raw mode, with software flow control not in play) is just an inert
-//!   byte otherwise. This is a real product decision the design doc
-//!   didn't make — flagged here for it to be revisited/formalized
-//!   (e.g. promoted to a proper Kitty-forwarded chord) rather than staying
-//!   a hardcoded raw byte.
+//! - **Quit key: `Ctrl-Q` (byte `0x11`), not `Ctrl-C`.** `Ctrl-C` was
+//!   deliberately *not* picked: it needs to `PassThrough` to whatever's
+//!   running in the focused pane (interrupting a stuck program is one of
+//!   the most common reasons to press it), and stealing it globally
+//!   would make that impossible. `Ctrl-Q` is rarely bound by interactive
+//!   programs and (in raw mode, with software flow control not in play)
+//!   is just an inert byte otherwise -- checked directly on raw input
+//!   before any mode-specific parsing, so it works in every keybinding
+//!   mode, and even before one has been chosen. `Action::Quit` (`cmd-
+//!   shift-q`/`Ctrl-Space q`, see `keys::BINDINGS`) is the formalized,
+//!   discoverable counterpart once a mode is configured -- this raw byte
+//!   check remains alongside it as the always-available fallback, not a
+//!   stand-in for it.
 //! - **Focus movement (`FocusLeft/Right/Up/Down`) uses real screen
 //!   adjacency.** `nearest_leaf_in_direction` computes each leaf's
 //!   actual on-screen `Rect` via `render::leaf_rects` (the same data
@@ -209,6 +209,15 @@ pub enum Action {
     FocusRight,
     FocusUp,
     FocusDown,
+    /// Exit `dimax attach` entirely, returning to the shell -- reachable
+    /// through the normal chord machinery in both binding modes (see
+    /// `BINDINGS`' `cmd+shift+q`/`Ctrl-Space q` entry in `keys.rs`), so
+    /// it's discoverable via `dimax keys list`/`print` and aliasable
+    /// like every other action. The raw `Ctrl-Q` byte check in `run`'s
+    /// read loop (module doc "Quit key") is a separate, always-available
+    /// fallback that works even before a keybinding mode has been
+    /// chosen; this is not a replacement for it.
+    Quit,
     /// Not a dimax chord — forward these raw bytes to the focused
     /// client-pane's bound server-pane as keyboard input.
     PassThrough,
@@ -1915,13 +1924,17 @@ impl App {
     }
 
     /// Route one resolved `Action` to its effect.
+    /// Returns `true` when `action` was `Action::Quit` -- the caller's
+    /// read loop must break out and exit `dimax attach` in that case,
+    /// which this method (an ordinary `&mut self` action handler) has no
+    /// way to do on its own.
     async fn handle_action(
         &mut self,
         action: Action,
         raw: &[u8],
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         self.text_selection = None;
         match action {
             Action::SwitchWorkspace(n) => self.switch_workspace(n, write_half, reader).await?,
@@ -1940,6 +1953,7 @@ impl App {
             Action::FocusRight => self.move_focus(Direction::Right),
             Action::FocusUp => self.move_focus(Direction::Up),
             Action::FocusDown => self.move_focus(Direction::Down),
+            Action::Quit => return Ok(true),
             Action::PassThrough => {
                 if let Some(pane) = self.focused {
                     let req = Request::Input {
@@ -1950,7 +1964,7 @@ impl App {
                 }
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Bind the focused client-pane to the nth server-pane in the
@@ -2803,7 +2817,12 @@ pub async fn run() -> anyhow::Result<()> {
                     } else {
                         match key_parser.parse(leftover, binding_mode) {
                             keys::ParsedInput::Action(action) => {
-                                app.handle_action(action, &[], &mut write_half, &mut reader).await?;
+                                let should_quit = app
+                                    .handle_action(action, &[], &mut write_half, &mut reader)
+                                    .await?;
+                                if should_quit {
+                                    break;
+                                }
                             }
                             keys::ParsedInput::PassThrough(raw) => {
                                 app.handle_action(
@@ -3221,6 +3240,31 @@ mod tests {
             !is_quit(&[0x03]),
             "Ctrl-C must remain a pass-through byte, not the quit key"
         );
+    }
+
+    /// `Action::Quit` (reachable via `cmd-shift-q`/`Ctrl-Space q`, see
+    /// `keys::BINDINGS`) must signal the caller's read loop to break --
+    /// unlike every other action, `handle_action` has no way to do that
+    /// on its own, so it reports back via its return value instead.
+    #[tokio::test]
+    async fn handle_action_quit_signals_the_caller_to_break() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+        let should_quit = app
+            .handle_action(Action::Quit, &[], &mut write_half, &mut reader)
+            .await
+            .unwrap();
+        assert!(should_quit);
+    }
+
+    /// Every other action must leave the read loop running.
+    #[tokio::test]
+    async fn handle_action_non_quit_action_does_not_signal_a_break() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+        let should_quit = app
+            .handle_action(Action::PassThrough, b"x", &mut write_half, &mut reader)
+            .await
+            .unwrap();
+        assert!(!should_quit);
     }
 
     #[test]
