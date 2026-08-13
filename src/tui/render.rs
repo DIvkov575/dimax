@@ -527,10 +527,11 @@ pub(super) fn draw_attach_menu(
     preview: Option<&(ServerPaneId, String)>,
     pinned: &[String],
 ) {
-    // Wider than the previous 60% -- each row now packs four columns
-    // (name/process/id/status, see `attach_menu_line`) rather than the
-    // original two, and needs more horizontal room to avoid every field
-    // being clipped down to near-nothing on an ordinary terminal width.
+    // Wider than the previous 60% -- each row now packs five columns
+    // (name/tag/process/id/status, see `attach_menu_line`) rather than
+    // the original two, and needs more horizontal room to avoid every
+    // field being clipped down to near-nothing on an ordinary terminal
+    // width.
     let popup_area = centered_rect(85, 60, frame.area());
     frame.render_widget(Clear, popup_area);
 
@@ -708,16 +709,32 @@ fn spawn_new_in_group_line(
     Line::styled(text, style)
 }
 
-/// Column widths for the attach menu's server-pane rows: `name | process
-/// | id | status` (a `cwd` column existed here before rows were grouped
-/// under per-cwd header lines — see `draw_attach_menu` — at which point
-/// showing it a second time per row became redundant). `id` here is
-/// `ServerPaneInfo::short_id` (`"aa"`, `"ab"`, ...), a sequential
-/// two-plus-character label assigned once at spawn time — not the full
-/// UUID, which would dominate the row for no benefit; the attach menu
-/// is for picking a pane by eye, not by exact id.
+/// Column widths for the attach menu's server-pane rows: `name | tag |
+/// process | id | status` (a `cwd` column existed here before rows
+/// were grouped under per-cwd header lines — see `draw_attach_menu` —
+/// at which point showing it a second time per row became redundant).
+/// `id` here is `ServerPaneInfo::short_id` (`"aa"`, `"ab"`, ...), a
+/// sequential two-plus-character label assigned once at spawn time —
+/// not the full UUID, which would dominate the row for no benefit; the
+/// attach menu is for picking a pane by eye, not by exact id.
 const NAME_COL_WIDTH: usize = 28;
+/// Fits `[opencode]` (10 chars), the longest of `session_tag`'s
+/// possible outputs, with no truncation.
+const TAG_COL_WIDTH: usize = 10;
 const PROCESS_COL_WIDTH: usize = 10;
+
+/// `[claude]`/`[codex]`/etc. when `server`'s foreground process is a
+/// recognized AI-coding CLI tool (see `protocol::SessionKind`), blank
+/// otherwise -- a visible tag for the same classification `dimax
+/// server ls`'s `kind` column exposes on the CLI side, so a recognized
+/// session stands out at a glance in the row list too, not just in
+/// scripted output.
+fn session_tag(server: &ServerPaneInfo) -> String {
+    match server.foreground.as_ref().and_then(|f| f.session_kind) {
+        Some(kind) => format!("[{}]", kind.as_str()),
+        None => String::new(),
+    }
+}
 
 fn attach_menu_line(
     server: &ServerPaneInfo,
@@ -734,6 +751,7 @@ fn attach_menu_line(
         .foreground
         .as_ref()
         .map_or("-", |f| f.process_name.as_str());
+    let tag = session_tag(server);
     let marker = if selected { ">" } else { " " };
     // Marks the row this client-pane was bound to right before this
     // menu opened (see `AttachMenu.previously_bound`'s doc comment) --
@@ -744,11 +762,13 @@ fn attach_menu_line(
 
     if let Some(rename) = renaming {
         let text = format!(
-            "  {just_detached_marker}{marker} [{}] {:<process_w$} {} {}",
+            "  {just_detached_marker}{marker} [{}] {:<tag_w$} {:<process_w$} {} {}",
             rename.text,
+            tag,
             truncate_end(process, PROCESS_COL_WIDTH),
             server.short_id,
             status,
+            tag_w = TAG_COL_WIDTH,
             process_w = PROCESS_COL_WIDTH,
         );
         return Line::styled(text, Style::new().add_modifier(Modifier::REVERSED));
@@ -759,8 +779,9 @@ fn attach_menu_line(
         .clone()
         .unwrap_or_else(|| server.short_id.clone());
     let text = format!(
-        "  {just_detached_marker}{marker} {:<name_w$} {:<process_w$} {} {}{}",
+        "  {just_detached_marker}{marker} {:<name_w$} {:<tag_w$} {:<process_w$} {} {}{}",
         truncate_end(&name, NAME_COL_WIDTH),
+        tag,
         truncate_end(process, PROCESS_COL_WIDTH),
         server.short_id,
         status,
@@ -770,6 +791,7 @@ fn attach_menu_line(
             ""
         },
         name_w = NAME_COL_WIDTH,
+        tag_w = TAG_COL_WIDTH,
         process_w = PROCESS_COL_WIDTH,
     );
     let style = match (selected, delete_armed) {
@@ -1660,6 +1682,102 @@ mod tests {
     }
 
     #[test]
+    fn session_tag_is_bracketed_kind_or_blank() {
+        let mut server = ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: None,
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+            foreground: Some(ForegroundProcessInfo {
+                process_name: "claude".to_string(),
+                cwd: None,
+                session_kind: Some(crate::protocol::SessionKind::Claude),
+            }),
+            owner_workspace: None,
+            short_id: "aa".to_string(),
+        };
+        assert_eq!(session_tag(&server), "[claude]");
+
+        server.foreground = Some(ForegroundProcessInfo {
+            process_name: "bash".to_string(),
+            cwd: None,
+            session_kind: None,
+        });
+        assert_eq!(session_tag(&server), "");
+
+        server.foreground = None;
+        assert_eq!(session_tag(&server), "");
+    }
+
+    #[test]
+    fn draw_attach_menu_shows_recognized_session_tag() {
+        let server = ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: Some("my-session".to_string()),
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+            foreground: Some(ForegroundProcessInfo {
+                process_name: "claude".to_string(),
+                cwd: Some("/home/dev/project".to_string()),
+                session_kind: Some(crate::protocol::SessionKind::Claude),
+            }),
+            owner_workspace: None,
+            short_id: "aa".to_string(),
+        };
+        let servers = vec![("/home/dev/project".to_string(), server)];
+        let menu = super::super::AttachMenu {
+            servers,
+            selected: 0,
+            pending_delete: None,
+            rename: None,
+            previously_bound: None,
+            spawn_in_group: None,
+            adding_tab: false,
+        };
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), true, None, &[]))
+            .unwrap();
+        assert!(buffer_contains(&terminal, "my-session"));
+        assert!(buffer_contains(&terminal, "[claude]"));
+    }
+
+    #[test]
+    fn draw_attach_menu_shows_no_tag_for_an_unrecognized_process() {
+        let server = ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: Some("plain-shell".to_string()),
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+            foreground: Some(ForegroundProcessInfo {
+                process_name: "bash".to_string(),
+                cwd: Some("/home/dev".to_string()),
+                session_kind: None,
+            }),
+            owner_workspace: None,
+            short_id: "aa".to_string(),
+        };
+        let servers = vec![("/home/dev".to_string(), server)];
+        let menu = super::super::AttachMenu {
+            servers,
+            selected: 0,
+            pending_delete: None,
+            rename: None,
+            previously_bound: None,
+            spawn_in_group: None,
+            adding_tab: false,
+        };
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), true, None, &[]))
+            .unwrap();
+        assert!(buffer_contains(&terminal, "plain-shell"));
+        assert!(!buffer_contains(&terminal, "["));
+    }
+
+    #[test]
     fn draw_attach_menu_shows_key_hints() {
         let menu = super::super::AttachMenu {
             servers: vec![],
@@ -2276,7 +2394,10 @@ mod tests {
             spawn_in_group: None,
             adding_tab: false,
         };
-        let backend = TestBackend::new(100, 30);
+        // Wide enough that the row (now with the tag column) plus the
+        // delete-confirm suffix both fit within the popup's 85%-width
+        // interior without truncating.
+        let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), true, None, &[]))
