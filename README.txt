@@ -4,33 +4,56 @@ dimax
 A terminal multiplexer with persistent server sessions, detachable client
 panes, multiple workspaces, tabs, mouse resizing, and a scriptable CLI.
 
+Recommended terminal: Kitty
+---------------------------
+
+dimax runs in any Unix terminal, but Kitty is the recommended host. Kitty
+mode maps every dimax action to a real single-press Cmd chord (Cmd+D to
+split, Cmd+T to add a tab, Cmd+Shift+Z for the attach menu, and so on) --
+the same shortcuts a native macOS app would use. The portable prefix
+(Ctrl-Space, then a key) still works everywhere else and is fully
+supported; it's just noticeably less ergonomic for actions you take
+dozens of times a day.
+
 Install
 -------
 
 Requirements:
 
-- Rust toolchain with Cargo
-- A Unix-like operating system
-- Kitty only when using the optional Cmd-key integration
+- Rust toolchain with Cargo (any recent stable)
+- A Unix-like operating system (macOS or Linux)
+- Kitty, if you want the recommended Cmd-key integration
 
-Install the binary from a checkout:
+Recommended: install from the Git repository via Cargo, then wire up the
+recommended Kitty bindings:
+
+    cargo install --git https://github.com/DIvkov575/dimax --locked dimax
+    dimax keys install --mode both --reload
+
+`--mode both` enables both the Kitty Cmd-key chords and the portable
+Ctrl-Space prefix; `--reload` tells the running Kitty instance to pick
+up the new config immediately (requires Kitty remote control to be
+available, which is Kitty's default when launched from macOS). The
+`keys install` step amends `~/.config/kitty/kitty.conf` -- see
+"Keybinding modes" below for exactly what it writes and how to remove
+it. Pass `--yes`/`-y` to skip the confirmation prompt for a scripted
+install.
+
+Not using Kitty (or not sure yet)? Skip the second command -- `dimax
+attach`'s one-time first-run wizard (see "First-run wizard" below) will
+walk you through picking a mode interactively, defaulting to portable
+so it never touches a config file you didn't opt into.
+
+Other install methods
+---------------------
+
+From a local checkout (working on dimax itself, or wanting a specific
+revision):
 
     cargo install --path .
 
-No terminal configuration is modified by installing dimax. The first time
-you run `dimax attach` (or bare `dimax`), a one-time setup wizard asks you
-to pick a keybinding mode and offers to install the bundled Claude Code
-skill -- see "First-run wizard" and "Claude Code skill" below. Nothing
-about `install` itself touches your terminal config or `~/.claude`.
-
-Package managers
-----------------
-
-Install directly from the Git repository with Cargo:
-
-    cargo install --git https://github.com/DIvkov575/dimax --locked dimax
-
-After a crates.io release, the equivalent command is:
+After a crates.io release, the equivalent of the recommended `--git`
+install is:
 
     cargo install dimax --locked
 
@@ -39,11 +62,10 @@ For Homebrew, use the repository as a source-build tap:
     brew tap divkov575/dimax https://github.com/DIvkov575/dimax
     brew install --HEAD divkov575/dimax/dimax
 
-Package managers install only the executable. Select terminal integration
-explicitly afterward, so package installation never edits user configuration:
-
-    dimax keys install --mode portable
-    dimax keys install --mode both --reload
+All install methods above only place the binary; they never touch your
+terminal config or `~/.claude` on their own. Run `dimax keys install
+--mode <mode>` yourself afterward, or let the first-run wizard do it
+for you the first time you run `dimax attach`.
 
 First-run wizard
 ----------------
@@ -68,16 +90,20 @@ set later by hand -- see "Keybinding modes" and "Claude Code skill".
 Keybinding modes
 ----------------
 
-Choose one mode explicitly:
+Three modes; the recommendation is `both` on Kitty:
 
-    dimax keys install --mode portable
+    dimax keys install --mode both --reload   # recommended on Kitty
     dimax keys install --mode kitty
-    dimax keys install --mode both
-    dimax keys install --mode both --reload
+    dimax keys install --mode portable        # non-Kitty terminals
 
-`portable` uses a Ctrl-Space prefix and does not modify terminal files.
-`kitty` installs Cmd-key mappings in Kitty. `both` enables both input layers.
-The selection is stored in `~/.config/dimax/keybindings.json`, or under
+`both` enables both input layers -- Kitty's Cmd-key chords for the main
+day-to-day actions, and the portable Ctrl-Space prefix as a fallback
+that keeps working in any terminal (e.g. when you SSH into a remote
+box or open a non-Kitty pane). `kitty` alone drops the fallback and is
+mostly useful for a scripted install that will never see anything but
+Kitty. `portable` never modifies any terminal files and is the right
+choice when you can't (or don't want to) run Kitty. The selection is
+stored in `~/.config/dimax/keybindings.json`, or under
 `$XDG_CONFIG_HOME/dimax` when that variable is set.
 
 Installing `kitty` or `both` mode amends `~/.config/kitty/kitty.conf` (one
