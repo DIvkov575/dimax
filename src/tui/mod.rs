@@ -3052,6 +3052,23 @@ pub async fn run() -> anyhow::Result<()> {
                         write_half = new_write_half;
                         reader = new_reader;
                         app = App::bootstrap(&mut write_half, &mut reader, "1").await?;
+                        // `ratatui::Terminal::draw` only ever emits escapes
+                        // for cells that changed since its *own* cached
+                        // buffer, not since what's really on screen -- fine
+                        // normally, but the reconnect gap just replaced
+                        // `app` wholesale (fresh grids, re-derived pane
+                        // sizes) while the terminal's actual visible
+                        // content is still whatever the pre-reload frame
+                        // last drew. Any cell whose new content happens to
+                        // equal ratatui's stale cached cell (common with
+                        // idle shell prompts) never gets rewritten, leaving
+                        // real garbage on screen until something else
+                        // forces a full repaint -- a terminal resize does
+                        // this today, which is the "fiddling" a user
+                        // shouldn't have to do. `clear()` invalidates the
+                        // cache so the very next `draw()` rewrites every
+                        // cell unconditionally.
+                        terminal.clear()?;
                         continue;
                     }
                 }
