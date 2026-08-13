@@ -957,12 +957,18 @@ impl App {
     /// Route one raw byte chunk while the attach menu is open. A distinct,
     /// simpler modal grammar than the main keymap (same approach the
     /// removed picker used) rather than reusing `keys::parse`'s chords.
+    /// Returns `true` when the input resolved to `AttachMenuAction::Quit`
+    /// -- the caller's read loop must break in that case, same as
+    /// `handle_action`'s return value outside the menu (see its doc
+    /// comment). Every other path through this function -- renaming,
+    /// editing a spawn-in-group field, an armed delete, or any other
+    /// browse-mode action -- returns `false`.
     async fn handle_attach_menu_input(
         &mut self,
         bytes: &[u8],
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let is_renaming = self
             .attach_menu
             .as_ref()
@@ -983,7 +989,7 @@ impl App {
                     }
                 }
             }
-            return Ok(());
+            return Ok(false);
         }
 
         let is_spawning_in_group = self
@@ -1018,7 +1024,7 @@ impl App {
                     }
                 }
             }
-            return Ok(());
+            return Ok(false);
         }
 
         let has_pending_delete = self
@@ -1026,6 +1032,7 @@ impl App {
             .as_ref()
             .is_some_and(|m| m.pending_delete.is_some());
         if has_pending_delete {
+            let mut should_quit = false;
             match bytes {
                 b"x" | b"\r" | b"\n" => self.confirm_delete(write_half, reader).await?,
                 _ => {
@@ -1036,15 +1043,16 @@ impl App {
                     // both cancels the pending delete *and* moves the
                     // selection down, in one keypress. Fall through to
                     // normal dispatch for this same byte.
-                    self.dispatch_attach_menu_action(
-                        parse_attach_menu_input(bytes),
-                        write_half,
-                        reader,
-                    )
-                    .await?;
+                    should_quit = self
+                        .dispatch_attach_menu_action(
+                            parse_attach_menu_input(bytes),
+                            write_half,
+                            reader,
+                        )
+                        .await?;
                 }
             }
-            return Ok(());
+            return Ok(should_quit);
         }
 
         // A group's own "+ spawn new in <dir>" row gets its own
@@ -1082,7 +1090,7 @@ impl App {
                     }
                 }
             }
-            return Ok(());
+            return Ok(false);
         }
 
         self.dispatch_attach_menu_action(parse_attach_menu_input(bytes), write_half, reader)
@@ -1099,7 +1107,7 @@ impl App {
         action: AttachMenuAction,
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         match action {
             AttachMenuAction::Up => self.move_attach_menu_selection(false),
             AttachMenuAction::Down => self.move_attach_menu_selection(true),
@@ -1121,9 +1129,10 @@ impl App {
             AttachMenuAction::DetachAll => {
                 self.detach_all_and_close_menu(write_half, reader).await?
             }
+            AttachMenuAction::Quit => return Ok(true),
             AttachMenuAction::Ignore => {}
         }
-        Ok(())
+        Ok(false)
     }
 
     /// The row `menu.selected` currently names, per
@@ -2420,6 +2429,16 @@ enum AttachMenuAction {
     /// menu -- distinct from `Cancel` (`Esc`), which restores whatever
     /// was bound before the menu opened rather than clearing it.
     DetachAll,
+    /// `q` on any row: exit `dimax attach` entirely, same as
+    /// `Action::Quit` outside the menu -- the outer `cmd-shift-q`/
+    /// `Ctrl-Space q` chord can't reach the app while the menu is open
+    /// (every byte routes through here instead), so browsing the
+    /// server-pane selector needs its own quit binding rather than
+    /// forcing `Esc` first. Only reachable from browse-mode dispatch
+    /// (`parse_attach_menu_input`), never while renaming or editing a
+    /// spawn-in-group field -- `q` types literally there instead, same
+    /// as every other browse-mode letter.
+    Quit,
     Ignore,
 }
 
@@ -2447,6 +2466,7 @@ fn parse_attach_menu_input(bytes: &[u8]) -> AttachMenuAction {
         b"a" => AttachMenuAction::ToggleShowAllWorkspaces,
         b"g" => AttachMenuAction::ToggleGrouping,
         b"d" => AttachMenuAction::DetachAll,
+        b"q" => AttachMenuAction::Quit,
         _ => AttachMenuAction::Ignore,
     }
 }
@@ -2808,7 +2828,12 @@ pub async fn run() -> anyhow::Result<()> {
                 }
                 if !leftover.is_empty() {
                     if app.attach_menu.is_some() {
-                        app.handle_attach_menu_input(leftover, &mut write_half, &mut reader).await?;
+                        let should_quit = app
+                            .handle_attach_menu_input(leftover, &mut write_half, &mut reader)
+                            .await?;
+                        if should_quit {
+                            break;
+                        }
                         // Refresh right away rather than waiting for
                         // `preview_tick` -- otherwise opening the menu
                         // or moving the selection shows a blank/stale
@@ -3193,7 +3218,7 @@ mod tests {
 
     #[test]
     fn attach_menu_input_unrecognized_bytes_are_ignored() {
-        assert_eq!(parse_attach_menu_input(b"q"), AttachMenuAction::Ignore);
+        assert_eq!(parse_attach_menu_input(b"z"), AttachMenuAction::Ignore);
         assert_eq!(parse_attach_menu_input(b""), AttachMenuAction::Ignore);
     }
 
@@ -3234,6 +3259,11 @@ mod tests {
     }
 
     #[test]
+    fn parse_attach_menu_input_q_is_quit() {
+        assert_eq!(parse_attach_menu_input(b"q"), AttachMenuAction::Quit);
+    }
+
+    #[test]
     fn quit_byte_is_ctrl_q_not_ctrl_c() {
         assert!(is_quit(&[0x11]));
         assert!(
@@ -3262,6 +3292,31 @@ mod tests {
         let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
         let should_quit = app
             .handle_action(Action::PassThrough, b"x", &mut write_half, &mut reader)
+            .await
+            .unwrap();
+        assert!(!should_quit);
+    }
+
+    /// `q` while browsing the server-pane selector must quit too -- the
+    /// outer `cmd-shift-q`/`Ctrl-Space q` chord can't reach `handle_action`
+    /// while the menu is open (every byte routes through
+    /// `dispatch_attach_menu_action` instead), so it needs its own signal
+    /// back to the caller's read loop, mirroring `handle_action`'s.
+    #[tokio::test]
+    async fn dispatch_attach_menu_action_quit_signals_the_caller_to_break() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+        let should_quit = app
+            .dispatch_attach_menu_action(AttachMenuAction::Quit, &mut write_half, &mut reader)
+            .await
+            .unwrap();
+        assert!(should_quit);
+    }
+
+    #[tokio::test]
+    async fn dispatch_attach_menu_action_non_quit_action_does_not_signal_a_break() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+        let should_quit = app
+            .dispatch_attach_menu_action(AttachMenuAction::Ignore, &mut write_half, &mut reader)
             .await
             .unwrap();
         assert!(!should_quit);
