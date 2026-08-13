@@ -85,6 +85,12 @@ const PREFIX: &[u8] = b"\x1b_D";
 const TERMINATOR: &[u8] = b"\x1b\\";
 /// Portable prefix emitted by Ctrl-Space in conventional terminal modes.
 pub const PORTABLE_PREFIX: u8 = 0;
+/// Tmux-mode prefix, matching tmux's own out-of-the-box default of
+/// `Ctrl-B` (byte `0x02`) -- chosen so a user with tmux muscle memory
+/// gets a working setup by picking `--mode tmux` without also having
+/// to relearn a different prefix. Doesn't collide with `PORTABLE_PREFIX`
+/// (`0x00`) or `is_quit`'s `Ctrl-Q` byte (`0x11`).
+pub const TMUX_PREFIX: u8 = 0x02;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -92,6 +98,12 @@ pub enum BindingMode {
     Portable,
     Kitty,
     Both,
+    /// tmux-style prefix chords: press `Ctrl-B`, release, then the
+    /// mapped key (`%` to split side-by-side, `"` to split stacked,
+    /// `c` for a new tab, `d` to quit, `s` for the attach menu, etc.).
+    /// Standalone -- doesn't stack with `Portable` or `Kitty`, unlike
+    /// `Both`. See `TMUX_PREFIX` and the `tmux` column in `BINDINGS`.
+    Tmux,
 }
 
 impl Default for BindingMode {
@@ -107,6 +119,10 @@ impl BindingMode {
 
     pub fn kitty_enabled(self) -> bool {
         matches!(self, Self::Kitty | Self::Both)
+    }
+
+    pub fn tmux_enabled(self) -> bool {
+        matches!(self, Self::Tmux)
     }
 }
 
@@ -349,6 +365,23 @@ pub fn render_portable_bindings() -> String {
     out
 }
 
+pub fn render_tmux_bindings() -> String {
+    let mut out = String::from("Tmux prefix: Ctrl-B\n\n");
+    for binding in BINDINGS {
+        if binding.tmux.is_empty() {
+            continue;
+        }
+        let sequence = String::from_utf8_lossy(binding.tmux);
+        out.push_str(&format!(
+            "Ctrl-B, {sequence:<3}  {:<18}  {}\n",
+            action_name(binding.action),
+            binding.description
+        ));
+    }
+    out.push_str("Ctrl-B, Ctrl-B  send a literal Ctrl-B\n");
+    out
+}
+
 pub fn render_custom_bindings() -> String {
     let config = load_config();
     let mut out = String::new();
@@ -375,6 +408,13 @@ pub const SHIFT_ENTER_CHORD: &[u8] = b"\x1b_Ds\x1b\\";
 pub struct Binding {
     pub kitty: &'static str,
     pub portable: &'static [u8],
+    /// Bytes to expect after `TMUX_PREFIX` for this action, or empty
+    /// for "no tmux binding at all" (e.g. `JumpSession` -- tmux has no
+    /// per-session numeric jump concept). Uses a raw byte slice
+    /// rather than `Option<&'static [u8]>` so the parser can lookup
+    /// against the shared `BINDINGS` slice with the same
+    /// `starts_with`/`==` primitives it uses for `portable`.
+    pub tmux: &'static [u8],
     pub tag: &'static [u8],
     pub action: Action,
     pub description: &'static str,
@@ -384,6 +424,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+1",
         portable: b"1",
+        tmux: b"1",
         tag: b"1",
         action: Action::SwitchWorkspace(1),
         description: "switch to workspace 1",
@@ -391,6 +432,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+2",
         portable: b"2",
+        tmux: b"2",
         tag: b"2",
         action: Action::SwitchWorkspace(2),
         description: "switch to workspace 2",
@@ -398,6 +440,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+3",
         portable: b"3",
+        tmux: b"3",
         tag: b"3",
         action: Action::SwitchWorkspace(3),
         description: "switch to workspace 3",
@@ -405,6 +448,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+4",
         portable: b"4",
+        tmux: b"4",
         tag: b"4",
         action: Action::SwitchWorkspace(4),
         description: "switch to workspace 4",
@@ -412,6 +456,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+5",
         portable: b"5",
+        tmux: b"5",
         tag: b"5",
         action: Action::SwitchWorkspace(5),
         description: "switch to workspace 5",
@@ -419,6 +464,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+6",
         portable: b"6",
+        tmux: b"6",
         tag: b"6",
         action: Action::SwitchWorkspace(6),
         description: "switch to workspace 6",
@@ -426,6 +472,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+7",
         portable: b"7",
+        tmux: b"7",
         tag: b"7",
         action: Action::SwitchWorkspace(7),
         description: "switch to workspace 7",
@@ -433,6 +480,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+8",
         portable: b"8",
+        tmux: b"8",
         tag: b"8",
         action: Action::SwitchWorkspace(8),
         description: "switch to workspace 8",
@@ -440,6 +488,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+9",
         portable: b"9",
+        tmux: b"9",
         tag: b"9",
         action: Action::SwitchWorkspace(9),
         description: "switch to workspace 9",
@@ -447,6 +496,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+alt+1",
         portable: b"s1",
+        tmux: b"",
         tag: b"s1",
         action: Action::JumpSession(1),
         description: "bind session 1",
@@ -454,6 +504,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+alt+2",
         portable: b"s2",
+        tmux: b"",
         tag: b"s2",
         action: Action::JumpSession(2),
         description: "bind session 2",
@@ -461,6 +512,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+alt+3",
         portable: b"s3",
+        tmux: b"",
         tag: b"s3",
         action: Action::JumpSession(3),
         description: "bind session 3",
@@ -468,6 +520,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+alt+4",
         portable: b"s4",
+        tmux: b"",
         tag: b"s4",
         action: Action::JumpSession(4),
         description: "bind session 4",
@@ -475,6 +528,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+alt+5",
         portable: b"s5",
+        tmux: b"",
         tag: b"s5",
         action: Action::JumpSession(5),
         description: "bind session 5",
@@ -482,6 +536,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+alt+6",
         portable: b"s6",
+        tmux: b"",
         tag: b"s6",
         action: Action::JumpSession(6),
         description: "bind session 6",
@@ -489,6 +544,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+alt+7",
         portable: b"s7",
+        tmux: b"",
         tag: b"s7",
         action: Action::JumpSession(7),
         description: "bind session 7",
@@ -496,6 +552,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+alt+8",
         portable: b"s8",
+        tmux: b"",
         tag: b"s8",
         action: Action::JumpSession(8),
         description: "bind session 8",
@@ -503,6 +560,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+alt+9",
         portable: b"s9",
+        tmux: b"",
         tag: b"s9",
         action: Action::JumpSession(9),
         description: "bind session 9",
@@ -510,6 +568,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+d",
         portable: b"d",
+        tmux: b"%",
         tag: b"d",
         action: Action::SplitVertical,
         description: "split vertically",
@@ -517,6 +576,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+shift+d",
         portable: b"D",
+        tmux: b"\"",
         tag: b"D",
         action: Action::SplitHorizontal,
         description: "split horizontally",
@@ -524,6 +584,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+w",
         portable: b"w",
+        tmux: b"x",
         tag: b"w",
         action: Action::CloseFocusedPane,
         description: "close focused tab",
@@ -531,6 +592,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+shift+w",
         portable: b"W",
+        tmux: b"&",
         tag: b"W",
         action: Action::KillFocusedServerPane,
         description: "kill focused session",
@@ -538,6 +600,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+shift+z",
         portable: b"Z",
+        tmux: b"s",
         tag: b"Z",
         action: Action::DetachAndAttach,
         description: "detach and choose a session",
@@ -545,6 +608,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+h",
         portable: b"h",
+        tmux: b"h",
         tag: b"h",
         action: Action::FocusLeft,
         description: "focus left",
@@ -552,6 +616,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+j",
         portable: b"j",
+        tmux: b"j",
         tag: b"j",
         action: Action::FocusDown,
         description: "focus down",
@@ -559,6 +624,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+k",
         portable: b"k",
+        tmux: b"k",
         tag: b"k",
         action: Action::FocusUp,
         description: "focus up",
@@ -566,6 +632,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+l",
         portable: b"l",
+        tmux: b"l",
         tag: b"l",
         action: Action::FocusRight,
         description: "focus right",
@@ -573,6 +640,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+t",
         portable: b"t",
+        tmux: b"c",
         tag: b"t",
         action: Action::AddTab,
         description: "add a tab",
@@ -580,6 +648,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+]",
         portable: b"]",
+        tmux: b"n",
         tag: b"]",
         action: Action::CycleTabForward,
         description: "next tab",
@@ -587,6 +656,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         kitty: "cmd+[",
         portable: b"[",
+        tmux: b"p",
         tag: b"[",
         action: Action::CycleTabBackward,
         description: "previous tab",
@@ -598,6 +668,7 @@ pub const BINDINGS: &[Binding] = &[
         // expects to close the whole terminal, not just dimax.
         kitty: "cmd+shift+q",
         portable: b"q",
+        tmux: b"d",
         tag: b"q",
         action: Action::Quit,
         description: "quit dimax",
@@ -668,44 +739,65 @@ impl PortableParser {
         if mode.kitty_enabled() && kitty_action != Action::PassThrough {
             return ParsedInput::Action(kitty_action);
         }
-        if !mode.portable_enabled() {
+        // Tmux and Portable use the same prefix-then-key state machine
+        // but different prefix bytes and different lookup tables; they
+        // are mutually exclusive (Tmux is standalone -- see
+        // `BindingMode::Tmux`'s doc comment), so exactly one is active
+        // at a time here.
+        let (prefix, tmux) = if mode.tmux_enabled() {
+            (TMUX_PREFIX, true)
+        } else if mode.portable_enabled() {
+            (PORTABLE_PREFIX, false)
+        } else {
             return ParsedInput::PassThrough(bytes.to_vec());
-        }
+        };
 
         if self.pending.is_none() {
-            let Some(rest) = bytes.strip_prefix(&[PORTABLE_PREFIX]) else {
+            let Some(rest) = bytes.strip_prefix(&[prefix]) else {
                 return ParsedInput::PassThrough(bytes.to_vec());
             };
             if rest.is_empty() {
                 self.pending = Some(Vec::new());
                 return ParsedInput::Pending;
             }
-            return self.resolve_after_prefix(rest);
+            return self.resolve_after_prefix(rest, tmux);
         }
 
         let mut sequence = self.pending.take().expect("pending checked above");
-        if sequence.is_empty() && bytes == [PORTABLE_PREFIX] {
-            return ParsedInput::PassThrough(vec![PORTABLE_PREFIX]);
+        // Prefix pressed twice (portable: Ctrl-Space Ctrl-Space, tmux:
+        // Ctrl-B Ctrl-B) sends a literal prefix byte to the focused
+        // pane -- matches tmux/screen convention for escaping the
+        // prefix.
+        if sequence.is_empty() && bytes == [prefix] {
+            return ParsedInput::PassThrough(vec![prefix]);
         }
         sequence.extend_from_slice(bytes);
-        self.resolve_sequence(sequence, bytes)
+        self.resolve_sequence(sequence, bytes, tmux)
     }
 
-    fn resolve_after_prefix(&mut self, bytes: &[u8]) -> ParsedInput {
-        self.resolve_sequence(bytes.to_vec(), bytes)
+    fn resolve_after_prefix(&mut self, bytes: &[u8], tmux: bool) -> ParsedInput {
+        self.resolve_sequence(bytes.to_vec(), bytes, tmux)
     }
 
-    fn resolve_sequence(&mut self, sequence: Vec<u8>, raw: &[u8]) -> ParsedInput {
-        self.action_for_portable(&sequence)
-            .map(ParsedInput::Action)
-            .unwrap_or_else(|| {
-                if self.has_portable_prefix(&sequence) {
-                    self.pending = Some(sequence);
-                    ParsedInput::Pending
-                } else {
-                    ParsedInput::PassThrough(raw.to_vec())
-                }
-            })
+    fn resolve_sequence(&mut self, sequence: Vec<u8>, raw: &[u8], tmux: bool) -> ParsedInput {
+        let action = if tmux {
+            action_for_tmux(&sequence)
+        } else {
+            self.action_for_portable(&sequence)
+        };
+        action.map(ParsedInput::Action).unwrap_or_else(|| {
+            let has_prefix = if tmux {
+                has_tmux_prefix(&sequence)
+            } else {
+                self.has_portable_prefix(&sequence)
+            };
+            if has_prefix {
+                self.pending = Some(sequence);
+                ParsedInput::Pending
+            } else {
+                ParsedInput::PassThrough(raw.to_vec())
+            }
+        })
     }
 
     fn action_for_portable(&self, sequence: &[u8]) -> Option<Action> {
@@ -731,6 +823,30 @@ fn action_for_portable(sequence: &[u8]) -> Option<Action> {
         .iter()
         .find(|binding| binding.portable == sequence)
         .map(|binding| binding.action)
+}
+
+/// Look up an `Action` in the `tmux` column of `BINDINGS`. Empty
+/// `sequence` never matches -- an incoming empty sequence means "prefix
+/// arrived alone and we're waiting for the next byte", not "match an
+/// action with no key", which no real binding has anyway. The
+/// `binding.tmux.is_empty()` guard likewise skips actions like
+/// `JumpSession(1..9)` that deliberately have no tmux binding at all
+/// (tmux has no per-session numeric-jump concept -- see `BINDINGS`).
+fn action_for_tmux(sequence: &[u8]) -> Option<Action> {
+    if sequence.is_empty() {
+        return None;
+    }
+    BINDINGS
+        .iter()
+        .find(|binding| !binding.tmux.is_empty() && binding.tmux == sequence)
+        .map(|binding| binding.action)
+}
+
+fn has_tmux_prefix(sequence: &[u8]) -> bool {
+    !sequence.is_empty()
+        && BINDINGS
+            .iter()
+            .any(|binding| !binding.tmux.is_empty() && binding.tmux.starts_with(sequence))
 }
 
 #[cfg(test)]
@@ -859,6 +975,112 @@ mod tests {
         assert_eq!(
             parser.parse(b"q", BindingMode::Portable),
             ParsedInput::Action(Action::Quit)
+        );
+    }
+
+    /// End-to-end: pressing `Ctrl-B` then `%` in tmux mode resolves to
+    /// `SplitVertical` (tmux `%` = side-by-side split, matching dimax's
+    /// `SplitDir::Vertical` = vertical divider between panes).
+    #[test]
+    fn tmux_split_vertical() {
+        let mut parser = PortableParser::default();
+        assert_eq!(
+            parser.parse(&[TMUX_PREFIX], BindingMode::Tmux),
+            ParsedInput::Pending
+        );
+        assert_eq!(
+            parser.parse(b"%", BindingMode::Tmux),
+            ParsedInput::Action(Action::SplitVertical)
+        );
+    }
+
+    /// Prefix + following key delivered as one read (a fast press) is
+    /// resolved in a single call, matching how `portable_workspace_
+    /// binding_can_arrive_together_or_split` covers portable mode.
+    #[test]
+    fn tmux_prefix_and_key_can_arrive_in_one_read() {
+        let mut parser = PortableParser::default();
+        assert_eq!(
+            parser.parse(&[TMUX_PREFIX, b'c'], BindingMode::Tmux),
+            ParsedInput::Action(Action::AddTab)
+        );
+    }
+
+    /// `d` is tmux's `detach-client`; dimax maps it to `Action::Quit`
+    /// so a tmux user's muscle memory returns them to the shell.
+    #[test]
+    fn tmux_d_is_quit_not_split() {
+        let mut parser = PortableParser::default();
+        parser.parse(&[TMUX_PREFIX], BindingMode::Tmux);
+        assert_eq!(
+            parser.parse(b"d", BindingMode::Tmux),
+            ParsedInput::Action(Action::Quit)
+        );
+    }
+
+    /// `s` is tmux's `choose-tree` (session picker); dimax opens its
+    /// attach menu instead.
+    #[test]
+    fn tmux_s_opens_attach_menu() {
+        let mut parser = PortableParser::default();
+        parser.parse(&[TMUX_PREFIX], BindingMode::Tmux);
+        assert_eq!(
+            parser.parse(b"s", BindingMode::Tmux),
+            ParsedInput::Action(Action::DetachAndAttach)
+        );
+    }
+
+    /// Pressing the prefix twice sends a literal prefix byte to the
+    /// focused pane -- the tmux/screen escape convention. Mirrors
+    /// `Ctrl-Space Ctrl-Space` in portable mode.
+    #[test]
+    fn tmux_double_prefix_sends_literal_ctrl_b() {
+        let mut parser = PortableParser::default();
+        parser.parse(&[TMUX_PREFIX], BindingMode::Tmux);
+        assert_eq!(
+            parser.parse(&[TMUX_PREFIX], BindingMode::Tmux),
+            ParsedInput::PassThrough(vec![TMUX_PREFIX])
+        );
+    }
+
+    /// A key that has no tmux binding after the prefix (e.g. `z`,
+    /// which is unmapped) falls through as `PassThrough`, not as a
+    /// spurious action. The `is_empty` guard in `action_for_tmux`
+    /// makes this safe against actions with empty `tmux` columns (the
+    /// `JumpSession(1..9)` entries).
+    #[test]
+    fn tmux_unmapped_key_passes_through() {
+        let mut parser = PortableParser::default();
+        parser.parse(&[TMUX_PREFIX], BindingMode::Tmux);
+        assert_eq!(
+            parser.parse(b"z", BindingMode::Tmux),
+            ParsedInput::PassThrough(b"z".to_vec())
+        );
+    }
+
+    /// Ctrl-B outside tmux mode is a normal keystroke, not a chord --
+    /// specifically, in Portable mode Ctrl-B is just byte `0x02` with
+    /// no meaning, so it must pass through to the focused pane.
+    #[test]
+    fn tmux_prefix_in_portable_mode_passes_through() {
+        let mut parser = PortableParser::default();
+        assert_eq!(
+            parser.parse(&[TMUX_PREFIX], BindingMode::Portable),
+            ParsedInput::PassThrough(vec![TMUX_PREFIX])
+        );
+    }
+
+    /// Kitty chords are only recognized in modes with `kitty_enabled()`;
+    /// Tmux mode is standalone and must ignore an incoming Kitty APC
+    /// sequence, letting it pass through instead of stealing the
+    /// action.
+    #[test]
+    fn tmux_mode_does_not_intercept_kitty_chords() {
+        let mut parser = PortableParser::default();
+        let kitty = chord_bytes(b'd');
+        assert_eq!(
+            parser.parse(&kitty, BindingMode::Tmux),
+            ParsedInput::PassThrough(kitty.to_vec())
         );
     }
 

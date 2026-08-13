@@ -415,11 +415,11 @@ fn run_keys(cmd: KeysCmd) -> anyhow::Result<()> {
 
     match cmd {
         KeysCmd::Install { mode, reload, yes } => {
-            if reload && mode == BindingMode::Portable {
+            if reload && !mode.kitty_enabled() {
                 anyhow::bail!("--reload requires --mode kitty or --mode both");
             }
             let kitty_path = match mode {
-                BindingMode::Portable => None,
+                BindingMode::Portable | BindingMode::Tmux => None,
                 BindingMode::Kitty | BindingMode::Both => {
                     if confirm_kitty_amend(yes)? {
                         Some(crate::tui::kitty_setup::install()?)
@@ -452,21 +452,29 @@ fn run_keys(cmd: KeysCmd) -> anyhow::Result<()> {
             Ok(())
         }
         KeysCmd::Print { mode } => {
-            if matches!(mode, BindingMode::Portable | BindingMode::Both) {
+            if mode.portable_enabled() {
                 print!("{}", crate::tui::keys::render_portable_bindings());
             }
-            if matches!(mode, BindingMode::Kitty | BindingMode::Both) {
+            if mode.kitty_enabled() {
                 if mode == BindingMode::Both {
                     println!();
                 }
                 print!("{}", crate::tui::kitty_setup::render_effective_dimax_conf());
             }
+            if mode.tmux_enabled() {
+                print!("{}", crate::tui::keys::render_tmux_bindings());
+            }
             Ok(())
         }
         KeysCmd::List => {
-            println!("active mode: {:?}", crate::tui::keys::load_mode());
-            print!("{}", crate::tui::keys::render_portable_bindings());
-            print!("{}", crate::tui::keys::render_custom_bindings());
+            let mode = crate::tui::keys::load_mode();
+            println!("active mode: {mode:?}");
+            if mode.tmux_enabled() {
+                print!("{}", crate::tui::keys::render_tmux_bindings());
+            } else {
+                print!("{}", crate::tui::keys::render_portable_bindings());
+                print!("{}", crate::tui::keys::render_custom_bindings());
+            }
             Ok(())
         }
         KeysCmd::Bind {
