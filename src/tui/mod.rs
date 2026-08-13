@@ -946,15 +946,25 @@ impl App {
     /// bound server-pane -- unlike `dimax client close`/`ClientCloseTab`
     /// alone (which deliberately leaves the server-pane running for
     /// scripted callers), this chord is meant to fully clean up what it
-    /// was looking at, the same way `cmd-shift-w` kills on demand. A
-    /// no-op kill if the tab was already unbound. When that was the
-    /// pane's only tab the daemon closes the whole leaf instead (see
-    /// `state::client_close_tab`), so this degrades to the old
-    /// close-the-pane behavior on a single-tab leaf rather than needing
-    /// a separate chord. In that leaf-closing case focus reassignment
-    /// happens via `reconcile_focus` once the resulting `LayoutDelta`
-    /// lands, rather than being computed here from a tree this function
-    /// doesn't have an up-to-date copy of yet.
+    /// was looking at, the same way `cmd-shift-w` kills on demand. When
+    /// that was the pane's only tab the daemon closes the whole leaf
+    /// instead (see `state::client_close_tab`), so this degrades to the
+    /// old close-the-pane behavior on a single-tab leaf rather than
+    /// needing a separate chord -- in that leaf-closing case focus
+    /// reassignment happens via `reconcile_focus` once the resulting
+    /// `LayoutDelta` lands, rather than being computed here from a tree
+    /// this function doesn't have an up-to-date copy of yet.
+    ///
+    /// A pane that's *already* unbound (no tabs at all -- e.g. right
+    /// after detaching via `cmd-shift-z` and backing out of the picker)
+    /// is a complete no-op: there is no tab to drop and nothing to kill,
+    /// so unlike the daemon's own `client_close_tab` (which treats an
+    /// empty leaf the same as "just removed its last tab" and closes it
+    /// -- a reasonable default for a scripted `dimax client close-tab`
+    /// caller), cmd-w must not fall through to removing the pane from
+    /// the layout. Losing a grid slot you never asked to close is
+    /// exactly the surprise this chord already avoids for the
+    /// multi-tab case.
     async fn close_tab(
         &mut self,
         write_half: &mut OwnedWriteHalf,
@@ -967,27 +977,30 @@ impl App {
         // `ClientCloseTab` lands, the tab (and, if it was the last one,
         // the leaf itself) is already gone, so there's no later point
         // at which this could still be read back (same reasoning as
-        // `AttachMenu.previously_bound`'s doc comment).
-        let bound = self
+        // `AttachMenu.previously_bound`'s doc comment). `None` here means
+        // the leaf has no tabs at all, not just that the active one
+        // happens to be unbound (every leaf with a non-empty `tabs` has
+        // a valid `active_tab` index, so `active_bound` only returns
+        // `None` when `tabs` is empty) -- see this method's doc comment
+        // for why that case returns early instead of proceeding.
+        let Some(bound) = self
             .workspace
             .tree
             .as_ref()
             .and_then(|t| t.find(pane))
-            .and_then(|p| p.active_bound());
+            .and_then(|p| p.active_bound())
+        else {
+            return Ok(());
+        };
         let req = Request::ClientCloseTab {
             workspace: self.workspace.id.to_string(),
             pane,
         };
         let _ = self.request(write_half, reader, req).await?;
-        // `cmd-w` closes the tab AND kills its server-pane -- an unbound
-        // tab (or an already-unbound placeholder) has nothing to kill,
-        // so this only fires when there was a real binding.
-        if let Some(server_pane) = bound {
-            let req = Request::ServerKill {
-                target: server_pane.to_string(),
-            };
-            let _ = self.request(write_half, reader, req).await?;
-        }
+        let req = Request::ServerKill {
+            target: bound.to_string(),
+        };
+        let _ = self.request(write_half, reader, req).await?;
         Ok(())
     }
 
@@ -4931,10 +4944,13 @@ mod tests {
         );
     }
 
-    /// `cmd-w` on an already-unbound tab must not error or try to kill
-    /// anything -- there's nothing bound to kill.
+    /// `cmd-w` on an already-unbound pane (no tabs at all) must be a
+    /// complete no-op: nothing to drop, nothing to kill, and -- unlike
+    /// the daemon's own `client_close_tab` semantics for a scripted
+    /// `dimax client close-tab` caller -- the empty pane must stay in
+    /// the layout rather than being removed from the grid.
     #[tokio::test]
-    async fn close_tab_on_an_unbound_pane_is_a_plain_close() {
+    async fn close_tab_on_an_already_unbound_pane_is_a_no_op() {
         let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
 
         let Response::ClientPaneCreated { pane, .. } = app
@@ -4984,8 +5000,8 @@ mod tests {
             panic!("expected ClientPaneList");
         };
         assert!(
-            !panes.iter().any(|p| p.id == pane),
-            "the unbound leaf should still have been closed"
+            panes.iter().any(|p| p.id == pane),
+            "an already-unbound pane must survive cmd-w, not be removed from the layout"
         );
     }
 
