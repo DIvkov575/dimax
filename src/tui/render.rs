@@ -484,7 +484,7 @@ const PREVIEW_PANEL_HEIGHT: u16 = 12;
 /// Rendered along the row-list block's bottom border -- must stay in sync
 /// with `parse_attach_menu_input`'s actual byte matches (`tui/mod.rs`),
 /// which is the source of truth this is only a display of.
-const ATTACH_MENU_KEY_HINTS: &str = "↑↓ move · Enter attach · x del · r rename · p pin · a all-ws · g group · d detach · Esc cancel";
+const ATTACH_MENU_KEY_HINTS: &str = "↑↓ move · Enter attach · x del · r rename · p pin · a all-ws · g group · d detach · q quit · Esc cancel";
 
 /// Overlay for `cmd-shift-z`'s attach menu: lists every server-pane
 /// (grouped under selectable per-cwd headers) plus a trailing "spawn
@@ -1570,9 +1570,9 @@ mod tests {
             spawn_in_group: None,
             adding_tab: false,
         };
-        // Wide enough that the full (now longer, with "g group" added)
-        // hint string fits within the popup's 85%-width interior.
-        let backend = TestBackend::new(120, 30);
+        // Wide enough that the full (now longer, with "g group"/"q quit"
+        // added) hint string fits within the popup's 85%-width interior.
+        let backend = TestBackend::new(140, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), true, None, &[]))
