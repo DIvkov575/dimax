@@ -385,6 +385,15 @@ struct App {
     /// group is expected to stay collapsed next time the menu opens, not
     /// silently reset.
     collapsed_groups: HashSet<String>,
+    /// Whether the attach menu's rows are currently grouped under per-cwd
+    /// headers (`true`, the default/original behavior) or shown as a
+    /// flat list of `Server` rows with no headers at all (`false`). A
+    /// purely local UI preference, same category as `collapsed_groups`
+    /// and `show_all_workspaces` -- lives here so it survives closing and
+    /// reopening the menu, toggled by `AttachMenuAction::ToggleGrouping`
+    /// (`g` on any row) and applied by `visible_attach_menu_rows`/
+    /// `initial_selection_for` everywhere the menu's row list is built.
+    grouped_view: bool,
     /// The attach menu's preview panel content: whichever server-pane's
     /// row was selected as of the last `refresh_attach_menu_preview`
     /// call, and the plain-text screen contents fetched for it via
@@ -459,6 +468,7 @@ impl App {
                         dragging_split: None,
                         text_selection: None,
                         collapsed_groups: HashSet::new(),
+                        grouped_view: true,
                         attach_menu_preview: None,
                         pinned_dirs: Vec::new(),
                         show_all_workspaces: false,
@@ -797,8 +807,12 @@ impl App {
                 filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
                 &self.pinned_dirs,
             );
-            let selected =
-                initial_selection_for(&grouped, &self.collapsed_groups, previously_bound);
+            let selected = initial_selection_for(
+                &grouped,
+                &self.collapsed_groups,
+                self.grouped_view,
+                previously_bound,
+            );
             self.attach_menu = Some(AttachMenu {
                 servers: grouped,
                 selected,
@@ -835,12 +849,21 @@ impl App {
             .request(write_half, reader, Request::ServerList)
             .await?
         {
+            let grouped = group_servers_by_cwd(
+                filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
+                &self.pinned_dirs,
+            );
+            // Default to the trailing `SpawnNew` row ("generic new tab")
+            // rather than row 0 -- cmd-t is for opening a fresh tab, not
+            // for re-picking an existing session, so the cursor should
+            // start on the row that does that with a single Enter press.
+            let selected =
+                visible_attach_menu_rows(&grouped, &self.collapsed_groups, self.grouped_view)
+                    .len()
+                    .saturating_sub(1);
             self.attach_menu = Some(AttachMenu {
-                servers: group_servers_by_cwd(
-                    filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
-                    &self.pinned_dirs,
-                ),
-                selected: 0,
+                servers: grouped,
+                selected,
                 pending_delete: None,
                 rename: None,
                 previously_bound: None,
@@ -1085,6 +1108,7 @@ impl App {
             AttachMenuAction::ToggleShowAllWorkspaces => {
                 self.toggle_show_all_workspaces(write_half, reader).await?
             }
+            AttachMenuAction::ToggleGrouping => self.toggle_grouping(),
             AttachMenuAction::DetachAll => {
                 self.detach_all_and_close_menu(write_half, reader).await?
             }
@@ -1099,7 +1123,8 @@ impl App {
     /// least the trailing `SpawnNew` row).
     fn selected_attach_menu_row(&self) -> Option<AttachMenuRow> {
         let menu = self.attach_menu.as_ref()?;
-        let rows = visible_attach_menu_rows(&menu.servers, &self.collapsed_groups);
+        let rows =
+            visible_attach_menu_rows(&menu.servers, &self.collapsed_groups, self.grouped_view);
         rows.get(menu.selected).copied()
     }
 
@@ -1146,7 +1171,7 @@ impl App {
         let Some(menu) = &mut self.attach_menu else {
             return;
         };
-        let len = visible_attach_menu_rows(&menu.servers, &collapsed).len();
+        let len = visible_attach_menu_rows(&menu.servers, &collapsed, self.grouped_view).len();
         menu.selected = if forward {
             (menu.selected + 1) % len
         } else {
@@ -1191,7 +1216,27 @@ impl App {
         let Some(menu) = &mut self.attach_menu else {
             return;
         };
-        let len = visible_attach_menu_rows(&menu.servers, &collapsed).len();
+        let len = visible_attach_menu_rows(&menu.servers, &collapsed, self.grouped_view).len();
+        if menu.selected >= len {
+            menu.selected = len - 1;
+        }
+    }
+
+    /// `g` on any row: flip between grouped-by-cwd and a flat row list.
+    /// Purely local -- `menu.servers` is already sorted/grouped by
+    /// `group_servers_by_cwd`; this only changes whether
+    /// `visible_attach_menu_rows` emits header/spawn-in-group rows on top
+    /// of that existing order, so no re-fetch is needed. Clamps
+    /// `selected` the same way `toggle_group_collapse` does, since
+    /// flattening removes every `GroupHeader`/`SpawnNewInGroup` row and
+    /// can shrink the list out from under the cursor.
+    fn toggle_grouping(&mut self) {
+        self.grouped_view = !self.grouped_view;
+        let collapsed = self.collapsed_groups.clone();
+        let Some(menu) = &mut self.attach_menu else {
+            return;
+        };
+        let len = visible_attach_menu_rows(&menu.servers, &collapsed, self.grouped_view).len();
         if menu.selected >= len {
             menu.selected = len - 1;
         }
@@ -1238,7 +1283,7 @@ impl App {
                 return Ok(());
             };
             menu.servers = grouped;
-            let len = visible_attach_menu_rows(&menu.servers, &collapsed).len();
+            let len = visible_attach_menu_rows(&menu.servers, &collapsed, self.grouped_view).len();
             if menu.selected >= len {
                 menu.selected = len - 1;
             }
@@ -1270,7 +1315,7 @@ impl App {
                 return Ok(());
             };
             menu.servers = grouped;
-            let len = visible_attach_menu_rows(&menu.servers, &collapsed).len();
+            let len = visible_attach_menu_rows(&menu.servers, &collapsed, self.grouped_view).len();
             if menu.selected >= len {
                 menu.selected = len - 1;
             }
@@ -1392,7 +1437,7 @@ impl App {
                 return Ok(());
             };
             menu.servers = grouped;
-            let len = visible_attach_menu_rows(&menu.servers, &collapsed).len();
+            let len = visible_attach_menu_rows(&menu.servers, &collapsed, self.grouped_view).len();
             if menu.selected >= len {
                 menu.selected = len - 1;
             }
@@ -1668,7 +1713,9 @@ impl App {
                 if let Some(menu) = &mut self.attach_menu {
                     menu.servers = grouped;
                     menu.spawn_in_group = None;
-                    let len = visible_attach_menu_rows(&menu.servers, &collapsed).len();
+                    let len =
+                        visible_attach_menu_rows(&menu.servers, &collapsed, self.grouped_view)
+                            .len();
                     if menu.selected >= len {
                         menu.selected = len - 1;
                     }
@@ -2154,13 +2201,25 @@ enum AttachMenuRow {
 /// Takes the raw `servers` slice rather than a whole `AttachMenu` so a
 /// caller building the very first `AttachMenu` (no instance to borrow
 /// from yet) can still compute an initial `selected` from it — see
-/// `App::detach_and_open_menu`.
+/// `App::detach_and_open_menu`. When `grouped` is `false` (see
+/// `App.grouped_view`), headers and per-group spawn rows are skipped
+/// entirely and every server gets a plain `Server` row in `servers`'
+/// existing (still pin/alpha-sorted, just unlabeled) order -- `collapsed`
+/// is ignored in that case, since there are no headers to collapse.
 fn visible_attach_menu_rows(
     servers: &[(String, ServerPaneInfo)],
     collapsed: &HashSet<String>,
+    grouped: bool,
 ) -> Vec<AttachMenuRow> {
     const UNKNOWN: &str = "Unknown";
     let mut rows = Vec::with_capacity(servers.len() + 2);
+    if !grouped {
+        for index in 0..servers.len() {
+            rows.push(AttachMenuRow::Server(index));
+        }
+        rows.push(AttachMenuRow::SpawnNew);
+        return rows;
+    }
     let mut last_group: Option<&str> = None;
     let mut group_is_collapsed = false;
     let mut group_start = 0;
@@ -2207,6 +2266,7 @@ fn visible_attach_menu_rows(
 fn initial_selection_for(
     servers: &[(String, ServerPaneInfo)],
     collapsed: &HashSet<String>,
+    grouped: bool,
     previously_bound: Option<ServerPaneId>,
 ) -> usize {
     let Some(previously_bound) = previously_bound else {
@@ -2215,7 +2275,7 @@ fn initial_selection_for(
     let Some(server_index) = servers.iter().position(|(_, s)| s.id == previously_bound) else {
         return 0;
     };
-    let rows = visible_attach_menu_rows(servers, collapsed);
+    let rows = visible_attach_menu_rows(servers, collapsed, grouped);
     if let Some(row_index) = rows
         .iter()
         .position(|row| *row == AttachMenuRow::Server(server_index))
@@ -2337,6 +2397,10 @@ enum AttachMenuAction {
     /// comment) and re-fetch/re-group the server list so the toggle
     /// takes effect immediately.
     ToggleShowAllWorkspaces,
+    /// `g` on any row: flip `App.grouped_view` between grouped-by-cwd and
+    /// a flat list (see `App::toggle_grouping`). Purely a local
+    /// re-render -- no network round-trip, unlike `ToggleShowAllWorkspaces`.
+    ToggleGrouping,
     /// `d` on any row: detach every tab from the leaf that opened this
     /// menu (see `App::detach_all_and_close_menu`), then close the
     /// menu -- distinct from `Cancel` (`Esc`), which restores whatever
@@ -2367,6 +2431,7 @@ fn parse_attach_menu_input(bytes: &[u8]) -> AttachMenuAction {
         b"r" => AttachMenuAction::StartRename,
         b"p" => AttachMenuAction::TogglePin,
         b"a" => AttachMenuAction::ToggleShowAllWorkspaces,
+        b"g" => AttachMenuAction::ToggleGrouping,
         b"d" => AttachMenuAction::DetachAll,
         _ => AttachMenuAction::Ignore,
     }
@@ -2651,6 +2716,7 @@ pub async fn run() -> anyhow::Result<()> {
                     frame,
                     menu,
                     &app.collapsed_groups,
+                    app.grouped_view,
                     app.attach_menu_preview.as_ref(),
                     &app.pinned_dirs,
                 );
@@ -3136,6 +3202,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_attach_menu_input_g_is_toggle_grouping() {
+        assert_eq!(
+            parse_attach_menu_input(b"g"),
+            AttachMenuAction::ToggleGrouping
+        );
+    }
+
+    #[test]
     fn parse_attach_menu_input_d_is_detach_all() {
         assert_eq!(parse_attach_menu_input(b"d"), AttachMenuAction::DetachAll);
     }
@@ -3341,7 +3415,7 @@ mod tests {
             ("/a".to_string(), server_with_cwd("y", Some("/a"))),
             ("/b".to_string(), server_with_cwd("z", Some("/b"))),
         ];
-        let rows = visible_attach_menu_rows(&servers, &HashSet::new());
+        let rows = visible_attach_menu_rows(&servers, &HashSet::new(), true);
         assert_eq!(
             rows,
             vec![
@@ -3358,6 +3432,32 @@ mod tests {
     }
 
     #[test]
+    fn visible_attach_menu_rows_grouped_false_emits_no_headers_or_spawn_in_group_rows() {
+        // Same three-server, two-group input as the test above, but with
+        // `grouped: false` -- every server gets a plain `Server` row in
+        // its existing order, no `GroupHeader`/`SpawnNewInGroup` at all,
+        // `collapsed` is ignored entirely, and the trailing `SpawnNew`
+        // still closes the list.
+        let servers = vec![
+            ("/a".to_string(), server_with_cwd("x", Some("/a"))),
+            ("/a".to_string(), server_with_cwd("y", Some("/a"))),
+            ("/b".to_string(), server_with_cwd("z", Some("/b"))),
+        ];
+        let mut collapsed = HashSet::new();
+        collapsed.insert("/a".to_string());
+        let rows = visible_attach_menu_rows(&servers, &collapsed, false);
+        assert_eq!(
+            rows,
+            vec![
+                AttachMenuRow::Server(0),
+                AttachMenuRow::Server(1),
+                AttachMenuRow::Server(2),
+                AttachMenuRow::SpawnNew,
+            ]
+        );
+    }
+
+    #[test]
     fn visible_attach_menu_rows_omits_all_of_a_collapsed_groups_rows_except_its_header() {
         let servers = vec![
             ("/a".to_string(), server_with_cwd("x", Some("/a"))),
@@ -3366,7 +3466,7 @@ mod tests {
         ];
         let mut collapsed = HashSet::new();
         collapsed.insert("/a".to_string());
-        let rows = visible_attach_menu_rows(&servers, &collapsed);
+        let rows = visible_attach_menu_rows(&servers, &collapsed, true);
         // Both of "/a"'s Server rows AND its own "spawn new here" row
         // disappear -- only its header stays, so the group can still be
         // found and re-expanded. The uncollapsed "/b" group is
@@ -3389,7 +3489,7 @@ mod tests {
             .into_iter()
             .map(|s| ("Unknown".to_string(), s))
             .collect::<Vec<_>>();
-        let rows = visible_attach_menu_rows(&servers, &HashSet::new());
+        let rows = visible_attach_menu_rows(&servers, &HashSet::new(), true);
         // The synthetic "Unknown" bucket has no real directory to spawn
         // a new pane into, so it gets no SpawnNewInGroup row at all --
         // only the real per-group rows do.
@@ -3411,7 +3511,7 @@ mod tests {
         let servers = vec![("/x".to_string(), a), ("/x".to_string(), b)];
         // Rows: 0 = header, 1 = a's Server row, 2 = b's Server row, 3 = spawn-in-group.
         assert_eq!(
-            initial_selection_for(&servers, &HashSet::new(), Some(b_id)),
+            initial_selection_for(&servers, &HashSet::new(), true, Some(b_id)),
             2
         );
     }
@@ -3419,14 +3519,17 @@ mod tests {
     #[test]
     fn initial_selection_for_falls_back_to_zero_when_nothing_was_previously_bound() {
         let servers = vec![("/x".to_string(), server_with_cwd("a", Some("/x")))];
-        assert_eq!(initial_selection_for(&servers, &HashSet::new(), None), 0);
+        assert_eq!(
+            initial_selection_for(&servers, &HashSet::new(), true, None),
+            0
+        );
     }
 
     #[test]
     fn initial_selection_for_falls_back_to_zero_when_the_pane_no_longer_exists() {
         let servers = vec![("/x".to_string(), server_with_cwd("a", Some("/x")))];
         assert_eq!(
-            initial_selection_for(&servers, &HashSet::new(), Some(Uuid::new_v4())),
+            initial_selection_for(&servers, &HashSet::new(), true, Some(Uuid::new_v4())),
             0
         );
     }
@@ -3439,7 +3542,10 @@ mod tests {
         let mut collapsed = HashSet::new();
         collapsed.insert("/x".to_string());
         // Rows when collapsed: 0 = header only (Server(0) is hidden).
-        assert_eq!(initial_selection_for(&servers, &collapsed, Some(a_id)), 0);
+        assert_eq!(
+            initial_selection_for(&servers, &collapsed, true, Some(a_id)),
+            0
+        );
     }
 
     #[test]
@@ -3468,6 +3574,7 @@ mod tests {
             dragging_split: None,
             text_selection: None,
             collapsed_groups: HashSet::new(),
+            grouped_view: true,
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
             show_all_workspaces: false,
@@ -3510,6 +3617,7 @@ mod tests {
             dragging_split: None,
             text_selection: None,
             collapsed_groups: HashSet::new(),
+            grouped_view: true,
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
             show_all_workspaces: false,
@@ -3520,6 +3628,54 @@ mod tests {
             1,
             "should clamp onto the new last row (global spawn-new)"
         );
+    }
+
+    #[test]
+    fn toggle_grouping_flips_view_and_clamps_selection() {
+        let servers = vec![("/a".to_string(), server_with_cwd("x", Some("/a")))];
+        // Grouped rows: 0 = header, 1 = server, 2 = "spawn new here",
+        // 3 = global spawn-new -- len 4. Flat rows (grouped_view: false)
+        // drop the header and per-group spawn row entirely: 0 = server,
+        // 1 = global spawn-new -- len 2. Selecting the last grouped row
+        // beforehand must not leave `selected` pointing past the
+        // shrunk flat list.
+        let mut app = App {
+            workspace: WorkspaceInfo {
+                id: Uuid::new_v4(),
+                number: 1,
+                name: None,
+                tree: None,
+            },
+            grids: HashMap::new(),
+            pane_sizes: HashMap::new(),
+            focused: None,
+            attach_menu: Some(AttachMenu {
+                servers,
+                selected: 3,
+                pending_delete: None,
+                rename: None,
+                previously_bound: None,
+                spawn_in_group: None,
+                adding_tab: false,
+            }),
+            frame_area: ratatui::layout::Rect::default(),
+            dragging_split: None,
+            text_selection: None,
+            collapsed_groups: HashSet::new(),
+            grouped_view: true,
+            attach_menu_preview: None,
+            pinned_dirs: Vec::new(),
+            show_all_workspaces: false,
+        };
+        app.toggle_grouping();
+        assert!(!app.grouped_view);
+        assert_eq!(
+            app.attach_menu.as_ref().unwrap().selected,
+            1,
+            "should clamp onto the new last row (global spawn-new) of the flat list"
+        );
+        app.toggle_grouping();
+        assert!(app.grouped_view);
     }
 
     #[test]
@@ -3551,6 +3707,7 @@ mod tests {
             dragging_split: None,
             text_selection: None,
             collapsed_groups: HashSet::new(),
+            grouped_view: true,
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
             show_all_workspaces: false,
@@ -3588,6 +3745,7 @@ mod tests {
             dragging_split: None,
             text_selection: None,
             collapsed_groups: HashSet::new(),
+            grouped_view: true,
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
             show_all_workspaces: false,
@@ -3622,6 +3780,7 @@ mod tests {
             dragging_split: None,
             text_selection: None,
             collapsed_groups: HashSet::new(),
+            grouped_view: true,
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
             show_all_workspaces: false,
@@ -3658,6 +3817,7 @@ mod tests {
             dragging_split: None,
             text_selection: None,
             collapsed_groups: HashSet::new(),
+            grouped_view: true,
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
             show_all_workspaces: false,
@@ -3778,6 +3938,7 @@ mod tests {
             dragging_split: None,
             text_selection: None,
             collapsed_groups: HashSet::new(),
+            grouped_view: true,
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
             show_all_workspaces: false,
@@ -3815,6 +3976,7 @@ mod tests {
             dragging_split: None,
             text_selection: None,
             collapsed_groups: HashSet::new(),
+            grouped_view: true,
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
             show_all_workspaces: false,
@@ -3851,6 +4013,7 @@ mod tests {
             dragging_split: None,
             text_selection: None,
             collapsed_groups: HashSet::new(),
+            grouped_view: true,
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
             show_all_workspaces: false,
@@ -5147,6 +5310,60 @@ mod tests {
         assert_eq!(
             leaf.active_tab, 1,
             "the newly-added tab should become active"
+        );
+    }
+
+    /// `cmd-t` should default the cursor onto the trailing `SpawnNew`
+    /// row ("generic new tab") rather than row 0 -- the whole point of
+    /// cmd-t is opening a fresh tab, so a bare Enter right after opening
+    /// the menu should do exactly that, not re-pick some existing
+    /// session.
+    #[tokio::test]
+    async fn open_add_tab_menu_defaults_selection_to_spawn_new() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+
+        let Response::ServerPane(sp1) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: None,
+                    workspace: None,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        let Response::ClientPaneCreated { pane, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientSpawn {
+                    workspace: "1".to_string(),
+                    split_of: None,
+                    dir: None,
+                    bind: Some(sp1.id.to_string()),
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneCreated");
+        };
+        app.focused = Some(pane);
+
+        app.open_add_tab_menu(&mut write_half, &mut reader)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            app.selected_attach_menu_row(),
+            Some(AttachMenuRow::SpawnNew),
+            "cmd-t must default to the generic new-tab row, not row 0"
         );
     }
 

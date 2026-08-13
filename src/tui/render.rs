@@ -49,11 +49,18 @@ use crate::protocol::{
     SplitId, SplitTree, WorkspaceInfo,
 };
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use std::collections::{HashMap, HashSet};
+
+/// Reserved width, in columns, of the gap between two side-by-side panes:
+/// one blank column of margin on each side of the `│` divider glyph
+/// itself (see `draw_vertical_divider`). Stacked panes have no matching
+/// constant -- module doc "Bezels" -- their boundary stays exactly the
+/// lower pane's own title-bar row, unchanged.
+const PANE_GAP: u16 = 3;
 
 /// See module doc comment "`SplitDir` -> `ratatui::Direction` mapping".
 fn ratatui_direction(dir: SplitDir) -> Direction {
@@ -122,7 +129,7 @@ fn draw_tree(
                         direction,
                         [
                             Constraint::Percentage(percent_a),
-                            Constraint::Length(1),
+                            Constraint::Length(PANE_GAP),
                             Constraint::Percentage(percent_b),
                         ],
                     )
@@ -148,11 +155,14 @@ fn draw_tree(
     }
 }
 
-/// Paint a single-column `│` divider (the shared edge between two
-/// side-by-side panes) into `area`, which `draw_tree` has already
-/// reserved as exactly one column wide.
+/// Paint a `│` divider (the shared edge between two side-by-side panes)
+/// centered into `area`, which `draw_tree` has already reserved as
+/// `PANE_GAP` columns wide -- one blank column of margin on each side of
+/// the glyph itself.
 fn draw_vertical_divider(frame: &mut Frame, area: Rect) {
-    let line = Line::from("│").style(Style::new());
+    let line = Line::from("│")
+        .alignment(Alignment::Center)
+        .style(Style::new());
     let text = Text::from(vec![line; area.height as usize]);
     frame.render_widget(Paragraph::new(text), area);
 }
@@ -203,7 +213,7 @@ fn collect_divider_rects(tree: &SplitTree, area: Rect, out: &mut Vec<DividerHit>
                     direction,
                     [
                         Constraint::Percentage(percent_a),
-                        Constraint::Length(1),
+                        Constraint::Length(PANE_GAP),
                         Constraint::Percentage(percent_b),
                     ],
                 )
@@ -272,7 +282,7 @@ fn collect_leaf_rects(
                         direction,
                         [
                             Constraint::Percentage(percent_a),
-                            Constraint::Length(1),
+                            Constraint::Length(PANE_GAP),
                             Constraint::Percentage(percent_b),
                         ],
                     )
@@ -469,13 +479,12 @@ fn cell_to_span(cell: &Cell, selected: bool) -> Span<'static> {
 /// bottom border, plus enough interior rows to show a handful of a
 /// pane's most recent lines at a glance without the popup growing tall
 /// enough to crowd out the row list above it.
-const PREVIEW_PANEL_HEIGHT: u16 = 10;
+const PREVIEW_PANEL_HEIGHT: u16 = 12;
 
 /// Rendered along the row-list block's bottom border -- must stay in sync
 /// with `parse_attach_menu_input`'s actual byte matches (`tui/mod.rs`),
 /// which is the source of truth this is only a display of.
-const ATTACH_MENU_KEY_HINTS: &str =
-    "↑↓ move · Enter attach · x del · r rename · p pin · a all-ws · d detach · Esc cancel";
+const ATTACH_MENU_KEY_HINTS: &str = "↑↓ move · Enter attach · x del · r rename · p pin · a all-ws · g group · d detach · Esc cancel";
 
 /// Overlay for `cmd-shift-z`'s attach menu: lists every server-pane
 /// (grouped under selectable per-cwd headers) plus a trailing "spawn
@@ -496,6 +505,7 @@ pub(super) fn draw_attach_menu(
     frame: &mut Frame,
     menu: &super::AttachMenu,
     collapsed: &HashSet<String>,
+    grouped: bool,
     preview: Option<&(ServerPaneId, String)>,
     pinned: &[String],
 ) {
@@ -518,7 +528,7 @@ pub(super) fn draw_attach_menu(
     )
     .areas(popup_area);
 
-    let rows = super::visible_attach_menu_rows(&menu.servers, collapsed);
+    let rows = super::visible_attach_menu_rows(&menu.servers, collapsed, grouped);
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len() * 2);
     for (row_index, row) in rows.iter().enumerate() {
         match *row {
@@ -584,24 +594,37 @@ pub(super) fn draw_attach_menu(
         .title_bottom(Line::from(ATTACH_MENU_KEY_HINTS).right_aligned());
     frame.render_widget(Paragraph::new(lines).block(block), rows_area);
 
-    let selected_server_id = match rows.get(menu.selected) {
-        Some(super::AttachMenuRow::Server(server_index)) => Some(menu.servers[*server_index].1.id),
+    let selected_server = match rows.get(menu.selected) {
+        Some(super::AttachMenuRow::Server(server_index)) => Some(&menu.servers[*server_index].1),
         _ => None,
     };
-    draw_attach_menu_preview(frame, selected_server_id, preview, preview_area);
+    let selected_server_id = selected_server.map(|s| s.id);
+    let selected_name = selected_server.map(|s| s.name.as_deref().unwrap_or(s.short_id.as_str()));
+    draw_attach_menu_preview(
+        frame,
+        selected_server_id,
+        selected_name,
+        preview,
+        preview_area,
+    );
 }
 
 /// The attach menu's fixed-height preview panel (see `draw_attach_menu`
-/// for the layout rationale). Blank -- title only, no body text -- in
-/// every case where there's nothing meaningful to show: `selected` is
-/// `None` (the selection isn't on a `Server` row), or `preview`'s
-/// cached pane doesn't match `selected` (a stale fetch from just before
-/// the selection moved; see `App::refresh_attach_menu_preview`'s doc
-/// comment on why this can briefly happen and why showing nothing is
-/// correct rather than showing the wrong pane's content for one frame).
+/// for the layout rationale). Blank body -- title only -- in every case
+/// where there's nothing meaningful to show: `selected` is `None` (the
+/// selection isn't on a `Server` row), or `preview`'s cached pane doesn't
+/// match `selected` (a stale fetch from just before the selection moved;
+/// see `App::refresh_attach_menu_preview`'s doc comment on why this can
+/// briefly happen and why showing nothing is correct rather than showing
+/// the wrong pane's content for one frame). `selected_name` is that same
+/// selected pane's custom name (or short id fallback, see
+/// `draw_attach_menu`'s caller) -- shown as the panel's own title in
+/// place of the generic "Preview" so it's clear at a glance whose output
+/// is on screen, without having to look back up at the row list.
 fn draw_attach_menu_preview(
     frame: &mut Frame,
     selected: Option<ServerPaneId>,
+    selected_name: Option<&str>,
     preview: Option<&(ServerPaneId, String)>,
     area: Rect,
 ) {
@@ -621,7 +644,7 @@ fn draw_attach_menu_preview(
     let lines: Vec<&str> = full_text.lines().collect();
     let visible_text = lines[lines.len().saturating_sub(interior_rows)..].join("\n");
 
-    let block = Block::bordered().title("Preview");
+    let block = Block::bordered().title(selected_name.unwrap_or("Preview"));
     frame.render_widget(Paragraph::new(visible_text).block(block), area);
 }
 
@@ -675,7 +698,7 @@ fn spawn_new_in_group_line(
 /// two-plus-character label assigned once at spawn time — not the full
 /// UUID, which would dominate the row for no benefit; the attach menu
 /// is for picking a pane by eye, not by exact id.
-const NAME_COL_WIDTH: usize = 12;
+const NAME_COL_WIDTH: usize = 28;
 const PROCESS_COL_WIDTH: usize = 10;
 
 fn attach_menu_line(
@@ -1405,9 +1428,10 @@ mod tests {
         assert_eq!(hits[0].split, split_id);
         assert_eq!(hits[0].dir, SplitDir::Vertical);
         // 41 wide, 50/50 split -> percent_a=50% of 41 rounds to 20 or 21,
-        // then a 1-column divider; the exact column depends on ratatui's
-        // rounding, but it must land inside the area and be 1 column wide.
-        assert_eq!(hits[0].grab_zone.width, 1);
+        // then a PANE_GAP-column divider; the exact column depends on
+        // ratatui's rounding, but it must land inside the area and be
+        // PANE_GAP columns wide.
+        assert_eq!(hits[0].grab_zone.width, PANE_GAP);
         assert_eq!(hits[0].grab_zone.height, 10);
         assert_eq!(hits[0].parent_area, area);
     }
@@ -1526,7 +1550,7 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), true, None, &[]))
             .unwrap();
         assert!(buffer_contains(&terminal, "editor"));
         assert!(buffer_contains(&terminal, "vim"));
@@ -1546,10 +1570,12 @@ mod tests {
             spawn_in_group: None,
             adding_tab: false,
         };
-        let backend = TestBackend::new(100, 30);
+        // Wide enough that the full (now longer, with "g group" added)
+        // hint string fits within the popup's 85%-width interior.
+        let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), true, None, &[]))
             .unwrap();
         assert!(buffer_contains(&terminal, "move"));
         assert!(buffer_contains(&terminal, "attach"));
@@ -1570,7 +1596,7 @@ mod tests {
         let backend = TestBackend::new(40, 15);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), true, None, &[]))
             .unwrap();
     }
 
@@ -1600,10 +1626,14 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), Some(&preview), &[]))
+            .draw(|frame| {
+                draw_attach_menu(frame, &menu, &HashSet::new(), true, Some(&preview), &[])
+            })
             .unwrap();
         assert!(buffer_contains(&terminal, "some live pane output"));
-        assert!(buffer_contains(&terminal, "Preview"));
+        // The panel's own title is the selected pane's custom name, not
+        // the generic "Preview" label -- see `draw_attach_menu_preview`.
+        assert!(buffer_contains(&terminal, "editor"));
     }
 
     #[test]
@@ -1641,7 +1671,14 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                draw_attach_menu(frame, &menu, &HashSet::new(), Some(&stale_preview), &[])
+                draw_attach_menu(
+                    frame,
+                    &menu,
+                    &HashSet::new(),
+                    true,
+                    Some(&stale_preview),
+                    &[],
+                )
             })
             .unwrap();
         assert!(!buffer_contains(
@@ -1682,7 +1719,9 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), Some(&preview), &[]))
+            .draw(|frame| {
+                draw_attach_menu(frame, &menu, &HashSet::new(), true, Some(&preview), &[])
+            })
             .unwrap();
         assert!(!buffer_contains(
             &terminal,
@@ -1720,7 +1759,7 @@ mod tests {
         let backend_empty = TestBackend::new(100, 30);
         let mut terminal_empty = Terminal::new(backend_empty).unwrap();
         terminal_empty
-            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), true, None, &[]))
             .unwrap();
         let row_index_empty = buffer_row_index_containing(&terminal_empty, "editor");
 
@@ -1728,7 +1767,9 @@ mod tests {
         let backend_filled = TestBackend::new(100, 30);
         let mut terminal_filled = Terminal::new(backend_filled).unwrap();
         terminal_filled
-            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), Some(&preview), &[]))
+            .draw(|frame| {
+                draw_attach_menu(frame, &menu, &HashSet::new(), true, Some(&preview), &[])
+            })
             .unwrap();
         let row_index_filled = buffer_row_index_containing(&terminal_filled, "editor");
 
@@ -1771,7 +1812,9 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), Some(&preview), &[]))
+            .draw(|frame| {
+                draw_attach_menu(frame, &menu, &HashSet::new(), true, Some(&preview), &[])
+            })
             .unwrap();
         assert!(
             buffer_contains(&terminal, "line-19"),
@@ -1824,7 +1867,7 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), true, None, &[]))
             .unwrap();
         assert!(buffer_contains(&terminal, "editor"));
         assert!(buffer_contains(&terminal, "-"));
@@ -1851,7 +1894,7 @@ mod tests {
         let backend = TestBackend::new(60, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), true, None, &[]))
             .unwrap();
         assert!(buffer_contains(&terminal, "spawn new"));
     }
@@ -1895,10 +1938,13 @@ mod tests {
             spawn_in_group: None,
             adding_tab: false,
         };
-        let backend = TestBackend::new(100, 30);
+        // Tall enough that the row list still has room for all 7 rows
+        // (2 headers + 2 servers + 2 per-group spawn rows + the global
+        // spawn-new) below the now-taller PREVIEW_PANEL_HEIGHT panel.
+        let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), true, None, &[]))
             .unwrap();
         assert!(buffer_contains(&terminal, "/home/dev/api"));
         assert!(buffer_contains(&terminal, "/home/dev/web"));
@@ -1945,7 +1991,7 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), true, None, &[]))
             .unwrap();
         assert!(buffer_contains(&terminal, "+ spawn new in /home/dev/api"));
         assert!(!buffer_contains(&terminal, "+ spawn new in Unknown"));
@@ -1995,7 +2041,7 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_attach_menu(frame, &menu, &collapsed, None, &[]))
+            .draw(|frame| draw_attach_menu(frame, &menu, &collapsed, true, None, &[]))
             .unwrap();
         // The collapsed group's header stays visible (so it can be
         // re-expanded), but its member row AND its own "spawn new
@@ -2036,7 +2082,7 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), true, None, &[]))
             .unwrap();
         assert!(
             buffer_contains(&terminal, "▾"),
@@ -2048,7 +2094,7 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_attach_menu(frame, &menu, &collapsed, None, &[]))
+            .draw(|frame| draw_attach_menu(frame, &menu, &collapsed, true, None, &[]))
             .unwrap();
         assert!(
             buffer_contains(&terminal, "▸"),
@@ -2083,7 +2129,7 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), true, None, &[]))
             .unwrap();
         assert!(
             !buffer_contains(&terminal, "📌"),
@@ -2094,7 +2140,7 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &pinned))
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), true, None, &pinned))
             .unwrap();
         assert!(
             buffer_contains(&terminal, "📌"),
@@ -2125,7 +2171,7 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), true, None, &[]))
             .unwrap();
         assert!(buffer_contains(&terminal, "confirm delete"));
     }
@@ -2167,7 +2213,7 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), true, None, &[]))
             .unwrap();
         let marked_row = buffer_row_containing(&terminal, "detached");
         let unmarked_row = buffer_row_containing(&terminal, "other-pane");
@@ -2204,7 +2250,7 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), true, None, &[]))
             .unwrap();
         let row = buffer_row_containing(&terminal, "fresh");
         assert!(
@@ -2241,7 +2287,7 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), true, None, &[]))
             .unwrap();
         assert!(buffer_contains(&terminal, "new-name"));
         assert!(buffer_contains(&terminal, "name taken"));
@@ -2300,9 +2346,9 @@ mod tests {
         assert_eq!(rects.len(), 2);
         let rect_a = rects.iter().find(|(id, _)| *id == a).unwrap().1;
         let rect_b = rects.iter().find(|(id, _)| *id == b).unwrap().1;
-        // 81-wide area, 50/50 split, minus the 1-column reserved divider --
-        // same math draw_tree already uses for SplitDir::Vertical.
-        assert_eq!(rect_a.width + rect_b.width + 1, 81);
+        // 81-wide area, 50/50 split, minus the PANE_GAP-column reserved
+        // divider -- same math draw_tree already uses for SplitDir::Vertical.
+        assert_eq!(rect_a.width + rect_b.width + PANE_GAP, 81);
         assert_eq!(rect_a.height, 24);
         assert_eq!(rect_b.height, 24);
     }
