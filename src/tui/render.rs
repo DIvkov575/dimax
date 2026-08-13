@@ -79,21 +79,23 @@ pub fn draw(
     frame: &mut Frame,
     workspace: &WorkspaceInfo,
     grids: &HashMap<ServerPaneId, GridSnapshot>,
+    names: &HashMap<ServerPaneId, ServerPaneInfo>,
     focused: Option<crate::protocol::ClientPaneId>,
 ) {
-    draw_with_selection(frame, workspace, grids, focused, None);
+    draw_with_selection(frame, workspace, grids, names, focused, None);
 }
 
 pub(super) fn draw_with_selection(
     frame: &mut Frame,
     workspace: &WorkspaceInfo,
     grids: &HashMap<ServerPaneId, GridSnapshot>,
+    names: &HashMap<ServerPaneId, ServerPaneInfo>,
     focused: Option<crate::protocol::ClientPaneId>,
     selection: Option<&super::selection::TextSelection>,
 ) {
     let area = frame.area();
     match &workspace.tree {
-        Some(tree) => draw_tree(frame, tree, area, grids, focused, selection),
+        Some(tree) => draw_tree(frame, tree, area, grids, names, focused, selection),
         None => {
             let placeholder = Paragraph::new("(empty workspace — press cmd-d to spawn a pane)")
                 .block(Block::bordered().title("dimax"));
@@ -107,11 +109,12 @@ fn draw_tree(
     tree: &SplitTree,
     area: Rect,
     grids: &HashMap<ServerPaneId, GridSnapshot>,
+    names: &HashMap<ServerPaneId, ServerPaneInfo>,
     focused: Option<crate::protocol::ClientPaneId>,
     selection: Option<&super::selection::TextSelection>,
 ) {
     match tree {
-        SplitTree::Leaf(pane) => draw_leaf(frame, pane, area, grids, focused, selection),
+        SplitTree::Leaf(pane) => draw_leaf(frame, pane, area, grids, names, focused, selection),
         SplitTree::Split {
             dir, ratio, a, b, ..
         } => {
@@ -149,8 +152,8 @@ fn draw_tree(
                     (rects[0], rects[1])
                 }
             };
-            draw_tree(frame, a, rect_a, grids, focused, selection);
-            draw_tree(frame, b, rect_b, grids, focused, selection);
+            draw_tree(frame, a, rect_a, grids, names, focused, selection);
+            draw_tree(frame, b, rect_b, grids, names, focused, selection);
         }
     }
 }
@@ -335,12 +338,27 @@ fn draw_leaf(
     pane: &ClientPane,
     area: Rect,
     grids: &HashMap<ServerPaneId, GridSnapshot>,
+    names: &HashMap<ServerPaneId, ServerPaneInfo>,
     focused: Option<crate::protocol::ClientPaneId>,
     selection: Option<&super::selection::TextSelection>,
 ) {
     let active = pane.active_bound();
     let snapshot = active.and_then(|server_pane_id| grids.get(&server_pane_id));
-    let mut title = pane.name.clone().unwrap_or_else(|| pane.short_id.clone());
+    // The title bar shows the *bound server-pane's* id/name (both --
+    // `[short_id] name`, or just `[short_id]` when unnamed), not the
+    // client-pane wrapper's own -- `ClientPane.name`/`.short_id` are a
+    // separate identity for the grid leaf itself, which nothing ever
+    // renames in practice, so showing those left every pane's title
+    // permanently uninformative. Falls back to the client-pane's own
+    // short id only when unbound, or when `names` hasn't caught up yet
+    // (a few hundred ms after spawn/rebind -- see `App::refresh_server_names`).
+    let mut title = match active.and_then(|id| names.get(&id)) {
+        Some(server) => match &server.name {
+            Some(name) => format!("[{}] {name}", server.short_id),
+            None => format!("[{}]", server.short_id),
+        },
+        None => pane.short_id.clone(),
+    };
     if pane.tabs.len() > 1 {
         title.push_str(&format!(" ({}/{})", pane.active_tab + 1, pane.tabs.len()));
     }
@@ -908,7 +926,7 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw(frame, &workspace, &grids, None))
+            .draw(|frame| draw(frame, &workspace, &grids, &HashMap::new(), None))
             .unwrap();
         assert!(buffer_contains(&terminal, "empty workspace"));
     }
@@ -921,7 +939,7 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw(frame, &workspace, &grids, None))
+            .draw(|frame| draw(frame, &workspace, &grids, &HashMap::new(), None))
             .unwrap();
         assert!(buffer_contains(&terminal, "unbound"));
     }
@@ -933,7 +951,17 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let grids = HashMap::new();
         terminal
-            .draw(|frame| draw_leaf(frame, &pane, frame.area(), &grids, None, None))
+            .draw(|frame| {
+                draw_leaf(
+                    frame,
+                    &pane,
+                    frame.area(),
+                    &grids,
+                    &HashMap::new(),
+                    None,
+                    None,
+                )
+            })
             .unwrap();
         assert!(buffer_contains(&terminal, &pane.short_id));
     }
@@ -947,7 +975,7 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw(frame, &workspace, &grids, None))
+            .draw(|frame| draw(frame, &workspace, &grids, &HashMap::new(), None))
             .unwrap();
         assert!(buffer_contains(&terminal, "server-pane closed"));
     }
@@ -971,7 +999,7 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw(frame, &workspace, &grids, None))
+            .draw(|frame| draw(frame, &workspace, &grids, &HashMap::new(), None))
             .unwrap();
         assert!(buffer_contains(&terminal, "hi"));
     }
@@ -1002,7 +1030,7 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw(frame, &workspace, &grids, Some(pane_id)))
+            .draw(|frame| draw(frame, &workspace, &grids, &HashMap::new(), Some(pane_id)))
             .unwrap();
         // area starts at (0, 0); the leaf's top-border title bar occupies
         // row 0, so the content rect's origin is row 1 -- cursor (4, 1)
@@ -1048,7 +1076,14 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                draw_with_selection(frame, &workspace, &grids, None, Some(&selection));
+                draw_with_selection(
+                    frame,
+                    &workspace,
+                    &grids,
+                    &HashMap::new(),
+                    None,
+                    Some(&selection),
+                );
             })
             .unwrap();
 
@@ -1084,7 +1119,7 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw(frame, &workspace, &grids, None))
+            .draw(|frame| draw(frame, &workspace, &grids, &HashMap::new(), None))
             .unwrap();
         assert!(
             !terminal.backend().cursor_visible(),
@@ -1118,7 +1153,7 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw(frame, &workspace, &grids, Some(pane_id)))
+            .draw(|frame| draw(frame, &workspace, &grids, &HashMap::new(), Some(pane_id)))
             .unwrap();
         assert!(
             !terminal.backend().cursor_visible(),
@@ -1152,7 +1187,15 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                draw_leaf(frame, &pane, frame.area(), &grids, None, None);
+                draw_leaf(
+                    frame,
+                    &pane,
+                    frame.area(),
+                    &grids,
+                    &HashMap::new(),
+                    None,
+                    None,
+                );
             })
             .unwrap();
         assert!(buffer_contains(&terminal, "scrollback"));
@@ -1184,7 +1227,15 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                draw_leaf(frame, &pane, frame.area(), &grids, None, None);
+                draw_leaf(
+                    frame,
+                    &pane,
+                    frame.area(),
+                    &grids,
+                    &HashMap::new(),
+                    None,
+                    None,
+                );
             })
             .unwrap();
         assert!(!buffer_contains(&terminal, "scrollback"));
@@ -1206,7 +1257,17 @@ mod tests {
         let backend = TestBackend::new(40, 6);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_leaf(frame, &pane, frame.area(), &grids, None, None))
+            .draw(|frame| {
+                draw_leaf(
+                    frame,
+                    &pane,
+                    frame.area(),
+                    &grids,
+                    &HashMap::new(),
+                    None,
+                    None,
+                )
+            })
             .unwrap();
         assert!(buffer_contains(&terminal, "(1/2)"));
     }
@@ -1217,16 +1278,29 @@ mod tests {
         let sp = Uuid::new_v4();
         let pane = ClientPane {
             id: pane_id,
-            name: Some("shell".to_string()),
+            name: None,
             tabs: vec![sp],
             active_tab: 0,
             short_id: "aa".to_string(),
         };
         let grids = HashMap::new();
+        let mut names = HashMap::new();
+        names.insert(
+            sp,
+            ServerPaneInfo {
+                id: sp,
+                name: Some("shell".to_string()),
+                size: Size { rows: 24, cols: 80 },
+                status: ServerPaneStatus::Running,
+                foreground: None,
+                owner_workspace: None,
+                short_id: "aa".to_string(),
+            },
+        );
         let backend = TestBackend::new(40, 6);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_leaf(frame, &pane, frame.area(), &grids, None, None))
+            .draw(|frame| draw_leaf(frame, &pane, frame.area(), &grids, &names, None, None))
             .unwrap();
         assert!(!buffer_contains(&terminal, "(1/1)"));
         assert!(buffer_contains(&terminal, "shell"));
@@ -1238,18 +1312,43 @@ mod tests {
         let right_id = Uuid::new_v4();
         let left = ClientPane {
             id: Uuid::new_v4(),
-            name: Some("left".into()),
+            name: None,
             tabs: vec![left_id],
             active_tab: 0,
             short_id: "aa".to_string(),
         };
         let right = ClientPane {
             id: Uuid::new_v4(),
-            name: Some("right".into()),
+            name: None,
             tabs: vec![right_id],
             active_tab: 0,
             short_id: "aa".to_string(),
         };
+        let mut names = HashMap::new();
+        names.insert(
+            left_id,
+            ServerPaneInfo {
+                id: left_id,
+                name: Some("left".to_string()),
+                size: Size { rows: 1, cols: 4 },
+                status: ServerPaneStatus::Running,
+                foreground: None,
+                owner_workspace: None,
+                short_id: "aa".to_string(),
+            },
+        );
+        names.insert(
+            right_id,
+            ServerPaneInfo {
+                id: right_id,
+                name: Some("right".to_string()),
+                size: Size { rows: 1, cols: 5 },
+                status: ServerPaneStatus::Running,
+                foreground: None,
+                owner_workspace: None,
+                short_id: "ab".to_string(),
+            },
+        );
         let tree = SplitTree::Split {
             id: Uuid::new_v4(),
             dir: SplitDir::Vertical,
@@ -1293,7 +1392,7 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw(frame, &workspace, &grids, None))
+            .draw(|frame| draw(frame, &workspace, &grids, &names, None))
             .unwrap();
         assert!(buffer_contains(&terminal, "LEFT"));
         assert!(buffer_contains(&terminal, "RIGHT"));
@@ -1348,7 +1447,7 @@ mod tests {
         let backend = TestBackend::new(41, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw(frame, &workspace, &grids, None))
+            .draw(|frame| draw(frame, &workspace, &grids, &HashMap::new(), None))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -1380,7 +1479,7 @@ mod tests {
         let backend = TestBackend::new(20, 6);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw(frame, &workspace, &grids, None))
+            .draw(|frame| draw(frame, &workspace, &grids, &HashMap::new(), None))
             .unwrap();
 
         let buffer = terminal.backend().buffer();

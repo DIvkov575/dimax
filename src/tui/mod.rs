@@ -403,6 +403,15 @@ struct App {
     /// (`g` on any row) and applied by `visible_attach_menu_rows`/
     /// `initial_selection_for` everywhere the menu's row list is built.
     grouped_view: bool,
+    /// Every known server-pane's current id/name, keyed by id -- kept
+    /// fresh by `refresh_server_names` on the same tick as
+    /// `refresh_attach_menu_preview`, and consulted by the render loop so
+    /// each grid leaf's title bar can show the *bound server-pane's*
+    /// name (see `render::draw_leaf`), not the client-pane wrapper's own
+    /// (almost always unset) one. Unlike `attach_menu_preview`, this is
+    /// wanted whether or not the attach menu is even open, since it
+    /// drives the main grid view.
+    server_names: HashMap<ServerPaneId, ServerPaneInfo>,
     /// The attach menu's preview panel content: whichever server-pane's
     /// row was selected as of the last `refresh_attach_menu_preview`
     /// call, and the plain-text screen contents fetched for it via
@@ -478,6 +487,7 @@ impl App {
                         text_selection: None,
                         collapsed_groups: HashSet::new(),
                         grouped_view: true,
+                        server_names: HashMap::new(),
                         attach_menu_preview: None,
                         pinned_dirs: Vec::new(),
                         show_all_workspaces: false,
@@ -1180,6 +1190,25 @@ impl App {
         };
         if let Response::ServerReadOutput { text } = self.request(write_half, reader, req).await? {
             self.attach_menu_preview = Some((target, text));
+        }
+        Ok(())
+    }
+
+    /// Refresh `server_names` from a full `ServerList` fetch -- called
+    /// on the same tick as `refresh_attach_menu_preview` so every grid
+    /// leaf's title bar (see `render::draw_leaf`) tracks a bound
+    /// server-pane's current name shortly after a rename, whether or
+    /// not the attach menu happens to be open.
+    async fn refresh_server_names(
+        &mut self,
+        write_half: &mut OwnedWriteHalf,
+        reader: &mut FrameReader,
+    ) -> anyhow::Result<()> {
+        if let Response::ServerPaneList(servers) = self
+            .request(write_half, reader, Request::ServerList)
+            .await?
+        {
+            self.server_names = servers.into_iter().map(|s| (s.id, s)).collect();
         }
         Ok(())
     }
@@ -2733,6 +2762,7 @@ pub async fn run() -> anyhow::Result<()> {
                         frame,
                         &preview,
                         &app.grids,
+                        &app.server_names,
                         app.focused,
                         app.text_selection.as_ref(),
                     );
@@ -2741,6 +2771,7 @@ pub async fn run() -> anyhow::Result<()> {
                     frame,
                     &app.workspace,
                     &app.grids,
+                    &app.server_names,
                     app.focused,
                     app.text_selection.as_ref(),
                 ),
@@ -2872,6 +2903,7 @@ pub async fn run() -> anyhow::Result<()> {
             }
             _ = preview_tick.tick() => {
                 app.refresh_attach_menu_preview(&mut write_half, &mut reader).await?;
+                app.refresh_server_names(&mut write_half, &mut reader).await?;
             }
             frame = reader.next() => {
                 match frame {
@@ -3674,6 +3706,7 @@ mod tests {
             text_selection: None,
             collapsed_groups: HashSet::new(),
             grouped_view: true,
+            server_names: HashMap::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
             show_all_workspaces: false,
@@ -3717,6 +3750,7 @@ mod tests {
             text_selection: None,
             collapsed_groups: HashSet::new(),
             grouped_view: true,
+            server_names: HashMap::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
             show_all_workspaces: false,
@@ -3762,6 +3796,7 @@ mod tests {
             text_selection: None,
             collapsed_groups: HashSet::new(),
             grouped_view: true,
+            server_names: HashMap::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
             show_all_workspaces: false,
@@ -3807,6 +3842,7 @@ mod tests {
             text_selection: None,
             collapsed_groups: HashSet::new(),
             grouped_view: true,
+            server_names: HashMap::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
             show_all_workspaces: false,
@@ -3845,6 +3881,7 @@ mod tests {
             text_selection: None,
             collapsed_groups: HashSet::new(),
             grouped_view: true,
+            server_names: HashMap::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
             show_all_workspaces: false,
@@ -3880,6 +3917,7 @@ mod tests {
             text_selection: None,
             collapsed_groups: HashSet::new(),
             grouped_view: true,
+            server_names: HashMap::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
             show_all_workspaces: false,
@@ -3917,6 +3955,7 @@ mod tests {
             text_selection: None,
             collapsed_groups: HashSet::new(),
             grouped_view: true,
+            server_names: HashMap::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
             show_all_workspaces: false,
@@ -4038,6 +4077,7 @@ mod tests {
             text_selection: None,
             collapsed_groups: HashSet::new(),
             grouped_view: true,
+            server_names: HashMap::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
             show_all_workspaces: false,
@@ -4076,6 +4116,7 @@ mod tests {
             text_selection: None,
             collapsed_groups: HashSet::new(),
             grouped_view: true,
+            server_names: HashMap::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
             show_all_workspaces: false,
@@ -4113,6 +4154,7 @@ mod tests {
             text_selection: None,
             collapsed_groups: HashSet::new(),
             grouped_view: true,
+            server_names: HashMap::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
             show_all_workspaces: false,

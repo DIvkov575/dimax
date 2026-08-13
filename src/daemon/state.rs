@@ -86,6 +86,29 @@ fn encode_short_id(n: u64) -> String {
     String::from_utf8(digits).expect("SHORT_ID_CHARSET is pure ASCII")
 }
 
+/// Inverse of [`encode_short_id`]: recovers the original sequential
+/// counter value from an encoded label. Used to sort `server_list` by
+/// true spawn order (see its doc comment) -- `SHORT_ID_CHARSET`'s digit
+/// order (`0-9`, then `a-z`, then `A-Z`) does not match ASCII byte order
+/// (`0-9`, then `A-Z`, then `a-z`), so comparing the encoded *strings*
+/// directly would sort a pane spawned at, say, n=36 (`"0A"`) before one
+/// spawned at n=10 (`"0a"`) -- wrong once a session has spawned more
+/// than 10 panes over its lifetime. Panics on a label outside
+/// `SHORT_ID_CHARSET`, which never happens for a label this module
+/// itself produced via `encode_short_id`.
+fn decode_short_id(label: &str) -> u64 {
+    let base = SHORT_ID_CHARSET.len() as u64;
+    let offset: u64 = (2..label.len() as u32).map(|w| base.pow(w)).sum();
+    let value = label.bytes().fold(0u64, |acc, byte| {
+        let digit = SHORT_ID_CHARSET
+            .iter()
+            .position(|&c| c == byte)
+            .expect("label must be composed of SHORT_ID_CHARSET bytes") as u64;
+        acc * base + digit
+    });
+    offset + value
+}
+
 pub struct State {
     server_panes: HashMap<ServerPaneId, ServerPane>,
     workspaces: HashMap<WorkspaceId, Workspace>,
@@ -321,8 +344,13 @@ impl State {
             })
             .collect();
         // HashMap order is unspecified; sort so `dimax server ls` output
-        // and tests are stable.
-        panes.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        // and tests are stable. Sorted by decoded spawn order (see
+        // `decode_short_id`'s doc comment for why the encoded *string*
+        // can't be compared directly), not `name` -- renaming a pane
+        // must not change its position in this list, in the attach menu,
+        // or in `dimax server ls`, which sorting by the very field that
+        // just changed would do.
+        panes.sort_by_key(|p| decode_short_id(&p.short_id));
         panes
     }
 
@@ -1042,6 +1070,31 @@ mod tests {
     }
 
     #[test]
+    fn decode_short_id_inverts_encode_across_a_wide_range() {
+        for n in 0..10_000 {
+            assert_eq!(
+                decode_short_id(&encode_short_id(n)),
+                n,
+                "round-trip failed for n={n}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_short_id_does_not_sort_like_the_raw_encoded_string() {
+        // n=10 encodes to "0a" (lowercase), n=36 to "0A" (uppercase) --
+        // ASCII puts 'A' before 'a', so the raw strings sort backwards
+        // relative to spawn order. Decoding must recover the true order.
+        let earlier = encode_short_id(10);
+        let later = encode_short_id(36);
+        assert!(
+            later < earlier,
+            "test premise broken: expected the raw strings to sort backwards"
+        );
+        assert!(decode_short_id(&earlier) < decode_short_id(&later));
+    }
+
+    #[test]
     fn server_spawn_assigns_sequential_short_ids_starting_at_00() {
         let mut state = State::new();
         let a = state
@@ -1247,7 +1300,10 @@ mod tests {
     }
 
     #[test]
-    fn server_list_is_sorted_by_name() {
+    fn server_list_is_sorted_by_short_id_not_name() {
+        // Spawned out of alphabetical order ("c", "a", "b") -- the list
+        // must come back in *spawn* order (short ids assigned
+        // sequentially: "aa", "ab", "ac"), not alphabetically by name.
         let mut state = State::new();
         spawn_pane(&mut state, "c");
         spawn_pane(&mut state, "a");
@@ -1256,8 +1312,30 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                Some("c".to_string()),
                 Some("a".to_string()),
-                Some("b".to_string()),
+                Some("b".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn server_rename_does_not_change_list_order() {
+        // Renaming "b" to something that would sort first alphabetically
+        // ("aaa") must not move it to the front of `server_list` -- the
+        // list orders by short id (spawn order), which a rename never
+        // touches.
+        let mut state = State::new();
+        spawn_pane(&mut state, "a");
+        spawn_pane(&mut state, "b");
+        spawn_pane(&mut state, "c");
+        state.server_rename("b", "aaa".to_string()).unwrap();
+        let names: Vec<Option<String>> = state.server_list().into_iter().map(|i| i.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                Some("a".to_string()),
+                Some("aaa".to_string()),
                 Some("c".to_string())
             ]
         );
