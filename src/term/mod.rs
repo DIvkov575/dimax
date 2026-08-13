@@ -428,10 +428,13 @@ impl ServerPane {
                 .with_cmd(sysinfo::UpdateKind::Always),
         );
         let process = system.process(sysinfo_pid)?;
+        let process_name = process.name().to_string_lossy().into_owned();
+        let session_kind = session_name::classify(&process_name);
 
         Some(ForegroundProcessInfo {
-            process_name: process.name().to_string_lossy().into_owned(),
+            process_name,
             cwd: process.cwd().map(|p| p.display().to_string()),
+            session_kind,
         })
     }
 

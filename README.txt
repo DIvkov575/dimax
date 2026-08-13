@@ -237,8 +237,10 @@ Claude Code skill
 -----------------
 
 dimax ships a Claude Code skill (`dimax-pane-control`) that lets Claude
-drive `dimax server ...` directly -- spawn a pane, send it commands, read
-back what it printed, rename/list/kill it -- without opening the TUI.
+drive the entire `dimax` CLI directly -- spawn a server-pane, send it
+commands, read back what it printed, rename/list/kill it; create and
+manage client-panes/workspaces; pin directories; configure keybindings;
+hot-reload the daemon -- all without opening the TUI.
 
 The first-run wizard offers to install it automatically. Install or
 reinstall it explicitly at any time with:
@@ -264,12 +266,49 @@ mode is configured; see "Portable bindings" and "Kitty integration" above.
 
 CLI session control includes:
 
-    dimax server spawn <name>
+    dimax server spawn <name> [--cwd <dir>]
     dimax server ls
     dimax server send <name> "command" --enter
     dimax server read <name>
     dimax server rename <name> <new-name>
     dimax server kill <name>
+
+`dimax server ls` also prints a trailing `kind` column: `claude`/`codex`/
+`opencode`/`omp`/`herdr` when the pane's foreground process is a
+recognized AI-coding CLI tool, `-` otherwise. This is a stable tag (see
+`daemon::state`/`term::session_name` in the source), not something a
+caller needs to re-derive by pattern-matching the `process` column
+itself.
+
+Client-panes and workspaces (the TUI's grid) are also fully scriptable:
+
+    dimax client spawn <workspace> [--split <pane-uuid>] [--dir h|v] [--bind <target>]
+    dimax client ls [workspace]
+    dimax client bind <addr> <target>
+    dimax client unbind <addr>
+    dimax client add-tab <addr> <target>
+    dimax client cycle-tab <addr> [--backward]
+    dimax client close-tab <addr>
+    dimax client rename <addr> <new-name>
+    dimax client close <addr>
+
+`<addr>` is `<workspace>/<pane-id>`, as printed by `client spawn`/`ls`.
+
+Directory pinning
+------------------
+
+The attach menu groups server-panes by working directory; a pinned
+directory always sorts first. Pinning is scriptable, not just reachable
+via the attach menu's `p` key:
+
+    dimax pin add <dir>
+    dimax pin remove <dir>
+    dimax pin list
+
+`add`/`remove` are idempotent (pinning an already-pinned directory, or
+unpinning one that isn't pinned, is a no-op that still succeeds) --
+unlike the attach menu's `p` key, which always just flips the current
+state.
 
 Hot reload
 ----------
