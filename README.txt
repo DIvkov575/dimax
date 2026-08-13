@@ -282,6 +282,16 @@ itself. The same tag shows up as a `[claude]`/`[codex]`/etc. marker in
 the attach menu's row list, so a recognized session stands out at a
 glance there too.
 
+`dimax server ls`'s final column is `attached`, answering "where is
+this server-pane bound right now?" in the form `<workspace>/<client-
+pane-short-id>`. A trailing `+` marks that this pane is a background
+tab on that client-pane (bound but not the currently-displayed one);
+commas separate multiple bindings; a lone `-` means unattached (still
+running, but no client-pane is showing it). The attach menu's row list
+shows the same information in its own `attached` column, so the "which
+of these panes am I actually looking at right now?" question is
+answerable at a glance in the picker too, not just via the CLI.
+
 The attach menu (`cmd-shift-z` / `Ctrl-Space Z`) defaults to an
 agents-only view: only server-panes tagged with a recognized `kind` are
 listed. Press `f` inside the menu to flip between the agents-only

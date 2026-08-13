@@ -709,18 +709,25 @@ fn spawn_new_in_group_line(
     Line::styled(text, style)
 }
 
-/// Column widths for the attach menu's server-pane rows: `name | tag |
-/// process | id | status` (a `cwd` column existed here before rows
-/// were grouped under per-cwd header lines — see `draw_attach_menu` —
-/// at which point showing it a second time per row became redundant).
-/// `id` here is `ServerPaneInfo::short_id` (`"aa"`, `"ab"`, ...), a
-/// sequential two-plus-character label assigned once at spawn time —
-/// not the full UUID, which would dominate the row for no benefit; the
-/// attach menu is for picking a pane by eye, not by exact id.
+/// Column widths for the attach menu's server-pane rows: `name |
+/// attached | tag | process | id | status` (a `cwd` column existed here
+/// before rows were grouped under per-cwd header lines — see
+/// `draw_attach_menu` — at which point showing it a second time per
+/// row became redundant). `id` here is `ServerPaneInfo::short_id`
+/// (`"aa"`, `"ab"`, ...), a sequential two-plus-character label
+/// assigned once at spawn time — not the full UUID, which would
+/// dominate the row for no benefit; the attach menu is for picking a
+/// pane by eye, not by exact id.
 const NAME_COL_WIDTH: usize = 28;
 /// Fits `[opencode]` (10 chars), the longest of `session_tag`'s
 /// possible outputs, with no truncation.
 const TAG_COL_WIDTH: usize = 10;
+/// Fits one binding formatted as `<ws>/<client-short>` (typically 4
+/// characters: `1/aa`) plus a `+N` overflow marker for the multi-tab
+/// case (e.g. `1/aa +2`). A `+` marks that the binding is a background
+/// tab, not the client-pane's currently displayed one; a lone `-` means
+/// unattached.
+const ATTACHED_COL_WIDTH: usize = 10;
 const PROCESS_COL_WIDTH: usize = 10;
 
 /// `[claude]`/`[codex]`/etc. when `server`'s foreground process is a
@@ -733,6 +740,32 @@ fn session_tag(server: &ServerPaneInfo) -> String {
     match server.foreground.as_ref().and_then(|f| f.session_kind) {
         Some(kind) => format!("[{}]", kind.as_str()),
         None => String::new(),
+    }
+}
+
+/// Rendered `attached` column value for the attach menu -- see
+/// `ATTACHED_COL_WIDTH`. `-` for an unattached pane, `<ws>/<short>` for
+/// a single-binding pane (`+` suffix if that one binding is a background
+/// tab, not the currently displayed one -- so `1/aa` reads as "you can
+/// see this pane right now on workspace 1's client-pane aa"; `1/aa+`
+/// reads as "workspace 1's client-pane aa has it, but as a hidden
+/// tab"). Multiple bindings render the first as above plus a compact
+/// `+N` overflow marker for the rest, since a longer list would
+/// overflow the column anyway.
+fn attached_column(server: &ServerPaneInfo) -> String {
+    let bindings = &server.attached_to;
+    let Some(first) = bindings.first() else {
+        return "-".to_string();
+    };
+    let bg_marker = if first.active { "" } else { "+" };
+    let head = format!(
+        "{}/{}{}",
+        first.workspace_number, first.client_short_id, bg_marker
+    );
+    if bindings.len() == 1 {
+        head
+    } else {
+        format!("{head} +{}", bindings.len() - 1)
     }
 }
 
@@ -752,6 +785,7 @@ fn attach_menu_line(
         .as_ref()
         .map_or("-", |f| f.process_name.as_str());
     let tag = session_tag(server);
+    let attached = attached_column(server);
     let marker = if selected { ">" } else { " " };
     // Marks the row this client-pane was bound to right before this
     // menu opened (see `AttachMenu.previously_bound`'s doc comment) --
@@ -762,12 +796,14 @@ fn attach_menu_line(
 
     if let Some(rename) = renaming {
         let text = format!(
-            "  {just_detached_marker}{marker} [{}] {:<tag_w$} {:<process_w$} {} {}",
+            "  {just_detached_marker}{marker} [{}] {:<attached_w$} {:<tag_w$} {:<process_w$} {} {}",
             rename.text,
+            truncate_end(&attached, ATTACHED_COL_WIDTH),
             tag,
             truncate_end(process, PROCESS_COL_WIDTH),
             server.short_id,
             status,
+            attached_w = ATTACHED_COL_WIDTH,
             tag_w = TAG_COL_WIDTH,
             process_w = PROCESS_COL_WIDTH,
         );
@@ -779,8 +815,9 @@ fn attach_menu_line(
         .clone()
         .unwrap_or_else(|| server.short_id.clone());
     let text = format!(
-        "  {just_detached_marker}{marker} {:<name_w$} {:<tag_w$} {:<process_w$} {} {}{}",
+        "  {just_detached_marker}{marker} {:<name_w$} {:<attached_w$} {:<tag_w$} {:<process_w$} {} {}{}",
         truncate_end(&name, NAME_COL_WIDTH),
+        truncate_end(&attached, ATTACHED_COL_WIDTH),
         tag,
         truncate_end(process, PROCESS_COL_WIDTH),
         server.short_id,
@@ -791,6 +828,7 @@ fn attach_menu_line(
             ""
         },
         name_w = NAME_COL_WIDTH,
+        attached_w = ATTACHED_COL_WIDTH,
         tag_w = TAG_COL_WIDTH,
         process_w = PROCESS_COL_WIDTH,
     );
@@ -1317,6 +1355,7 @@ mod tests {
                 foreground: None,
                 owner_workspace: None,
                 short_id: "aa".to_string(),
+                attached_to: Vec::new(),
             },
         );
         let backend = TestBackend::new(40, 6);
@@ -1357,6 +1396,7 @@ mod tests {
                 foreground: None,
                 owner_workspace: None,
                 short_id: "aa".to_string(),
+                attached_to: Vec::new(),
             },
         );
         names.insert(
@@ -1369,6 +1409,7 @@ mod tests {
                 foreground: None,
                 owner_workspace: None,
                 short_id: "ab".to_string(),
+                attached_to: Vec::new(),
             },
         );
         let tree = SplitTree::Split {
@@ -1654,6 +1695,7 @@ mod tests {
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let servers = vec![("/home/dev/project".to_string(), server)];
         let menu = super::super::AttachMenu {
@@ -1695,6 +1737,7 @@ mod tests {
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         assert_eq!(session_tag(&server), "[claude]");
 
@@ -1723,6 +1766,7 @@ mod tests {
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let servers = vec![("/home/dev/project".to_string(), server)];
         let menu = super::super::AttachMenu {
@@ -1757,6 +1801,7 @@ mod tests {
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let servers = vec![("/home/dev".to_string(), server)];
         let menu = super::super::AttachMenu {
@@ -1775,6 +1820,123 @@ mod tests {
             .unwrap();
         assert!(buffer_contains(&terminal, "plain-shell"));
         assert!(!buffer_contains(&terminal, "["));
+    }
+
+    #[test]
+    fn attached_column_renders_dash_for_no_bindings() {
+        let server = ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: None,
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+            foreground: None,
+            owner_workspace: None,
+            short_id: "aa".to_string(),
+            attached_to: Vec::new(),
+        };
+        assert_eq!(super::attached_column(&server), "-");
+    }
+
+    #[test]
+    fn attached_column_renders_active_binding() {
+        let server = ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: None,
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+            foreground: None,
+            owner_workspace: None,
+            short_id: "aa".to_string(),
+            attached_to: vec![crate::protocol::AttachedBinding {
+                workspace_number: 1,
+                client_short_id: "aa".to_string(),
+                active: true,
+            }],
+        };
+        assert_eq!(super::attached_column(&server), "1/aa");
+    }
+
+    #[test]
+    fn attached_column_marks_background_tab_with_plus() {
+        let server = ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: None,
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+            foreground: None,
+            owner_workspace: None,
+            short_id: "aa".to_string(),
+            attached_to: vec![crate::protocol::AttachedBinding {
+                workspace_number: 2,
+                client_short_id: "ab".to_string(),
+                active: false,
+            }],
+        };
+        assert_eq!(super::attached_column(&server), "2/ab+");
+    }
+
+    #[test]
+    fn attached_column_shows_overflow_count_for_multiple_bindings() {
+        let server = ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: None,
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+            foreground: None,
+            owner_workspace: None,
+            short_id: "aa".to_string(),
+            attached_to: vec![
+                crate::protocol::AttachedBinding {
+                    workspace_number: 1,
+                    client_short_id: "aa".to_string(),
+                    active: true,
+                },
+                crate::protocol::AttachedBinding {
+                    workspace_number: 2,
+                    client_short_id: "ab".to_string(),
+                    active: false,
+                },
+                crate::protocol::AttachedBinding {
+                    workspace_number: 3,
+                    client_short_id: "ac".to_string(),
+                    active: false,
+                },
+            ],
+        };
+        assert_eq!(super::attached_column(&server), "1/aa +2");
+    }
+
+    #[test]
+    fn draw_attach_menu_shows_the_attached_column() {
+        let server = ServerPaneInfo {
+            id: Uuid::new_v4(),
+            name: Some("attached-session".to_string()),
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+            foreground: None,
+            owner_workspace: None,
+            short_id: "aa".to_string(),
+            attached_to: vec![crate::protocol::AttachedBinding {
+                workspace_number: 1,
+                client_short_id: "aa".to_string(),
+                active: true,
+            }],
+        };
+        let menu = super::super::AttachMenu {
+            servers: vec![("Unknown".to_string(), server)],
+            selected: 0,
+            pending_delete: None,
+            rename: None,
+            previously_bound: None,
+            spawn_in_group: None,
+            adding_tab: false,
+        };
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), true, None, &[]))
+            .unwrap();
+        assert!(buffer_contains(&terminal, "1/aa"));
     }
 
     #[test]
@@ -1828,6 +1990,7 @@ mod tests {
             foreground: None,
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let selected_id = server.id;
         // Row 0 is the "Unknown" group header; row 1 is the server row.
@@ -1864,6 +2027,7 @@ mod tests {
             foreground: None,
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         // Row 0 is the "Unknown" group header; row 1 is the server row
         // -- selecting the server row itself is what makes this a real
@@ -1919,6 +2083,7 @@ mod tests {
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let server_id = server.id;
         let menu = super::super::AttachMenu {
@@ -1963,6 +2128,7 @@ mod tests {
             foreground: None,
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let server_id = server.id;
         let menu = super::super::AttachMenu {
@@ -2008,6 +2174,7 @@ mod tests {
             foreground: None,
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let selected_id = server.id;
         let menu = super::super::AttachMenu {
@@ -2072,6 +2239,7 @@ mod tests {
             foreground: None,
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let servers = vec![("Unknown".to_string(), server)];
         let menu = super::super::AttachMenu {
@@ -2132,6 +2300,7 @@ mod tests {
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let b = ServerPaneInfo {
             id: Uuid::new_v4(),
@@ -2145,6 +2314,7 @@ mod tests {
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let servers = vec![
             ("/home/dev/api".to_string(), a),
@@ -2187,6 +2357,7 @@ mod tests {
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let dead = ServerPaneInfo {
             id: Uuid::new_v4(),
@@ -2196,6 +2367,7 @@ mod tests {
             foreground: None,
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let servers = vec![
             ("/home/dev/api".to_string(), a),
@@ -2233,6 +2405,7 @@ mod tests {
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let b = ServerPaneInfo {
             id: Uuid::new_v4(),
@@ -2246,6 +2419,7 @@ mod tests {
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let servers = vec![
             ("/home/dev/api".to_string(), a),
@@ -2293,6 +2467,7 @@ mod tests {
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let menu = super::super::AttachMenu {
             servers: vec![("/home/dev/api".to_string(), a)],
@@ -2341,6 +2516,7 @@ mod tests {
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let menu = super::super::AttachMenu {
             servers: vec![("/home/dev/api".to_string(), a)],
@@ -2384,6 +2560,7 @@ mod tests {
             foreground: None,
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let menu = super::super::AttachMenu {
             servers: vec![("Unknown".to_string(), server)],
@@ -2394,10 +2571,10 @@ mod tests {
             spawn_in_group: None,
             adding_tab: false,
         };
-        // Wide enough that the row (now with the tag column) plus the
-        // delete-confirm suffix both fit within the popup's 85%-width
-        // interior without truncating.
-        let backend = TestBackend::new(120, 30);
+        // Wide enough that the row (now with tag + attached columns)
+        // plus the delete-confirm suffix all fit within the popup's
+        // 85%-width interior without truncating.
+        let backend = TestBackend::new(140, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), true, None, &[]))
@@ -2417,6 +2594,7 @@ mod tests {
             foreground: None,
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let server_b = ServerPaneInfo {
             id: other,
@@ -2426,6 +2604,7 @@ mod tests {
             foreground: None,
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let menu = super::super::AttachMenu {
             servers: vec![
@@ -2466,6 +2645,7 @@ mod tests {
             foreground: None,
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let menu = super::super::AttachMenu {
             servers: vec![("Unknown".to_string(), server)],
@@ -2498,6 +2678,7 @@ mod tests {
             foreground: None,
             owner_workspace: None,
             short_id: "aa".to_string(),
+            attached_to: Vec::new(),
         };
         let menu = super::super::AttachMenu {
             servers: vec![("Unknown".to_string(), server)],
