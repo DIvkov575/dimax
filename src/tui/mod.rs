@@ -2916,15 +2916,56 @@ pub async fn run() -> anyhow::Result<()> {
                     // this connection -- a protocol-level surprise, not a
                     // reason to crash the frontend.
                     Ok(ServerMessage::Response(_)) => {}
-                    // Connection lost -- nothing further to drive the UI
-                    // with.
-                    Err(_) => break,
+                    // Connection lost -- most likely a hot reload on the
+                    // daemon side (see `daemon::mod`'s "Hot reload"
+                    // module doc): the accepted-connection fd this
+                    // socket was using doesn't survive the daemon's
+                    // `execve` even though every server-pane does, so
+                    // every attached client sees exactly this. Reconnect
+                    // and re-bootstrap rather than dying -- a real,
+                    // unrecoverable daemon loss surfaces as an `Err`
+                    // from `reconnect` itself (its own last-resort
+                    // fallback already auto-spawns a fresh daemon if
+                    // nothing answers at all).
+                    Err(_) => {
+                        let (new_write_half, new_reader) = reconnect().await?;
+                        write_half = new_write_half;
+                        reader = new_reader;
+                        app = App::bootstrap(&mut write_half, &mut reader, "1").await?;
+                        continue;
+                    }
                 }
             }
         }
     }
 
     Ok(())
+}
+
+/// After the connection drops unexpectedly, reconnect and split a fresh
+/// pair of halves -- see `run`'s `reader.next()` error arm for the one
+/// caller and why this exists (module doc reference: `daemon::mod`'s
+/// "Hot reload"). Retries a bare connect a few times first (100ms
+/// apart, 2s total) rather than going straight to `Client::connect`'s
+/// auto-spawn-if-unreachable fallback: a hot reload's gap between the
+/// old process's `execve` and the new one finishing its listener rewrap
+/// is milliseconds, and spawning a *second* daemon because this raced a
+/// still-in-progress reload would be actively wrong. Only falls back to
+/// `Client::connect` (which auto-spawns) once those retries are
+/// exhausted -- covering the genuine "the daemon actually died" case,
+/// same recovery a fresh `dimax attach` would get today.
+async fn reconnect() -> anyhow::Result<(OwnedWriteHalf, FrameReader)> {
+    let path = crate::protocol::socket_path();
+    for _ in 0..20 {
+        if let Ok(stream) = tokio::net::UnixStream::connect(&path).await {
+            let (read_half, write_half) = stream.into_split();
+            return Ok((write_half, FrameReader::spawn(read_half)));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let client = Client::connect().await?;
+    let (read_half, write_half) = client.into_split();
+    Ok((write_half, FrameReader::spawn(read_half)))
 }
 
 #[cfg(test)]

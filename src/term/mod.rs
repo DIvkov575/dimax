@@ -12,6 +12,7 @@
 //!   block on I/O) except `write_input`, which does a non-blocking PTY
 //!   write.
 
+mod inherited;
 pub mod session_name;
 
 use crate::protocol::{
@@ -150,6 +151,62 @@ impl ServerPane {
         // would never observe `Died`.
         drop(slave);
 
+        Self::from_parts(
+            id,
+            name,
+            size,
+            events,
+            owner_workspace,
+            short_id,
+            master,
+            child,
+        )
+    }
+
+    /// Reconstruct a `ServerPane` around a PTY master fd + child pid that
+    /// already existed before this process started -- the other side of
+    /// a hot reload's `execve` (see `term::inherited`'s module doc and
+    /// `daemon::mod`'s "Hot reload" doc). Everything from here on is
+    /// identical to a freshly `spawn`ed pane: a new reader thread, a new
+    /// `wezterm_term::Terminal`, the same `Inner`/`Self` shape -- only
+    /// *how* `master`/`child` were obtained differs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_inherited(
+        id: ServerPaneId,
+        name: Option<String>,
+        size: Size,
+        events: UnboundedSender<ServerPaneEvent>,
+        owner_workspace: Option<WorkspaceId>,
+        short_id: String,
+        fd: RawFd,
+        pid: u32,
+    ) -> anyhow::Result<Self> {
+        let master: Box<dyn MasterPty + Send> =
+            Box::new(unsafe { inherited::InheritedMasterPty::new(fd) });
+        let child: Box<dyn Child + Send + Sync> = Box::new(inherited::InheritedChild::new(pid));
+        Self::from_parts(
+            id,
+            name,
+            size,
+            events,
+            owner_workspace,
+            short_id,
+            master,
+            child,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts(
+        id: ServerPaneId,
+        name: Option<String>,
+        size: Size,
+        events: UnboundedSender<ServerPaneEvent>,
+        owner_workspace: Option<WorkspaceId>,
+        short_id: String,
+        master: Box<dyn MasterPty + Send>,
+        child: Box<dyn Child + Send + Sync>,
+    ) -> anyhow::Result<Self> {
         let writer = SharedWriter(Arc::new(Mutex::new(master.take_writer()?)));
         let terminal = Terminal::new(
             TerminalSize {
@@ -307,6 +364,19 @@ impl ServerPane {
 
     pub fn size(&self) -> Size {
         self.inner.lock().unwrap().size
+    }
+
+    /// This pane's PTY master fd + its shell's pid -- the two pieces a
+    /// hot reload needs to carry across `execve` so `from_inherited` can
+    /// rebuild an equivalent `ServerPane` in the new process image
+    /// without killing the shell (see `daemon::mod`'s "Hot reload"
+    /// module doc). `None` for either only if the underlying
+    /// `MasterPty`/`Child` impl doesn't expose it, which never happens
+    /// for either `ServerPane::spawn`'s or `from_inherited`'s own
+    /// backing types.
+    pub fn reload_handle(&self) -> (Option<RawFd>, Option<u32>) {
+        let guard = self.inner.lock().unwrap();
+        (guard.master.as_raw_fd(), guard.child.process_id())
     }
 
     /// Rows of actual history available to scroll back into (excludes

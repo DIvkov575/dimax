@@ -6,8 +6,16 @@ async fn main() -> anyhow::Result<()> {
     let cli = Args::parse().command.unwrap_or(Cli::Attach);
     match cli {
         Cli::Attach => dimax::tui::run().await,
-        Cli::Daemon => {
-            let daemon = dimax::daemon::run(dimax::protocol::socket_path()).await?;
+        Cli::Daemon {
+            cmd: None,
+            resume_from,
+        } => {
+            let daemon = match resume_from {
+                Some(path) => {
+                    dimax::daemon::run_resumed(dimax::protocol::socket_path(), path).await?
+                }
+                None => dimax::daemon::run(dimax::protocol::socket_path()).await?,
+            };
             let _ = daemon;
             std::future::pending::<()>().await;
             Ok(())

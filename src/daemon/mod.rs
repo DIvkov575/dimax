@@ -12,6 +12,56 @@
 //! daemon state. Every request handler locks it for the duration of one
 //! request; this is fine at the pane counts dimax targets (see design doc
 //! non-goals) and keeps the logic in `state` free of async concerns.
+//!
+//! # Hot reload
+//!
+//! `Request::DaemonReload` (`dimax daemon reload`) upgrades the running
+//! daemon onto a freshly built binary *without* killing any server-pane
+//! -- normal `pkill`-and-respawn kills every PTY the old process owned,
+//! since a PTY master fd (and the shell's controlling-terminal
+//! relationship to it) dies with the process holding it. Instead:
+//!
+//! 1. `dispatch`'s `DaemonReload` arm snapshots `State` via
+//!    `state::State::to_resume` (every server-pane's metadata plus its
+//!    PTY master's raw fd and its shell's pid -- see that method's doc
+//!    comment for what's deliberately excluded) and writes it to a temp
+//!    file next to the socket.
+//! 2. It clears `FD_CLOEXEC` on every one of those PTY master fds, and
+//!    on the listening socket's fd -- both would otherwise be closed by
+//!    the kernel the instant `execve` runs, which is what makes a
+//!    normal restart kill everything.
+//! 3. It records the resume-file path on the shared `ReloadHandle`
+//!    rather than exec'ing immediately, and returns `Response::Ack`.
+//! 4. `handle_connection`'s loop writes that `Ack` frame to the
+//!    socket -- *then*, and only then, checks `ReloadHandle` and calls
+//!    `perform_reexec`. `execve` (via `std::process::Command::exec`)
+//!    replaces this process's image in place, keeping its pid and every
+//!    fd that survived step 2. On success it never returns; a failure
+//!    (e.g. the binary vanished) is logged and this loop just keeps
+//!    running the old code -- there's no way to tell the already-Ack'd
+//!    caller after the fact, so `Request::DaemonReload`'s doc comment
+//!    says as much.
+//! 5. The new process image starts at `main` again, this time with
+//!    `--resume-from <path>`: `run_resumed` reads the file back,
+//!    rebuilds `State` via `state::State::from_resume` (which
+//!    reconstructs each server-pane around its *already-open* PTY
+//!    master fd via `term::ServerPane::from_inherited`, instead of
+//!    spawning fresh), and re-wraps the inherited listener fd as a
+//!    `tokio::net::UnixListener` instead of binding a new one.
+//!
+//! Residual risk, not eliminated by the above: if the new binary panics
+//! very early in `run_resumed` -- before it finishes re-wrapping the
+//! inherited fds as owned resources -- the process exits and closes
+//! every fd, killing the PTYs this was trying to protect. There's no
+//! practical way to fully eliminate that for a personal tool without a
+//! much larger validate-before-committing mechanism (spawning the
+//! candidate binary as a real subprocess first to prove it can at least
+//! parse the resume file); accepted as-is for v1.
+//!
+//! Connections themselves are *not* inherited (only the listening
+//! socket fd is) -- each already-connected client's accepted-socket fd
+//! is left behind, so every `dimax attach` sees its connection drop and
+//! must reconnect (see `tui::mod`'s reconnect loop).
 
 pub mod pinned_dirs;
 pub mod state;
@@ -22,6 +72,8 @@ use crate::protocol::{
 use crate::term::ServerPaneEvent;
 use state::{CloseTabResult, State, SubscriberId};
 use std::collections::HashMap;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
@@ -56,16 +108,63 @@ pub struct Daemon {
 /// with a temp path.
 pub async fn run(socket_path: std::path::PathBuf) -> anyhow::Result<Daemon> {
     let listener = bind_socket(&socket_path).await?;
+    start(State::new(), listener, socket_path)
+}
+
+/// The other side of a hot reload's `execve` (module doc "Hot reload"):
+/// rebuild `State` from the snapshot `resume_path` points to, instead of
+/// starting fresh, and re-wrap the listener fd that snapshot recorded
+/// (inherited across the exec, still open, still bound) instead of
+/// binding a new one -- `bind_socket`'s stale-file detection would
+/// otherwise see this same daemon's own still-live socket file and
+/// (correctly, for the normal case) refuse to touch it.
+///
+/// # Safety
+/// `resume_path`'s `listener_fd` must be a valid, still-open,
+/// non-blocking-compatible listening Unix socket fd this process
+/// inherited -- true for any file produced by `prepare_reload` and
+/// carried across `execve` before this ever runs, never otherwise.
+pub async fn run_resumed(
+    socket_path: std::path::PathBuf,
+    resume_path: std::path::PathBuf,
+) -> anyhow::Result<Daemon> {
+    let bytes = std::fs::read(&resume_path)
+        .map_err(|e| anyhow::anyhow!("reading resume state {resume_path:?}: {e}"))?;
+    let file: ReloadFile = serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow::anyhow!("parsing resume state {resume_path:?}: {e}"))?;
+    let _ = std::fs::remove_file(&resume_path);
+    let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(file.listener_fd) };
+    std_listener.set_nonblocking(true)?;
+    let listener = UnixListener::from_std(std_listener)?;
+    let state = State::from_resume(file.state)?;
+    start(state, listener, socket_path)
+}
+
+/// Shared tail of [`run`]/[`run_resumed`]: install the signal handler,
+/// spin up the grid-broadcast and accept-loop tasks. `state` is either
+/// freshly constructed or rebuilt from a resume snapshot; `listener` is
+/// either freshly bound or an inherited fd re-wrapped -- identical from
+/// here on either way.
+fn start(
+    mut inner_state: State,
+    listener: UnixListener,
+    socket_path: std::path::PathBuf,
+) -> anyhow::Result<Daemon> {
     spawn_cleanup_on_signal(socket_path.clone())?;
-    let mut inner_state = State::new();
     // Claim the pane-event stream exactly once, right here at start-up
     // (module doc / `state::State::take_pane_events` doc comment) — this
     // is the *only* caller, so `expect` is warranted: a `None` here would
     // mean this function ran twice against the same `State`, which can't
-    // happen since `State::new()` is constructed fresh above.
+    // happen since `State::new()`/`State::from_resume` are constructed
+    // fresh above.
     let mut pane_events = inner_state
         .take_pane_events()
         .expect("freshly constructed State always has its pane-event receiver available");
+    let reload = Arc::new(ReloadHandle {
+        socket_path: socket_path.clone(),
+        listener_fd: listener.as_raw_fd(),
+        pending: Mutex::new(None),
+    });
     let state = Arc::new(Mutex::new(inner_state));
     let registry: SubscriberRegistry = Arc::new(Mutex::new(HashMap::new()));
     let next_subscriber_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -106,8 +205,9 @@ pub async fn run(socket_path: std::path::PathBuf) -> anyhow::Result<Daemon> {
                 Ok((stream, _addr)) => {
                     let state = state.clone();
                     let registry = registry.clone();
+                    let reload = reload.clone();
                     let id = next_subscriber_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    tokio::spawn(handle_connection(stream, state, registry, id));
+                    tokio::spawn(handle_connection(stream, state, registry, reload, id));
                 }
                 Err(err) => {
                     tracing_lite_log(&format!("accept error on {path_for_task:?}: {err}"));
@@ -117,6 +217,108 @@ pub async fn run(socket_path: std::path::PathBuf) -> anyhow::Result<Daemon> {
     });
 
     Ok(Daemon { socket_path })
+}
+
+/// Process-wide handle for triggering a hot reload (module doc "Hot
+/// reload") -- one instance per `start` call, cloned into every
+/// connection so any connection's `DaemonReload` request can arrange
+/// the re-exec. `pending` is `Some` for the brief window between
+/// `dispatch` preparing a reload and `handle_connection`'s loop actually
+/// performing it, right after writing that request's `Ack` response --
+/// see both call sites' doc comments for why the ordering matters.
+struct ReloadHandle {
+    socket_path: PathBuf,
+    listener_fd: RawFd,
+    pending: Mutex<Option<PathBuf>>,
+}
+
+/// Everything `run_resumed` needs besides what's already inside
+/// `state::ResumeState` -- just the listening socket's fd, which lives
+/// at the daemon-process level (`start`'s `listener` parameter), not
+/// inside `State` itself. Serialized to a temp file next to the socket,
+/// read back on the other side of the exec that carries it across (fd
+/// *numbers* are stable across `execve` for anything that survives
+/// `FD_CLOEXEC` -- see `prepare_reload`).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReloadFile {
+    listener_fd: RawFd,
+    state: state::ResumeState,
+}
+
+fn resume_file_path(socket_path: &Path) -> PathBuf {
+    let mut path = socket_path.as_os_str().to_owned();
+    path.push(".resume.json");
+    PathBuf::from(path)
+}
+
+/// Clear `FD_CLOEXEC` on `fd` so it survives the `execve` in
+/// `perform_reexec` -- everything the kernel would otherwise close the
+/// instant the new process image starts. See module doc "Hot reload"
+/// step 2.
+fn clear_cloexec(fd: RawFd) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Snapshot `state`, clear `FD_CLOEXEC` on every fd that must survive
+/// the exec, and write the resume file -- everything `DaemonReload`'s
+/// handler needs to do *before* responding, so the response write and
+/// the actual `execve` (in `handle_connection`'s loop, after that write
+/// succeeds) can stay decoupled from each other. Returns the resume
+/// file's path on success.
+async fn prepare_reload(
+    state: &Arc<Mutex<State>>,
+    reload: &ReloadHandle,
+) -> anyhow::Result<PathBuf> {
+    let resume = state.lock().await.to_resume();
+    for fd in resume.pty_fds() {
+        clear_cloexec(fd)
+            .map_err(|e| anyhow::anyhow!("clearing FD_CLOEXEC on pty fd {fd}: {e}"))?;
+    }
+    clear_cloexec(reload.listener_fd).map_err(|e| {
+        anyhow::anyhow!(
+            "clearing FD_CLOEXEC on listener fd {}: {e}",
+            reload.listener_fd
+        )
+    })?;
+    let path = resume_file_path(&reload.socket_path);
+    let file = ReloadFile {
+        listener_fd: reload.listener_fd,
+        state: resume,
+    };
+    let json = serde_json::to_vec(&file)?;
+    std::fs::write(&path, json)?;
+    Ok(path)
+}
+
+/// Replace this process's own image with a fresh invocation of the same
+/// binary, `--resume-from resume_path` -- see module doc "Hot reload"
+/// step 4. Only ever called from `handle_connection`'s loop, and only
+/// *after* that loop has already written the `Ack` response for the
+/// `DaemonReload` request that produced `resume_path` -- `execve`
+/// succeeding means this process never executes another line of Rust
+/// code, so anything that needs to happen for that request has to
+/// happen before this call, not after. On success, never returns.
+/// Failure (this process survives, still running the old code) is
+/// returned rather than panicked on -- e.g. the binary disappearing
+/// between build and reload is a plausible, recoverable-by-just-trying-
+/// again failure, not a reason to take the whole daemon down.
+fn perform_reexec(resume_path: &Path) -> std::io::Error {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => return e,
+    };
+    std::process::Command::new(exe)
+        .arg("daemon")
+        .arg("--resume-from")
+        .arg(resume_path)
+        .exec()
 }
 
 /// Bind `socket_path`, first clearing out a stale leftover socket file if
@@ -175,11 +377,10 @@ fn spawn_cleanup_on_signal(socket_path: PathBuf) -> anyhow::Result<()> {
 /// reparented to init (or the nearest subreaper) once this process exits
 /// — it never depended on this process's session/job-control the way a
 /// shell-launched background job would — so a real double-fork buys
-/// nothing extra here and would need a new dependency (`libc`/`nix`) this
-/// crate doesn't have budget for. Known limitation: unlike a true
-/// double-fork, the child stays in this process's process group until it
-/// exits, so a signal sent to the whole group (e.g. a shell's Ctrl-C to
-/// its foreground job) could reach the daemon too; acceptable for v1.
+/// nothing extra here. Known limitation: unlike a true double-fork, the
+/// child stays in this process's process group until it exits, so a
+/// signal sent to the whole group (e.g. a shell's Ctrl-C to its
+/// foreground job) could reach the daemon too; acceptable for v1.
 pub fn ensure_running(socket_path: &std::path::Path) -> anyhow::Result<()> {
     use std::process::Stdio;
 
@@ -209,6 +410,7 @@ async fn handle_connection(
     stream: tokio::net::UnixStream,
     state: Arc<Mutex<State>>,
     registry: SubscriberRegistry,
+    reload: Arc<ReloadHandle>,
     subscriber_id: SubscriberId,
 ) {
     let (mut reader, writer) = stream.into_split();
@@ -243,18 +445,31 @@ async fn handle_connection(
         let response = dispatch(
             &state,
             &registry,
+            &reload,
             subscriber_id,
             &mut subscribed_workspace,
             request,
         )
         .await;
-        if protocol::framing::write_frame(
+        let write_ok = protocol::framing::write_frame(
             &mut *writer.lock().await,
             &ServerMessage::Response(response),
         )
         .await
-        .is_err()
-        {
+        .is_ok();
+        // Only *after* the Ack this reload's request produced has
+        // actually been written -- see `perform_reexec`'s doc comment
+        // for why the ordering is load-bearing, not stylistic. A failed
+        // write doesn't skip the reload attempt: the requesting
+        // connection may be the one that's gone, not the daemon, and
+        // every other connection still deserves the upgrade.
+        if let Some(resume_path) = reload.pending.lock().await.take() {
+            let err = perform_reexec(&resume_path);
+            tracing_lite_log(&format!(
+                "hot reload exec failed, staying on current code: {err}"
+            ));
+        }
+        if !write_ok {
             break;
         }
     }
@@ -277,12 +492,27 @@ async fn handle_connection(
 async fn dispatch(
     state: &Arc<Mutex<State>>,
     registry: &SubscriberRegistry,
+    reload: &Arc<ReloadHandle>,
     subscriber_id: SubscriberId,
     subscribed_workspace: &mut Option<protocol::WorkspaceId>,
     request: Request,
 ) -> Response {
     let _ = subscriber_id;
     match request {
+        // See module doc "Hot reload" and `perform_reexec`'s doc comment:
+        // this only *prepares* the reload (snapshot + FD_CLOEXEC clearing
+        // + resume file) and records where to find it -- the actual
+        // execve happens in `handle_connection`'s loop, strictly after
+        // this `Ack` has been written to the socket.
+        Request::DaemonReload => match prepare_reload(state, reload).await {
+            Ok(path) => {
+                *reload.pending.lock().await = Some(path);
+                Response::Ack
+            }
+            Err(e) => Response::Error {
+                message: format!("preparing hot reload: {e}"),
+            },
+        },
         Request::ServerSpawn {
             name,
             cmd,
