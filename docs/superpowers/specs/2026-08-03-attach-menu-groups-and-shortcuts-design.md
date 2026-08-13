@@ -29,7 +29,7 @@ pick — or now manage — a server-pane), exactly as today.
 - No "clear name back to id fallback" affordance for rename — submitting
   an empty name is a no-op.
 - No undo for delete beyond the arm/confirm step itself.
-- No change to `dimux server ls`'s CLI output — grouping/delete/rename
+- No change to `dimax server ls`'s CLI output — grouping/delete/rename
   from this spec are TUI-menu-only. (`ServerKill`/`ServerRename` already
   exist as CLI commands and daemon requests; this spec wires the
   existing menu to call them, not adds new daemon behavior.)
@@ -210,5 +210,5 @@ dialogue (grouping style, menu scope, delete confirmation, rename
 editing capability, no-cwd bucket, post-delete menu behavior all
 explicitly decided). One deliberate product call worth flagging in the
 PR description: dropping the per-row `cwd` column is scoped entirely to
-the TUI attach menu's `draw_attach_menu` — `dimux server ls`'s CLI
+the TUI attach menu's `draw_attach_menu` — `dimax server ls`'s CLI
 output is untouched (see Non-goals).

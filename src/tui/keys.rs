@@ -1,15 +1,14 @@
 //! Parses raw input bytes into [`super::Action`]s.
 //!
-//! Two input sources feed this: normal keystrokes (passed through to the
-//! focused pane) and Kitty-forwarded Cmd-chords, which arrive as custom
-//! escape sequences configured via `kitty.conf` `map ... send_text`
-//! (design doc "Default keybinds (TUI)" — exact sequences documented in
-//! the setup docs this module's implementer should also write).
+//! Three input sources feed this: normal keystrokes (passed through to the
+//! focused pane), portable Ctrl-Space prefix sequences, and optional
+//! Kitty-forwarded Cmd chords. [`BINDINGS`] is the shared source of truth
+//! for parsing, generated Kitty config, CLI help, and custom-alias actions.
 //!
 //! # Chord encoding
 //!
 //! There is no pre-existing "Cmd chord to escape sequence" standard to
-//! match, so this module defines its own. Every dimux chord is encoded as
+//! match, so this module defines its own. Every dimax chord is encoded as
 //! an APC-style private escape sequence:
 //!
 //! ```text
@@ -21,12 +20,10 @@
 //!   string — a control sequence real terminal programs essentially never
 //!   emit on their own, and Kitty never generates from normal keyboard
 //!   input. Using it as a private prefix means we will never misinterpret
-//!   an ordinary keystroke or a program's own output as a dimux chord.
-//! - `D` identifies this APC string as a "dimux chord" (as opposed to some
+//!   an ordinary keystroke or a program's own output as a dimax chord.
+//! - `D` identifies this APC string as a "dimax chord" (as opposed to some
 //!   other private APC use some other tool might pick).
-//! - `<tag>` is one or more ASCII bytes identifying which chord: a decimal
-//!   digit `'1'..='9'` for workspace switches, or a single letter for the
-//!   named chords below.
+//! - `<tag>` is one or more ASCII bytes identifying which chord.
 //! - `ESC \` (`0x1B 0x5C`, the standard "String Terminator", `ST`)
 //!   terminates the APC string.
 //!
@@ -62,10 +59,10 @@
 //! the shift relationship: `cmd-shift-d` uses the uppercase of `cmd-d`'s
 //! tag, etc. — easy to eyeball in a `kitty.conf` diff.)
 //!
-//! Anything that does not match this exact prefix/tag/terminator shape
-//! (including a bare `ESC`, plain text, or an unrecognized tag) resolves
-//! to [`Action::PassThrough`], so the caller forwards the original bytes
-//! to the focused server-pane untouched.
+//! Anything that does not match an enabled input layer resolves to
+//! [`ParsedInput::PassThrough`], so the caller forwards it to the focused
+//! server-pane. Portable parsing is stateful so a prefix and its following
+//! key can arrive in separate terminal reads.
 //!
 //! `shift-enter` is the one entry in this table with no [`Chord`]/
 //! [`Action`] variant of its own: plain Enter and Shift+Enter are
@@ -78,76 +75,532 @@
 //! via the [`SHIFT_ENTER_CHORD`] constant below.
 
 use super::Action;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 /// APC opener: `ESC _ D`.
 const PREFIX: &[u8] = b"\x1b_D";
 /// String terminator: `ESC \`.
 const TERMINATOR: &[u8] = b"\x1b\\";
+/// Portable prefix emitted by Ctrl-Space in conventional terminal modes.
+pub const PORTABLE_PREFIX: u8 = 0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum BindingMode {
+    Portable,
+    Kitty,
+    Both,
+}
+
+impl Default for BindingMode {
+    fn default() -> Self {
+        Self::Portable
+    }
+}
+
+impl BindingMode {
+    pub fn portable_enabled(self) -> bool {
+        matches!(self, Self::Portable | Self::Both)
+    }
+
+    pub fn kitty_enabled(self) -> bool {
+        matches!(self, Self::Kitty | Self::Both)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct KeybindingConfig {
+    version: u8,
+    mode: BindingMode,
+    #[serde(default)]
+    bindings: BTreeMap<String, String>,
+    #[serde(default)]
+    kitty_bindings: BTreeMap<String, String>,
+    /// Whether the one-time first-run wizard (keybinding mode + Claude
+    /// skill install, shown on `dimax attach`) has already run against
+    /// this config file. `#[serde(default)]` means an existing
+    /// `keybindings.json` predating this field reads back as `false` --
+    /// so upgrading users see the wizard once too, which is acceptable
+    /// (Esc/defaults make it a two-second skip) and avoids a separate
+    /// migration.
+    #[serde(default)]
+    first_run_seen: bool,
+}
+
+impl Default for KeybindingConfig {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            mode: BindingMode::default(),
+            bindings: BTreeMap::new(),
+            kitty_bindings: BTreeMap::new(),
+            first_run_seen: false,
+        }
+    }
+}
+
+fn config_path() -> anyhow::Result<PathBuf> {
+    let base = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(path) => PathBuf::from(path),
+        None => PathBuf::from(
+            std::env::var_os("HOME")
+                .ok_or_else(|| anyhow::anyhow!("cannot locate config directory: HOME is unset"))?,
+        )
+        .join(".config"),
+    };
+    Ok(base.join("dimax").join("keybindings.json"))
+}
+
+fn load_config() -> KeybindingConfig {
+    let Ok(path) = config_path() else {
+        return KeybindingConfig::default();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return KeybindingConfig::default();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+pub fn load_mode() -> BindingMode {
+    load_config().mode
+}
+
+pub fn save_mode(mode: BindingMode) -> anyhow::Result<PathBuf> {
+    let mut config = load_config();
+    config.mode = mode;
+    save_config(&config)
+}
+
+/// Atomically check-and-set the first-run wizard's flag, mirroring
+/// `daemon::state::consume_shell_fallback`'s pattern. Returns `true` the
+/// first time this is ever called against a given `keybindings.json`
+/// (the caller should show the wizard), `false` every time after --
+/// including when saving the flag itself fails, so a transient write
+/// error never wedges the wizard into showing on every single attach.
+pub fn consume_first_run() -> bool {
+    let mut config = load_config();
+    let available = !config.first_run_seen;
+    config.first_run_seen = true;
+    let _ = save_config(&config);
+    available
+}
+
+fn save_config(config: &KeybindingConfig) -> anyhow::Result<PathBuf> {
+    let path = config_path()?;
+    let parent = path
+        .parent()
+        .expect("keybinding config always has a parent");
+    std::fs::create_dir_all(parent)?;
+    let text = serde_json::to_string_pretty(config)?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, format!("{text}\n"))?;
+    std::fs::rename(&temporary, &path)?;
+    Ok(path)
+}
+
+pub fn action_name(action: Action) -> &'static str {
+    match action {
+        Action::SwitchWorkspace(1) => "workspace-1",
+        Action::SwitchWorkspace(2) => "workspace-2",
+        Action::SwitchWorkspace(3) => "workspace-3",
+        Action::SwitchWorkspace(4) => "workspace-4",
+        Action::SwitchWorkspace(5) => "workspace-5",
+        Action::SwitchWorkspace(6) => "workspace-6",
+        Action::SwitchWorkspace(7) => "workspace-7",
+        Action::SwitchWorkspace(8) => "workspace-8",
+        Action::SwitchWorkspace(9) => "workspace-9",
+        Action::JumpSession(1) => "session-1",
+        Action::JumpSession(2) => "session-2",
+        Action::JumpSession(3) => "session-3",
+        Action::JumpSession(4) => "session-4",
+        Action::JumpSession(5) => "session-5",
+        Action::JumpSession(6) => "session-6",
+        Action::JumpSession(7) => "session-7",
+        Action::JumpSession(8) => "session-8",
+        Action::JumpSession(9) => "session-9",
+        Action::SplitVertical => "split-vertical",
+        Action::SplitHorizontal => "split-horizontal",
+        Action::CloseFocusedPane => "close-tab",
+        Action::KillFocusedServerPane => "kill-session",
+        Action::DetachAndAttach => "choose-session",
+        Action::AddTab => "add-tab",
+        Action::CycleTabForward => "next-tab",
+        Action::CycleTabBackward => "previous-tab",
+        Action::FocusLeft => "focus-left",
+        Action::FocusRight => "focus-right",
+        Action::FocusUp => "focus-up",
+        Action::FocusDown => "focus-down",
+        Action::SwitchWorkspace(_) | Action::JumpSession(_) | Action::PassThrough => "unsupported",
+    }
+}
+
+pub fn parse_action_name(name: &str) -> Option<Action> {
+    BINDINGS
+        .iter()
+        .find(|binding| action_name(binding.action) == name)
+        .map(|binding| binding.action)
+}
+
+pub fn add_custom_binding(
+    action: &str,
+    portable: Option<&str>,
+    kitty: Option<&str>,
+) -> anyhow::Result<PathBuf> {
+    let resolved = parse_action_name(action)
+        .ok_or_else(|| anyhow::anyhow!("unknown action {action:?}; run `dimax keys list`"))?;
+    if portable.is_none() && kitty.is_none() {
+        anyhow::bail!("provide --portable, --kitty, or both");
+    }
+    let mut config = load_config();
+    if let Some(sequence) = portable {
+        if sequence.is_empty()
+            || sequence.len() > 3
+            || !sequence.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            anyhow::bail!("portable sequence must be 1-3 printable ASCII bytes");
+        }
+        if let Some(binding) = BINDINGS
+            .iter()
+            .find(|binding| binding.portable == sequence.as_bytes())
+            && binding.action != resolved
+        {
+            anyhow::bail!(
+                "portable sequence {sequence:?} is already bound to {}",
+                action_name(binding.action)
+            );
+        }
+        config
+            .bindings
+            .insert(sequence.to_string(), action.to_string());
+    }
+    if let Some(combo) = kitty {
+        if combo.is_empty() || !combo.bytes().all(|byte| byte.is_ascii_graphic()) {
+            anyhow::bail!("Kitty chord must be non-empty printable ASCII without spaces");
+        }
+        if let Some(binding) = BINDINGS.iter().find(|binding| binding.kitty == combo)
+            && binding.action != resolved
+        {
+            anyhow::bail!(
+                "Kitty chord {combo:?} is already bound to {}",
+                action_name(binding.action)
+            );
+        }
+        config
+            .kitty_bindings
+            .insert(combo.to_string(), action.to_string());
+    }
+    save_config(&config)
+}
+
+pub fn remove_custom_binding(
+    portable: Option<&str>,
+    kitty: Option<&str>,
+) -> anyhow::Result<PathBuf> {
+    if portable.is_none() && kitty.is_none() {
+        anyhow::bail!("provide --portable, --kitty, or both");
+    }
+    let mut config = load_config();
+    if let Some(sequence) = portable {
+        config.bindings.remove(sequence);
+    }
+    if let Some(combo) = kitty {
+        config.kitty_bindings.remove(combo);
+    }
+    save_config(&config)
+}
+
+pub fn reset_custom_bindings() -> anyhow::Result<PathBuf> {
+    let mut config = load_config();
+    config.bindings.clear();
+    config.kitty_bindings.clear();
+    save_config(&config)
+}
+
+pub fn custom_kitty_bindings() -> Vec<(String, Vec<u8>)> {
+    load_config()
+        .kitty_bindings
+        .into_iter()
+        .filter_map(|(combo, action)| {
+            let action = parse_action_name(&action)?;
+            let tag = BINDINGS
+                .iter()
+                .find(|binding| binding.action == action)?
+                .tag
+                .to_vec();
+            Some((combo, tag))
+        })
+        .collect()
+}
+
+pub fn render_portable_bindings() -> String {
+    let mut out = String::from("Portable prefix: Ctrl-Space\n\n");
+    for binding in BINDINGS {
+        let sequence = String::from_utf8_lossy(binding.portable);
+        out.push_str(&format!(
+            "Ctrl-Space, {sequence:<3}  {:<18}  {}\n",
+            action_name(binding.action),
+            binding.description
+        ));
+    }
+    out.push_str("Ctrl-Space, Ctrl-Space  send a literal Ctrl-Space\n");
+    out
+}
+
+pub fn render_custom_bindings() -> String {
+    let config = load_config();
+    let mut out = String::new();
+    if !config.bindings.is_empty() {
+        out.push_str("\nCustom portable aliases:\n");
+        for (sequence, action) in config.bindings {
+            out.push_str(&format!("Ctrl-Space, {sequence:<3}  {action}\n"));
+        }
+    }
+    if !config.kitty_bindings.is_empty() {
+        out.push_str("\nCustom Kitty aliases:\n");
+        for (combo, action) in config.kitty_bindings {
+            out.push_str(&format!("{combo:<20}  {action}\n"));
+        }
+    }
+    out
+}
 
 /// The `shift-enter` chord's full byte sequence -- see module doc for why
 /// this is a bare constant rather than a [`Chord`]/[`Action`] variant.
 pub const SHIFT_ENTER_CHORD: &[u8] = b"\x1b_Ds\x1b\\";
 
-/// Recognized chord tag, decoded from the byte(s) between [`PREFIX`] and
-/// [`TERMINATOR`]. Kept separate from [`Action`] so the escape-sequence
-/// grammar (single tag byte) doesn't leak into the public action type.
-enum Chord {
-    Workspace(u8),
-    SplitVertical,
-    SplitHorizontal,
-    CloseFocusedPane,
-    KillFocusedServerPane,
-    DetachAndAttach,
-    FocusLeft,
-    FocusDown,
-    FocusUp,
-    FocusRight,
-    AddTab,
-    CycleTabForward,
-    CycleTabBackward,
+#[derive(Debug, Clone, Copy)]
+pub struct Binding {
+    pub kitty: &'static str,
+    pub portable: &'static [u8],
+    pub tag: &'static [u8],
+    pub action: Action,
+    pub description: &'static str,
 }
 
-impl Chord {
-    fn from_tag(tag: u8) -> Option<Chord> {
-        match tag {
-            b'1'..=b'9' => Some(Chord::Workspace(tag - b'0')),
-            b'd' => Some(Chord::SplitVertical),
-            b'D' => Some(Chord::SplitHorizontal),
-            b'w' => Some(Chord::CloseFocusedPane),
-            b'W' => Some(Chord::KillFocusedServerPane),
-            b'Z' => Some(Chord::DetachAndAttach),
-            b'h' => Some(Chord::FocusLeft),
-            b'j' => Some(Chord::FocusDown),
-            b'k' => Some(Chord::FocusUp),
-            b'l' => Some(Chord::FocusRight),
-            b't' => Some(Chord::AddTab),
-            b']' => Some(Chord::CycleTabForward),
-            b'[' => Some(Chord::CycleTabBackward),
-            _ => None,
-        }
-    }
+pub const BINDINGS: &[Binding] = &[
+    Binding {
+        kitty: "cmd+1",
+        portable: b"1",
+        tag: b"1",
+        action: Action::SwitchWorkspace(1),
+        description: "switch to workspace 1",
+    },
+    Binding {
+        kitty: "cmd+2",
+        portable: b"2",
+        tag: b"2",
+        action: Action::SwitchWorkspace(2),
+        description: "switch to workspace 2",
+    },
+    Binding {
+        kitty: "cmd+3",
+        portable: b"3",
+        tag: b"3",
+        action: Action::SwitchWorkspace(3),
+        description: "switch to workspace 3",
+    },
+    Binding {
+        kitty: "cmd+4",
+        portable: b"4",
+        tag: b"4",
+        action: Action::SwitchWorkspace(4),
+        description: "switch to workspace 4",
+    },
+    Binding {
+        kitty: "cmd+5",
+        portable: b"5",
+        tag: b"5",
+        action: Action::SwitchWorkspace(5),
+        description: "switch to workspace 5",
+    },
+    Binding {
+        kitty: "cmd+6",
+        portable: b"6",
+        tag: b"6",
+        action: Action::SwitchWorkspace(6),
+        description: "switch to workspace 6",
+    },
+    Binding {
+        kitty: "cmd+7",
+        portable: b"7",
+        tag: b"7",
+        action: Action::SwitchWorkspace(7),
+        description: "switch to workspace 7",
+    },
+    Binding {
+        kitty: "cmd+8",
+        portable: b"8",
+        tag: b"8",
+        action: Action::SwitchWorkspace(8),
+        description: "switch to workspace 8",
+    },
+    Binding {
+        kitty: "cmd+9",
+        portable: b"9",
+        tag: b"9",
+        action: Action::SwitchWorkspace(9),
+        description: "switch to workspace 9",
+    },
+    Binding {
+        kitty: "cmd+alt+1",
+        portable: b"s1",
+        tag: b"s1",
+        action: Action::JumpSession(1),
+        description: "bind session 1",
+    },
+    Binding {
+        kitty: "cmd+alt+2",
+        portable: b"s2",
+        tag: b"s2",
+        action: Action::JumpSession(2),
+        description: "bind session 2",
+    },
+    Binding {
+        kitty: "cmd+alt+3",
+        portable: b"s3",
+        tag: b"s3",
+        action: Action::JumpSession(3),
+        description: "bind session 3",
+    },
+    Binding {
+        kitty: "cmd+alt+4",
+        portable: b"s4",
+        tag: b"s4",
+        action: Action::JumpSession(4),
+        description: "bind session 4",
+    },
+    Binding {
+        kitty: "cmd+alt+5",
+        portable: b"s5",
+        tag: b"s5",
+        action: Action::JumpSession(5),
+        description: "bind session 5",
+    },
+    Binding {
+        kitty: "cmd+alt+6",
+        portable: b"s6",
+        tag: b"s6",
+        action: Action::JumpSession(6),
+        description: "bind session 6",
+    },
+    Binding {
+        kitty: "cmd+alt+7",
+        portable: b"s7",
+        tag: b"s7",
+        action: Action::JumpSession(7),
+        description: "bind session 7",
+    },
+    Binding {
+        kitty: "cmd+alt+8",
+        portable: b"s8",
+        tag: b"s8",
+        action: Action::JumpSession(8),
+        description: "bind session 8",
+    },
+    Binding {
+        kitty: "cmd+alt+9",
+        portable: b"s9",
+        tag: b"s9",
+        action: Action::JumpSession(9),
+        description: "bind session 9",
+    },
+    Binding {
+        kitty: "cmd+d",
+        portable: b"d",
+        tag: b"d",
+        action: Action::SplitVertical,
+        description: "split vertically",
+    },
+    Binding {
+        kitty: "cmd+shift+d",
+        portable: b"D",
+        tag: b"D",
+        action: Action::SplitHorizontal,
+        description: "split horizontally",
+    },
+    Binding {
+        kitty: "cmd+w",
+        portable: b"w",
+        tag: b"w",
+        action: Action::CloseFocusedPane,
+        description: "close focused tab",
+    },
+    Binding {
+        kitty: "cmd+shift+w",
+        portable: b"W",
+        tag: b"W",
+        action: Action::KillFocusedServerPane,
+        description: "kill focused session",
+    },
+    Binding {
+        kitty: "cmd+shift+z",
+        portable: b"Z",
+        tag: b"Z",
+        action: Action::DetachAndAttach,
+        description: "detach and choose a session",
+    },
+    Binding {
+        kitty: "cmd+h",
+        portable: b"h",
+        tag: b"h",
+        action: Action::FocusLeft,
+        description: "focus left",
+    },
+    Binding {
+        kitty: "cmd+j",
+        portable: b"j",
+        tag: b"j",
+        action: Action::FocusDown,
+        description: "focus down",
+    },
+    Binding {
+        kitty: "cmd+k",
+        portable: b"k",
+        tag: b"k",
+        action: Action::FocusUp,
+        description: "focus up",
+    },
+    Binding {
+        kitty: "cmd+l",
+        portable: b"l",
+        tag: b"l",
+        action: Action::FocusRight,
+        description: "focus right",
+    },
+    Binding {
+        kitty: "cmd+t",
+        portable: b"t",
+        tag: b"t",
+        action: Action::AddTab,
+        description: "add a tab",
+    },
+    Binding {
+        kitty: "cmd+]",
+        portable: b"]",
+        tag: b"]",
+        action: Action::CycleTabForward,
+        description: "next tab",
+    },
+    Binding {
+        kitty: "cmd+[",
+        portable: b"[",
+        tag: b"[",
+        action: Action::CycleTabBackward,
+        description: "previous tab",
+    },
+];
 
-    fn into_action(self) -> Action {
-        match self {
-            Chord::Workspace(n) => Action::SwitchWorkspace(n),
-            Chord::SplitVertical => Action::SplitVertical,
-            Chord::SplitHorizontal => Action::SplitHorizontal,
-            Chord::CloseFocusedPane => Action::CloseFocusedPane,
-            Chord::KillFocusedServerPane => Action::KillFocusedServerPane,
-            Chord::DetachAndAttach => Action::DetachAndAttach,
-            Chord::FocusLeft => Action::FocusLeft,
-            Chord::FocusDown => Action::FocusDown,
-            Chord::FocusUp => Action::FocusUp,
-            Chord::FocusRight => Action::FocusRight,
-            Chord::AddTab => Action::AddTab,
-            Chord::CycleTabForward => Action::CycleTabForward,
-            Chord::CycleTabBackward => Action::CycleTabBackward,
-        }
-    }
+fn action_for_tag(tag: &[u8]) -> Option<Action> {
+    BINDINGS
+        .iter()
+        .find(|binding| binding.tag == tag)
+        .map(|binding| binding.action)
 }
 
 /// Parse one input event's raw bytes into an [`Action`]. Returns
-/// `Action::PassThrough` for anything not recognized as a dimux chord, so
+/// `Action::PassThrough` for anything not recognized as a dimax chord, so
 /// the caller forwards it to the focused server-pane unchanged.
 ///
 /// # Constraint on the caller
@@ -167,19 +620,141 @@ pub fn parse(bytes: &[u8]) -> Action {
     let Some(tag) = rest.strip_suffix(TERMINATOR) else {
         return Action::PassThrough;
     };
-    // Exactly one tag byte expected between prefix and terminator.
-    let [tag_byte] = tag else {
-        return Action::PassThrough;
-    };
-    match Chord::from_tag(*tag_byte) {
-        Some(chord) => chord.into_action(),
-        None => Action::PassThrough,
+    action_for_tag(tag).unwrap_or(Action::PassThrough)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedInput {
+    Action(Action),
+    PassThrough(Vec<u8>),
+    Pending,
+}
+
+#[derive(Debug, Default)]
+pub struct PortableParser {
+    pending: Option<Vec<u8>>,
+    custom: BTreeMap<Vec<u8>, Action>,
+}
+
+impl PortableParser {
+    pub fn from_config() -> Self {
+        let custom = load_config()
+            .bindings
+            .into_iter()
+            .filter_map(|(sequence, action)| {
+                Some((sequence.into_bytes(), parse_action_name(&action)?))
+            })
+            .collect();
+        Self {
+            pending: None,
+            custom,
+        }
     }
+
+    pub fn parse(&mut self, bytes: &[u8], mode: BindingMode) -> ParsedInput {
+        let kitty_action = parse(bytes);
+        if mode.kitty_enabled() && kitty_action != Action::PassThrough {
+            return ParsedInput::Action(kitty_action);
+        }
+        if !mode.portable_enabled() {
+            return ParsedInput::PassThrough(bytes.to_vec());
+        }
+
+        if self.pending.is_none() {
+            let Some(rest) = bytes.strip_prefix(&[PORTABLE_PREFIX]) else {
+                return ParsedInput::PassThrough(bytes.to_vec());
+            };
+            if rest.is_empty() {
+                self.pending = Some(Vec::new());
+                return ParsedInput::Pending;
+            }
+            return self.resolve_after_prefix(rest);
+        }
+
+        let mut sequence = self.pending.take().expect("pending checked above");
+        if sequence.is_empty() && bytes == [PORTABLE_PREFIX] {
+            return ParsedInput::PassThrough(vec![PORTABLE_PREFIX]);
+        }
+        sequence.extend_from_slice(bytes);
+        self.resolve_sequence(sequence, bytes)
+    }
+
+    fn resolve_after_prefix(&mut self, bytes: &[u8]) -> ParsedInput {
+        self.resolve_sequence(bytes.to_vec(), bytes)
+    }
+
+    fn resolve_sequence(&mut self, sequence: Vec<u8>, raw: &[u8]) -> ParsedInput {
+        self.action_for_portable(&sequence)
+            .map(ParsedInput::Action)
+            .unwrap_or_else(|| {
+                if self.has_portable_prefix(&sequence) {
+                    self.pending = Some(sequence);
+                    ParsedInput::Pending
+                } else {
+                    ParsedInput::PassThrough(raw.to_vec())
+                }
+            })
+    }
+
+    fn action_for_portable(&self, sequence: &[u8]) -> Option<Action> {
+        self.custom
+            .get(sequence)
+            .copied()
+            .or_else(|| action_for_portable(sequence))
+    }
+
+    fn has_portable_prefix(&self, sequence: &[u8]) -> bool {
+        BINDINGS
+            .iter()
+            .any(|binding| binding.portable.starts_with(sequence))
+            || self
+                .custom
+                .keys()
+                .any(|binding| binding.starts_with(sequence))
+    }
+}
+
+fn action_for_portable(sequence: &[u8]) -> Option<Action> {
+    BINDINGS
+        .iter()
+        .find(|binding| binding.portable == sequence)
+        .map(|binding| binding.action)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes tests that mutate `XDG_CONFIG_HOME` (process-global) --
+    /// same pattern as `daemon::state`'s `PIN_ENV_LOCK`.
+    static CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_fake_config_home<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", dir);
+        }
+        let result = f();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn consume_first_run_returns_true_once_then_false() {
+        let dir = std::env::temp_dir().join(format!("dmx-keys-first-run-{}", std::process::id()));
+        with_fake_config_home(&dir, || {
+            assert!(consume_first_run(), "first call should grant the wizard");
+            assert!(!consume_first_run(), "second call should not");
+            assert!(!consume_first_run(), "third call should not");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn chord_bytes(tag: u8) -> Vec<u8> {
         let mut v = PREFIX.to_vec();
@@ -255,6 +830,106 @@ mod tests {
     #[test]
     fn cycle_tab_backward() {
         assert_eq!(parse(&chord_bytes(b'[')), Action::CycleTabBackward);
+    }
+
+    #[test]
+    fn kitty_session_jump_uses_a_two_byte_tag() {
+        let bytes = [PREFIX, b"s4", TERMINATOR].concat();
+        assert_eq!(parse(&bytes), Action::JumpSession(4));
+    }
+
+    #[test]
+    fn portable_workspace_binding_can_arrive_together_or_split() {
+        let mut parser = PortableParser::default();
+        assert_eq!(
+            parser.parse(b"\0", BindingMode::Portable),
+            ParsedInput::Pending
+        );
+        assert_eq!(
+            parser.parse(b"3", BindingMode::Portable),
+            ParsedInput::Action(Action::SwitchWorkspace(3))
+        );
+
+        let mut parser = PortableParser::default();
+        assert_eq!(
+            parser.parse(&[0, b'3'], BindingMode::Portable),
+            ParsedInput::Action(Action::SwitchWorkspace(3))
+        );
+    }
+
+    #[test]
+    fn portable_session_binding_can_arrive_across_three_reads() {
+        let mut parser = PortableParser::default();
+        assert_eq!(
+            parser.parse(b"\0", BindingMode::Portable),
+            ParsedInput::Pending
+        );
+        assert_eq!(
+            parser.parse(b"s", BindingMode::Portable),
+            ParsedInput::Pending
+        );
+        assert_eq!(
+            parser.parse(b"7", BindingMode::Portable),
+            ParsedInput::Action(Action::JumpSession(7))
+        );
+    }
+
+    #[test]
+    fn double_portable_prefix_passes_one_prefix_through() {
+        let mut parser = PortableParser::default();
+        assert_eq!(
+            parser.parse(b"\0", BindingMode::Portable),
+            ParsedInput::Pending
+        );
+        assert_eq!(
+            parser.parse(b"\0", BindingMode::Portable),
+            ParsedInput::PassThrough(vec![0])
+        );
+    }
+
+    #[test]
+    fn each_mode_only_enables_its_own_input_layer() {
+        let kitty = chord_bytes(b'd');
+        let portable = [0, b'd'];
+        let mut parser = PortableParser::default();
+        assert_eq!(
+            parser.parse(&kitty, BindingMode::Portable),
+            ParsedInput::PassThrough(kitty)
+        );
+        assert_eq!(
+            parser.parse(&portable, BindingMode::Kitty),
+            ParsedInput::PassThrough(portable.to_vec())
+        );
+    }
+
+    #[test]
+    fn custom_portable_alias_can_span_multiple_reads() {
+        let mut parser = PortableParser {
+            pending: None,
+            custom: BTreeMap::from([(b"xx".to_vec(), Action::SplitVertical)]),
+        };
+        assert_eq!(
+            parser.parse(b"\0", BindingMode::Portable),
+            ParsedInput::Pending
+        );
+        assert_eq!(
+            parser.parse(b"x", BindingMode::Portable),
+            ParsedInput::Pending
+        );
+        assert_eq!(
+            parser.parse(b"x", BindingMode::Portable),
+            ParsedInput::Action(Action::SplitVertical)
+        );
+    }
+
+    #[test]
+    fn action_names_round_trip_for_every_bindable_action() {
+        for binding in BINDINGS {
+            assert_eq!(
+                parse_action_name(action_name(binding.action)),
+                Some(binding.action)
+            );
+        }
     }
 
     #[test]

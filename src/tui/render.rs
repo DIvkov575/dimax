@@ -48,11 +48,11 @@ use crate::protocol::{
     Cell, ClientPane, GridSnapshot, ServerPaneId, ServerPaneInfo, ServerPaneStatus, SplitDir,
     SplitId, SplitTree, WorkspaceInfo,
 };
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use ratatui::Frame;
 use std::collections::{HashMap, HashSet};
 
 /// See module doc comment "`SplitDir` -> `ratatui::Direction` mapping".
@@ -74,12 +74,22 @@ pub fn draw(
     grids: &HashMap<ServerPaneId, GridSnapshot>,
     focused: Option<crate::protocol::ClientPaneId>,
 ) {
+    draw_with_selection(frame, workspace, grids, focused, None);
+}
+
+pub(super) fn draw_with_selection(
+    frame: &mut Frame,
+    workspace: &WorkspaceInfo,
+    grids: &HashMap<ServerPaneId, GridSnapshot>,
+    focused: Option<crate::protocol::ClientPaneId>,
+    selection: Option<&super::selection::TextSelection>,
+) {
     let area = frame.area();
     match &workspace.tree {
-        Some(tree) => draw_tree(frame, tree, area, grids, focused),
+        Some(tree) => draw_tree(frame, tree, area, grids, focused, selection),
         None => {
             let placeholder = Paragraph::new("(empty workspace — press cmd-d to spawn a pane)")
-                .block(Block::bordered().title("dimux"));
+                .block(Block::bordered().title("dimax"));
             frame.render_widget(placeholder, area);
         }
     }
@@ -91,10 +101,13 @@ fn draw_tree(
     area: Rect,
     grids: &HashMap<ServerPaneId, GridSnapshot>,
     focused: Option<crate::protocol::ClientPaneId>,
+    selection: Option<&super::selection::TextSelection>,
 ) {
     match tree {
-        SplitTree::Leaf(pane) => draw_leaf(frame, pane, area, grids, focused),
-        SplitTree::Split { dir, ratio, a, b, .. } => {
+        SplitTree::Leaf(pane) => draw_leaf(frame, pane, area, grids, focused, selection),
+        SplitTree::Split {
+            dir, ratio, a, b, ..
+        } => {
             let direction = ratatui_direction(*dir);
             let percent_a = (ratio.clamp(0.0, 1.0) * 100.0).round() as u16;
             let percent_b = 100u16.saturating_sub(percent_a);
@@ -120,14 +133,17 @@ fn draw_tree(
                 Direction::Vertical => {
                     let rects = Layout::new(
                         direction,
-                        [Constraint::Percentage(percent_a), Constraint::Percentage(percent_b)],
+                        [
+                            Constraint::Percentage(percent_a),
+                            Constraint::Percentage(percent_b),
+                        ],
                     )
                     .split(area);
                     (rects[0], rects[1])
                 }
             };
-            draw_tree(frame, a, rect_a, grids, focused);
-            draw_tree(frame, b, rect_b, grids, focused);
+            draw_tree(frame, a, rect_a, grids, focused, selection);
+            draw_tree(frame, b, rect_b, grids, focused, selection);
         }
     }
 }
@@ -169,7 +185,14 @@ pub fn divider_rects(tree: &SplitTree, area: Rect) -> Vec<DividerHit> {
 }
 
 fn collect_divider_rects(tree: &SplitTree, area: Rect, out: &mut Vec<DividerHit>) {
-    if let SplitTree::Split { id, dir, ratio, a, b } = tree {
+    if let SplitTree::Split {
+        id,
+        dir,
+        ratio,
+        a,
+        b,
+    } = tree
+    {
         let direction = ratatui_direction(*dir);
         let percent_a = (ratio.clamp(0.0, 1.0) * 100.0).round() as u16;
         let percent_b = 100u16.saturating_sub(percent_a);
@@ -190,17 +213,28 @@ fn collect_divider_rects(tree: &SplitTree, area: Rect, out: &mut Vec<DividerHit>
             Direction::Vertical => {
                 let rects = Layout::new(
                     direction,
-                    [Constraint::Percentage(percent_a), Constraint::Percentage(percent_b)],
+                    [
+                        Constraint::Percentage(percent_a),
+                        Constraint::Percentage(percent_b),
+                    ],
                 )
                 .split(area);
                 // The lower child's title-bar row (its topmost row) is
                 // the grab zone -- no reserved row exists to point at
                 // directly (module doc "Bezels").
-                let title_row = Rect { height: 1, ..rects[1] };
+                let title_row = Rect {
+                    height: 1,
+                    ..rects[1]
+                };
                 (rects[0], rects[1], title_row)
             }
         };
-        out.push(DividerHit { split: *id, dir: *dir, grab_zone: divider, parent_area: area });
+        out.push(DividerHit {
+            split: *id,
+            dir: *dir,
+            grab_zone: divider,
+            parent_area: area,
+        });
         collect_divider_rects(a, rect_a, out);
         collect_divider_rects(b, rect_b, out);
     }
@@ -219,10 +253,16 @@ pub fn leaf_rects(tree: &SplitTree, area: Rect) -> Vec<(crate::protocol::ClientP
     out
 }
 
-fn collect_leaf_rects(tree: &SplitTree, area: Rect, out: &mut Vec<(crate::protocol::ClientPaneId, Rect)>) {
+fn collect_leaf_rects(
+    tree: &SplitTree,
+    area: Rect,
+    out: &mut Vec<(crate::protocol::ClientPaneId, Rect)>,
+) {
     match tree {
         SplitTree::Leaf(pane) => out.push((pane.id, area)),
-        SplitTree::Split { dir, ratio, a, b, .. } => {
+        SplitTree::Split {
+            dir, ratio, a, b, ..
+        } => {
             let direction = ratatui_direction(*dir);
             let percent_a = (ratio.clamp(0.0, 1.0) * 100.0).round() as u16;
             let percent_b = 100u16.saturating_sub(percent_a);
@@ -242,7 +282,10 @@ fn collect_leaf_rects(tree: &SplitTree, area: Rect, out: &mut Vec<(crate::protoc
                 Direction::Vertical => {
                     let rects = Layout::new(
                         direction,
-                        [Constraint::Percentage(percent_a), Constraint::Percentage(percent_b)],
+                        [
+                            Constraint::Percentage(percent_a),
+                            Constraint::Percentage(percent_b),
+                        ],
                     )
                     .split(area);
                     (rects[0], rects[1])
@@ -283,6 +326,7 @@ fn draw_leaf(
     area: Rect,
     grids: &HashMap<ServerPaneId, GridSnapshot>,
     focused: Option<crate::protocol::ClientPaneId>,
+    selection: Option<&super::selection::TextSelection>,
 ) {
     let active = pane.active_bound();
     let snapshot = active.and_then(|server_pane_id| grids.get(&server_pane_id));
@@ -309,12 +353,15 @@ fn draw_leaf(
     match active {
         None => {
             let placeholder =
-                Paragraph::new("(unbound — bind via `dimux client bind`)").block(block);
+                Paragraph::new("(unbound — bind via `dimax client bind`)").block(block);
             frame.render_widget(placeholder, area);
         }
         Some(_) => match snapshot {
             Some(snapshot) => {
-                let text = grid_to_text(snapshot);
+                let pane_selection = selection.filter(|selection| {
+                    selection.pane() == pane.id && selection.server_pane() == snapshot.server_pane
+                });
+                let text = grid_to_text(snapshot, pane_selection);
                 let inner = block.inner(area);
                 frame.render_widget(Paragraph::new(text).block(block), area);
                 if is_focused {
@@ -360,20 +407,32 @@ fn place_cursor(frame: &mut Frame, snapshot: &GridSnapshot, inner: Rect) {
 
 /// Convert a `GridSnapshot`'s row-major cell grid into a `ratatui::Text`,
 /// one `Line` per row and one styled `Span` per `Cell`.
-fn grid_to_text(snapshot: &GridSnapshot) -> Text<'static> {
+fn grid_to_text(
+    snapshot: &GridSnapshot,
+    selection: Option<&super::selection::TextSelection>,
+) -> Text<'static> {
     let lines: Vec<Line<'static>> = snapshot
         .lines
         .iter()
-        .map(|row| {
-            let spans: Vec<Span<'static>> =
-                row.iter().map(|cell| cell_to_span(cell)).collect();
+        .enumerate()
+        .map(|(row_index, row)| {
+            let spans: Vec<Span<'static>> = row
+                .iter()
+                .enumerate()
+                .map(|(col_index, cell)| {
+                    cell_to_span(
+                        cell,
+                        selection.is_some_and(|selection| selection.contains(row_index, col_index)),
+                    )
+                })
+                .collect();
             Line::from(spans)
         })
         .collect();
     Text::from(lines)
 }
 
-fn cell_to_span(cell: &Cell) -> Span<'static> {
+fn cell_to_span(cell: &Cell, selected: bool) -> Span<'static> {
     let mut style = Style::new();
     if let Some((r, g, b)) = cell.fg {
         style = style.fg(Color::Rgb(r, g, b));
@@ -395,6 +454,12 @@ fn cell_to_span(cell: &Cell) -> Span<'static> {
         modifiers |= Modifier::REVERSED;
     }
     style = style.add_modifier(modifiers);
+    if selected {
+        style = style
+            .remove_modifier(Modifier::REVERSED)
+            .fg(Color::White)
+            .bg(Color::Rgb(70, 110, 170));
+    }
     Span::styled(cell.text.clone(), style)
 }
 
@@ -482,7 +547,10 @@ pub(super) fn draw_attach_menu(
                 if let Some(rename) = renaming
                     && let Some(error) = &rename.error
                 {
-                    lines.push(Line::styled(format!("    {error}"), Style::new().fg(Color::Red)));
+                    lines.push(Line::styled(
+                        format!("    {error}"),
+                        Style::new().fg(Color::Red),
+                    ));
                 }
             }
             super::AttachMenuRow::SpawnNewInGroup(server_index) => {
@@ -491,11 +559,18 @@ pub(super) fn draw_attach_menu(
                     .spawn_in_group
                     .as_ref()
                     .filter(|s| s.group_server_index == server_index);
-                lines.push(spawn_new_in_group_line(group, row_index == menu.selected, spawning));
+                lines.push(spawn_new_in_group_line(
+                    group,
+                    row_index == menu.selected,
+                    spawning,
+                ));
                 if let Some(spawn) = spawning
                     && let Some(error) = &spawn.error
                 {
-                    lines.push(Line::styled(format!("    {error}"), Style::new().fg(Color::Red)));
+                    lines.push(Line::styled(
+                        format!("    {error}"),
+                        Style::new().fg(Color::Red),
+                    ));
                 }
             }
             super::AttachMenuRow::SpawnNew => {
@@ -574,7 +649,11 @@ fn group_header_line(group: &str, collapsed: bool, pinned: bool, selected: bool)
 /// `spawning` is `Some` (its inline field is open), shows the field's
 /// live text in brackets instead of the static label -- same visual
 /// convention `attach_menu_line` uses for an active rename.
-fn spawn_new_in_group_line(group: &str, selected: bool, spawning: Option<&super::SpawnInGroupState>) -> Line<'static> {
+fn spawn_new_in_group_line(
+    group: &str,
+    selected: bool,
+    spawning: Option<&super::SpawnInGroupState>,
+) -> Line<'static> {
     let marker = if selected { ">" } else { " " };
     let text = match spawning {
         Some(spawn) => format!("  {marker} + [{}] in {group}", spawn.text),
@@ -610,7 +689,10 @@ fn attach_menu_line(
         ServerPaneStatus::Running => "Running",
         ServerPaneStatus::Dead => "Dead",
     };
-    let process = server.foreground.as_ref().map_or("-", |f| f.process_name.as_str());
+    let process = server
+        .foreground
+        .as_ref()
+        .map_or("-", |f| f.process_name.as_str());
     let marker = if selected { ">" } else { " " };
     // Marks the row this client-pane was bound to right before this
     // menu opened (see `AttachMenu.previously_bound`'s doc comment) --
@@ -631,14 +713,21 @@ fn attach_menu_line(
         return Line::styled(text, Style::new().add_modifier(Modifier::REVERSED));
     }
 
-    let name = server.name.clone().unwrap_or_else(|| server.short_id.clone());
+    let name = server
+        .name
+        .clone()
+        .unwrap_or_else(|| server.short_id.clone());
     let text = format!(
         "  {just_detached_marker}{marker} {:<name_w$} {:<process_w$} {} {}{}",
         truncate_end(&name, NAME_COL_WIDTH),
         truncate_end(process, PROCESS_COL_WIDTH),
         server.short_id,
         status,
-        if delete_armed { "  [x/Enter: confirm delete]" } else { "" },
+        if delete_armed {
+            "  [x/Enter: confirm delete]"
+        } else {
+            ""
+        },
         name_w = NAME_COL_WIDTH,
         process_w = PROCESS_COL_WIDTH,
     );
@@ -667,7 +756,11 @@ fn truncate_end(s: &str, width: usize) -> String {
 
 fn spawn_new_line(selected: bool) -> Line<'static> {
     let text = format!("{} spawn new...", if selected { ">" } else { " " });
-    let style = if selected { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+    let style = if selected {
+        Style::new().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::new()
+    };
     Line::styled(text, style)
 }
 
@@ -675,7 +768,7 @@ fn spawn_new_line(selected: bool) -> Line<'static> {
 /// centered within it. Standard ratatui centering pattern: split into
 /// thirds along each axis (with the requested percentage as the middle
 /// share) and take the middle segment of each split.
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+pub(super) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let vertical_margin = (100u16.saturating_sub(percent_y)) / 2;
     let rows = Layout::new(
         Direction::Vertical,
@@ -703,8 +796,8 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::protocol::{ForegroundProcessInfo, Size};
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use uuid::Uuid;
 
     fn buffer_contains(terminal: &Terminal<TestBackend>, needle: &str) -> bool {
@@ -817,7 +910,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let grids = HashMap::new();
         terminal
-            .draw(|frame| draw_leaf(frame, &pane, frame.area(), &grids, None))
+            .draw(|frame| draw_leaf(frame, &pane, frame.area(), &grids, None, None))
             .unwrap();
         assert!(buffer_contains(&terminal, &pane.short_id));
     }
@@ -891,8 +984,55 @@ mod tests {
         // area starts at (0, 0); the leaf's top-border title bar occupies
         // row 0, so the content rect's origin is row 1 -- cursor (4, 1)
         // within it lands at absolute (4, 2).
-        assert_eq!(terminal.get_cursor_position().unwrap(), ratatui::layout::Position { x: 4, y: 2 });
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            ratatui::layout::Position { x: 4, y: 2 }
+        );
         assert!(terminal.backend().cursor_visible());
+    }
+
+    #[test]
+    fn draw_selection_highlights_only_selected_cells() {
+        let pane_id = Uuid::new_v4();
+        let server_pane_id = Uuid::new_v4();
+        let pane = ClientPane {
+            id: pane_id,
+            name: Some("shell".to_string()),
+            tabs: vec![server_pane_id],
+            active_tab: 0,
+            short_id: "aa".to_string(),
+        };
+        let workspace = workspace_with_tree(SplitTree::Leaf(pane));
+        let mut grids = HashMap::new();
+        grids.insert(
+            server_pane_id,
+            GridSnapshot {
+                server_pane: server_pane_id,
+                size: Size { rows: 1, cols: 3 },
+                cursor: (0, 0),
+                lines: vec![vec![simple_cell("a"), simple_cell("b"), simple_cell("c")]],
+                scroll_offset: 0,
+            },
+        );
+        let mut selection = super::super::selection::TextSelection::new(
+            pane_id,
+            server_pane_id,
+            super::super::selection::GridPosition { row: 0, col: 1 },
+        );
+        selection.finish(super::super::selection::GridPosition { row: 0, col: 2 });
+
+        let backend = TestBackend::new(10, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_with_selection(frame, &workspace, &grids, None, Some(&selection));
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.cell((0, 1)).unwrap().bg, Color::Reset);
+        assert_eq!(buffer.cell((1, 1)).unwrap().bg, Color::Rgb(70, 110, 170));
+        assert_eq!(buffer.cell((2, 1)).unwrap().bg, Color::Rgb(70, 110, 170));
     }
 
     #[test]
@@ -923,7 +1063,10 @@ mod tests {
         terminal
             .draw(|frame| draw(frame, &workspace, &grids, None))
             .unwrap();
-        assert!(!terminal.backend().cursor_visible(), "cursor should stay hidden when unfocused");
+        assert!(
+            !terminal.backend().cursor_visible(),
+            "cursor should stay hidden when unfocused"
+        );
     }
 
     #[test]
@@ -954,14 +1097,23 @@ mod tests {
         terminal
             .draw(|frame| draw(frame, &workspace, &grids, Some(pane_id)))
             .unwrap();
-        assert!(!terminal.backend().cursor_visible(), "cursor should stay hidden while scrolled back");
+        assert!(
+            !terminal.backend().cursor_visible(),
+            "cursor should stay hidden while scrolled back"
+        );
     }
 
     #[test]
     fn draw_leaf_shows_scrollback_indicator_when_scrolled() {
         let pane_id = Uuid::new_v4();
         let server_id = Uuid::new_v4();
-        let pane = ClientPane { id: pane_id, name: Some("shell".to_string()), tabs: vec![server_id], active_tab: 0, short_id: "aa".to_string() };
+        let pane = ClientPane {
+            id: pane_id,
+            name: Some("shell".to_string()),
+            tabs: vec![server_id],
+            active_tab: 0,
+            short_id: "aa".to_string(),
+        };
         let mut grids = HashMap::new();
         grids.insert(
             server_id,
@@ -977,7 +1129,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                draw_leaf(frame, &pane, frame.area(), &grids, None);
+                draw_leaf(frame, &pane, frame.area(), &grids, None, None);
             })
             .unwrap();
         assert!(buffer_contains(&terminal, "scrollback"));
@@ -987,7 +1139,13 @@ mod tests {
     fn draw_leaf_shows_no_scrollback_indicator_when_live() {
         let pane_id = Uuid::new_v4();
         let server_id = Uuid::new_v4();
-        let pane = ClientPane { id: pane_id, name: Some("shell".to_string()), tabs: vec![server_id], active_tab: 0, short_id: "aa".to_string() };
+        let pane = ClientPane {
+            id: pane_id,
+            name: Some("shell".to_string()),
+            tabs: vec![server_id],
+            active_tab: 0,
+            short_id: "aa".to_string(),
+        };
         let mut grids = HashMap::new();
         grids.insert(
             server_id,
@@ -1003,7 +1161,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                draw_leaf(frame, &pane, frame.area(), &grids, None);
+                draw_leaf(frame, &pane, frame.area(), &grids, None, None);
             })
             .unwrap();
         assert!(!buffer_contains(&terminal, "scrollback"));
@@ -1025,7 +1183,7 @@ mod tests {
         let backend = TestBackend::new(40, 6);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_leaf(frame, &pane, frame.area(), &grids, None))
+            .draw(|frame| draw_leaf(frame, &pane, frame.area(), &grids, None, None))
             .unwrap();
         assert!(buffer_contains(&terminal, "(1/2)"));
     }
@@ -1045,7 +1203,7 @@ mod tests {
         let backend = TestBackend::new(40, 6);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_leaf(frame, &pane, frame.area(), &grids, None))
+            .draw(|frame| draw_leaf(frame, &pane, frame.area(), &grids, None, None))
             .unwrap();
         assert!(!buffer_contains(&terminal, "(1/1)"));
         assert!(buffer_contains(&terminal, "shell"));
@@ -1055,8 +1213,20 @@ mod tests {
     fn draw_split_produces_no_panic_and_both_leaves_render() {
         let left_id = Uuid::new_v4();
         let right_id = Uuid::new_v4();
-        let left = ClientPane { id: Uuid::new_v4(), name: Some("left".into()), tabs: vec![left_id], active_tab: 0, short_id: "aa".to_string() };
-        let right = ClientPane { id: Uuid::new_v4(), name: Some("right".into()), tabs: vec![right_id], active_tab: 0, short_id: "aa".to_string() };
+        let left = ClientPane {
+            id: Uuid::new_v4(),
+            name: Some("left".into()),
+            tabs: vec![left_id],
+            active_tab: 0,
+            short_id: "aa".to_string(),
+        };
+        let right = ClientPane {
+            id: Uuid::new_v4(),
+            name: Some("right".into()),
+            tabs: vec![right_id],
+            active_tab: 0,
+            short_id: "aa".to_string(),
+        };
         let tree = SplitTree::Split {
             id: Uuid::new_v4(),
             dir: SplitDir::Vertical,
@@ -1129,8 +1299,20 @@ mod tests {
         // A vertical split (side-by-side panes) reserves exactly one
         // divider column between the two children -- not two (one from
         // each pane's own border), per module doc "Bezels".
-        let left = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() };
-        let right = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() };
+        let left = ClientPane {
+            id: Uuid::new_v4(),
+            name: None,
+            tabs: vec![],
+            active_tab: 0,
+            short_id: "aa".to_string(),
+        };
+        let right = ClientPane {
+            id: Uuid::new_v4(),
+            name: None,
+            tabs: vec![],
+            active_tab: 0,
+            short_id: "aa".to_string(),
+        };
         let tree = SplitTree::Split {
             id: Uuid::new_v4(),
             dir: SplitDir::Vertical,
@@ -1142,7 +1324,9 @@ mod tests {
         let grids = HashMap::new();
         let backend = TestBackend::new(41, 10);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &workspace, &grids, None)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &workspace, &grids, None))
+            .unwrap();
 
         let buffer = terminal.backend().buffer();
         // Row 1 (below the title-bar row) is pure pane body on both sides
@@ -1151,19 +1335,30 @@ mod tests {
         let divider_columns = (0..buffer.area().width)
             .filter(|&x| buffer.cell((x, 1)).unwrap().symbol() == "│")
             .count();
-        assert_eq!(divider_columns, 1, "expected exactly one shared divider column, not a doubled seam");
+        assert_eq!(
+            divider_columns, 1,
+            "expected exactly one shared divider column, not a doubled seam"
+        );
     }
 
     #[test]
     fn leaf_uses_top_only_border_not_a_full_box() {
         // A single leaf should not draw side/bottom border glyphs -- only
         // the top title-bar row, per module doc "Bezels".
-        let pane = ClientPane { id: Uuid::new_v4(), name: Some("solo".into()), tabs: vec![], active_tab: 0, short_id: "aa".to_string() };
+        let pane = ClientPane {
+            id: Uuid::new_v4(),
+            name: Some("solo".into()),
+            tabs: vec![],
+            active_tab: 0,
+            short_id: "aa".to_string(),
+        };
         let workspace = workspace_with_tree(SplitTree::Leaf(pane));
         let grids = HashMap::new();
         let backend = TestBackend::new(20, 6);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &workspace, &grids, None)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &workspace, &grids, None))
+            .unwrap();
 
         let buffer = terminal.backend().buffer();
         let last_row = buffer.area().height - 1;
@@ -1177,8 +1372,20 @@ mod tests {
 
     #[test]
     fn divider_rects_finds_vertical_split_at_reserved_column() {
-        let left = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() };
-        let right = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() };
+        let left = ClientPane {
+            id: Uuid::new_v4(),
+            name: None,
+            tabs: vec![],
+            active_tab: 0,
+            short_id: "aa".to_string(),
+        };
+        let right = ClientPane {
+            id: Uuid::new_v4(),
+            name: None,
+            tabs: vec![],
+            active_tab: 0,
+            short_id: "aa".to_string(),
+        };
         let split_id = Uuid::new_v4();
         let tree = SplitTree::Split {
             id: split_id,
@@ -1187,7 +1394,12 @@ mod tests {
             a: Box::new(SplitTree::Leaf(left)),
             b: Box::new(SplitTree::Leaf(right)),
         };
-        let area = Rect { x: 0, y: 0, width: 41, height: 10 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 41,
+            height: 10,
+        };
         let hits = divider_rects(&tree, area);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].split, split_id);
@@ -1202,8 +1414,20 @@ mod tests {
 
     #[test]
     fn divider_rects_finds_horizontal_split_at_lower_titlebar_row() {
-        let top = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() };
-        let bottom = ClientPane { id: Uuid::new_v4(), name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() };
+        let top = ClientPane {
+            id: Uuid::new_v4(),
+            name: None,
+            tabs: vec![],
+            active_tab: 0,
+            short_id: "aa".to_string(),
+        };
+        let bottom = ClientPane {
+            id: Uuid::new_v4(),
+            name: None,
+            tabs: vec![],
+            active_tab: 0,
+            short_id: "aa".to_string(),
+        };
         let split_id = Uuid::new_v4();
         let tree = SplitTree::Split {
             id: split_id,
@@ -1212,7 +1436,12 @@ mod tests {
             a: Box::new(SplitTree::Leaf(top)),
             b: Box::new(SplitTree::Leaf(bottom)),
         };
-        let area = Rect { x: 0, y: 0, width: 20, height: 11 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 11,
+        };
         let hits = divider_rects(&tree, area);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].dir, SplitDir::Horizontal);
@@ -1227,8 +1456,18 @@ mod tests {
         let hit = DividerHit {
             split: Uuid::new_v4(),
             dir: SplitDir::Vertical,
-            grab_zone: Rect { x: 50, y: 0, width: 1, height: 10 },
-            parent_area: Rect { x: 0, y: 0, width: 100, height: 10 },
+            grab_zone: Rect {
+                x: 50,
+                y: 0,
+                width: 1,
+                height: 10,
+            },
+            parent_area: Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 10,
+            },
         };
         assert!((ratio_at(&hit, 0, 0) - 0.0).abs() < 0.01);
         assert!((ratio_at(&hit, 50, 0) - 0.5).abs() < 0.01);
@@ -1240,8 +1479,18 @@ mod tests {
         let hit = DividerHit {
             split: Uuid::new_v4(),
             dir: SplitDir::Horizontal,
-            grab_zone: Rect { x: 0, y: 5, width: 10, height: 1 },
-            parent_area: Rect { x: 0, y: 0, width: 10, height: 10 },
+            grab_zone: Rect {
+                x: 0,
+                y: 5,
+                width: 10,
+                height: 1,
+            },
+            parent_area: Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
         };
         assert!((ratio_at(&hit, 0, 5) - 0.5).abs() < 0.01);
     }
@@ -1257,9 +1506,9 @@ mod tests {
                 process_name: "vim".to_string(),
                 cwd: Some("/home/dev/project".to_string()),
             }),
-        owner_workspace: None,
+            owner_workspace: None,
             short_id: "aa".to_string(),
-            };
+        };
         let servers = vec![("/home/dev/project".to_string(), server)];
         let menu = super::super::AttachMenu {
             servers,
@@ -1276,7 +1525,9 @@ mod tests {
         // what caused this test to flake when the columns were added.
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[])).unwrap();
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .unwrap();
         assert!(buffer_contains(&terminal, "editor"));
         assert!(buffer_contains(&terminal, "vim"));
         assert!(buffer_contains(&terminal, "/home/dev/project"));
@@ -1297,7 +1548,9 @@ mod tests {
         };
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[])).unwrap();
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .unwrap();
         assert!(buffer_contains(&terminal, "move"));
         assert!(buffer_contains(&terminal, "attach"));
         assert!(buffer_contains(&terminal, "cancel"));
@@ -1316,7 +1569,9 @@ mod tests {
         };
         let backend = TestBackend::new(40, 15);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[])).unwrap();
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .unwrap();
     }
 
     #[test]
@@ -1327,9 +1582,9 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-        owner_workspace: None,
+            owner_workspace: None,
             short_id: "aa".to_string(),
-            };
+        };
         let selected_id = server.id;
         // Row 0 is the "Unknown" group header; row 1 is the server row.
         let menu = super::super::AttachMenu {
@@ -1344,7 +1599,9 @@ mod tests {
         let preview = (selected_id, "some live pane output".to_string());
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), Some(&preview), &[])).unwrap();
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), Some(&preview), &[]))
+            .unwrap();
         assert!(buffer_contains(&terminal, "some live pane output"));
         assert!(buffer_contains(&terminal, "Preview"));
     }
@@ -1357,9 +1614,9 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-        owner_workspace: None,
+            owner_workspace: None,
             short_id: "aa".to_string(),
-            };
+        };
         // Row 0 is the "Unknown" group header; row 1 is the server row
         // -- selecting the server row itself is what makes this a real
         // test of "selection is on a Server row, but the cached
@@ -1376,13 +1633,21 @@ mod tests {
         };
         // Stale preview from some other (now-unselected) pane -- must
         // not be shown for a pane it wasn't fetched for.
-        let stale_preview = (Uuid::new_v4(), "stale output from a different pane".to_string());
+        let stale_preview = (
+            Uuid::new_v4(),
+            "stale output from a different pane".to_string(),
+        );
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), Some(&stale_preview), &[]))
+            .draw(|frame| {
+                draw_attach_menu(frame, &menu, &HashSet::new(), Some(&stale_preview), &[])
+            })
             .unwrap();
-        assert!(!buffer_contains(&terminal, "stale output from a different pane"));
+        assert!(!buffer_contains(
+            &terminal,
+            "stale output from a different pane"
+        ));
     }
 
     #[test]
@@ -1396,9 +1661,9 @@ mod tests {
                 process_name: "vim".to_string(),
                 cwd: Some("/home/dev/project".to_string()),
             }),
-        owner_workspace: None,
+            owner_workspace: None,
             short_id: "aa".to_string(),
-            };
+        };
         let server_id = server.id;
         let menu = super::super::AttachMenu {
             servers: vec![("/home/dev/project".to_string(), server)],
@@ -1410,11 +1675,19 @@ mod tests {
             spawn_in_group: None,
             adding_tab: false,
         };
-        let preview = (server_id, "should not appear while a header is selected".to_string());
+        let preview = (
+            server_id,
+            "should not appear while a header is selected".to_string(),
+        );
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), Some(&preview), &[])).unwrap();
-        assert!(!buffer_contains(&terminal, "should not appear while a header is selected"));
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), Some(&preview), &[]))
+            .unwrap();
+        assert!(!buffer_contains(
+            &terminal,
+            "should not appear while a header is selected"
+        ));
     }
 
     #[test]
@@ -1430,9 +1703,9 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-        owner_workspace: None,
+            owner_workspace: None,
             short_id: "aa".to_string(),
-            };
+        };
         let server_id = server.id;
         let menu = super::super::AttachMenu {
             servers: vec![("Unknown".to_string(), server)],
@@ -1446,7 +1719,9 @@ mod tests {
 
         let backend_empty = TestBackend::new(100, 30);
         let mut terminal_empty = Terminal::new(backend_empty).unwrap();
-        terminal_empty.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[])).unwrap();
+        terminal_empty
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .unwrap();
         let row_index_empty = buffer_row_index_containing(&terminal_empty, "editor");
 
         let preview = (server_id, "some content".to_string());
@@ -1471,9 +1746,9 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-        owner_workspace: None,
+            owner_workspace: None,
             short_id: "aa".to_string(),
-            };
+        };
         let selected_id = server.id;
         let menu = super::super::AttachMenu {
             servers: vec![("Unknown".to_string(), server)],
@@ -1488,12 +1763,20 @@ mod tests {
         // (PREVIEW_PANEL_HEIGHT is 10, i.e. 8 interior rows) -- a naive
         // top-down render would show "line-0" and cut off before ever
         // reaching the pane's actual current/most-recent output.
-        let full_text = (0..20).map(|i| format!("line-{i}")).collect::<Vec<_>>().join("\n");
+        let full_text = (0..20)
+            .map(|i| format!("line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let preview = (selected_id, full_text);
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), Some(&preview), &[])).unwrap();
-        assert!(buffer_contains(&terminal, "line-19"), "the most recent line must be visible");
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), Some(&preview), &[]))
+            .unwrap();
+        assert!(
+            buffer_contains(&terminal, "line-19"),
+            "the most recent line must be visible"
+        );
         assert!(
             !buffer_row_matches_exactly(&terminal, "line-0"),
             "the earliest line should have scrolled off, not just be a substring of a later one"
@@ -1511,7 +1794,10 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let width = buffer.area.width as usize;
         let symbols: Vec<&str> = buffer.content().iter().map(|c| c.symbol()).collect();
-        symbols.chunks(width).map(|row| row.concat()).any(|row| row.trim() == needle)
+        symbols
+            .chunks(width)
+            .map(|row| row.concat())
+            .any(|row| row.trim() == needle)
     }
 
     #[test]
@@ -1522,9 +1808,9 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Dead,
             foreground: None,
-        owner_workspace: None,
+            owner_workspace: None,
             short_id: "aa".to_string(),
-            };
+        };
         let servers = vec![("Unknown".to_string(), server)];
         let menu = super::super::AttachMenu {
             servers,
@@ -1537,7 +1823,9 @@ mod tests {
         };
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[])).unwrap();
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .unwrap();
         assert!(buffer_contains(&terminal, "editor"));
         assert!(buffer_contains(&terminal, "-"));
     }
@@ -1562,7 +1850,9 @@ mod tests {
         };
         let backend = TestBackend::new(60, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[])).unwrap();
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .unwrap();
         assert!(buffer_contains(&terminal, "spawn new"));
     }
 
@@ -1577,9 +1867,9 @@ mod tests {
                 process_name: "bash".to_string(),
                 cwd: Some("/home/dev/api".to_string()),
             }),
-        owner_workspace: None,
+            owner_workspace: None,
             short_id: "aa".to_string(),
-            };
+        };
         let b = ServerPaneInfo {
             id: Uuid::new_v4(),
             name: Some("web-shell".to_string()),
@@ -1589,11 +1879,13 @@ mod tests {
                 process_name: "bash".to_string(),
                 cwd: Some("/home/dev/web".to_string()),
             }),
-        owner_workspace: None,
+            owner_workspace: None,
             short_id: "aa".to_string(),
-            };
-        let servers =
-            vec![("/home/dev/api".to_string(), a), ("/home/dev/web".to_string(), b)];
+        };
+        let servers = vec![
+            ("/home/dev/api".to_string(), a),
+            ("/home/dev/web".to_string(), b),
+        ];
         let menu = super::super::AttachMenu {
             servers,
             selected: 0,
@@ -1605,7 +1897,9 @@ mod tests {
         };
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[])).unwrap();
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .unwrap();
         assert!(buffer_contains(&terminal, "/home/dev/api"));
         assert!(buffer_contains(&terminal, "/home/dev/web"));
         assert!(buffer_contains(&terminal, "api-shell"));
@@ -1623,18 +1917,18 @@ mod tests {
                 process_name: "bash".to_string(),
                 cwd: Some("/home/dev/api".to_string()),
             }),
-        owner_workspace: None,
+            owner_workspace: None,
             short_id: "aa".to_string(),
-            };
+        };
         let dead = ServerPaneInfo {
             id: Uuid::new_v4(),
             name: Some("dead-pane".to_string()),
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Dead,
             foreground: None,
-        owner_workspace: None,
+            owner_workspace: None,
             short_id: "aa".to_string(),
-            };
+        };
         let servers = vec![
             ("/home/dev/api".to_string(), a),
             ("Unknown".to_string(), dead),
@@ -1650,7 +1944,9 @@ mod tests {
         };
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[])).unwrap();
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .unwrap();
         assert!(buffer_contains(&terminal, "+ spawn new in /home/dev/api"));
         assert!(!buffer_contains(&terminal, "+ spawn new in Unknown"));
     }
@@ -1666,9 +1962,9 @@ mod tests {
                 process_name: "bash".to_string(),
                 cwd: Some("/home/dev/api".to_string()),
             }),
-        owner_workspace: None,
+            owner_workspace: None,
             short_id: "aa".to_string(),
-            };
+        };
         let b = ServerPaneInfo {
             id: Uuid::new_v4(),
             name: Some("web-shell".to_string()),
@@ -1678,11 +1974,13 @@ mod tests {
                 process_name: "bash".to_string(),
                 cwd: Some("/home/dev/web".to_string()),
             }),
-        owner_workspace: None,
+            owner_workspace: None,
             short_id: "aa".to_string(),
-            };
-        let servers =
-            vec![("/home/dev/api".to_string(), a), ("/home/dev/web".to_string(), b)];
+        };
+        let servers = vec![
+            ("/home/dev/api".to_string(), a),
+            ("/home/dev/web".to_string(), b),
+        ];
         let menu = super::super::AttachMenu {
             servers,
             selected: 0,
@@ -1696,7 +1994,9 @@ mod tests {
         collapsed.insert("/home/dev/api".to_string());
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu, &collapsed, None, &[])).unwrap();
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &collapsed, None, &[]))
+            .unwrap();
         // The collapsed group's header stays visible (so it can be
         // re-expanded), but its member row AND its own "spawn new
         // here" row are both gone.
@@ -1720,9 +2020,9 @@ mod tests {
                 process_name: "bash".to_string(),
                 cwd: Some("/home/dev/api".to_string()),
             }),
-        owner_workspace: None,
+            owner_workspace: None,
             short_id: "aa".to_string(),
-            };
+        };
         let menu = super::super::AttachMenu {
             servers: vec![("/home/dev/api".to_string(), a)],
             selected: 0,
@@ -1735,15 +2035,25 @@ mod tests {
 
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[])).unwrap();
-        assert!(buffer_contains(&terminal, "▾"), "expanded group should show the expanded marker");
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .unwrap();
+        assert!(
+            buffer_contains(&terminal, "▾"),
+            "expanded group should show the expanded marker"
+        );
 
         let mut collapsed = HashSet::new();
         collapsed.insert("/home/dev/api".to_string());
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu, &collapsed, None, &[])).unwrap();
-        assert!(buffer_contains(&terminal, "▸"), "collapsed group should show the collapsed marker");
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &collapsed, None, &[]))
+            .unwrap();
+        assert!(
+            buffer_contains(&terminal, "▸"),
+            "collapsed group should show the collapsed marker"
+        );
     }
 
     #[test]
@@ -1757,9 +2067,9 @@ mod tests {
                 process_name: "bash".to_string(),
                 cwd: Some("/home/dev/api".to_string()),
             }),
-        owner_workspace: None,
+            owner_workspace: None,
             short_id: "aa".to_string(),
-            };
+        };
         let menu = super::super::AttachMenu {
             servers: vec![("/home/dev/api".to_string(), a)],
             selected: 0,
@@ -1772,14 +2082,24 @@ mod tests {
 
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[])).unwrap();
-        assert!(!buffer_contains(&terminal, "📌"), "unpinned group should show no pin marker");
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .unwrap();
+        assert!(
+            !buffer_contains(&terminal, "📌"),
+            "unpinned group should show no pin marker"
+        );
 
         let pinned = vec!["/home/dev/api".to_string()];
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &pinned)).unwrap();
-        assert!(buffer_contains(&terminal, "📌"), "pinned group should show the pin marker");
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &pinned))
+            .unwrap();
+        assert!(
+            buffer_contains(&terminal, "📌"),
+            "pinned group should show the pin marker"
+        );
     }
 
     #[test]
@@ -1790,9 +2110,9 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-        owner_workspace: None,
+            owner_workspace: None,
             short_id: "aa".to_string(),
-            };
+        };
         let menu = super::super::AttachMenu {
             servers: vec![("Unknown".to_string(), server)],
             selected: 0,
@@ -1804,7 +2124,9 @@ mod tests {
         };
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[])).unwrap();
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .unwrap();
         assert!(buffer_contains(&terminal, "confirm delete"));
     }
 
@@ -1818,18 +2140,18 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-        owner_workspace: None,
+            owner_workspace: None,
             short_id: "aa".to_string(),
-            };
+        };
         let server_b = ServerPaneInfo {
             id: other,
             name: Some("other-pane".to_string()),
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-        owner_workspace: None,
+            owner_workspace: None,
             short_id: "aa".to_string(),
-            };
+        };
         let menu = super::super::AttachMenu {
             servers: vec![
                 ("Unknown".to_string(), server_a),
@@ -1844,11 +2166,19 @@ mod tests {
         };
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[])).unwrap();
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .unwrap();
         let marked_row = buffer_row_containing(&terminal, "detached");
         let unmarked_row = buffer_row_containing(&terminal, "other-pane");
-        assert!(marked_row.contains('*'), "row previously bound should carry the * marker: {marked_row:?}");
-        assert!(!unmarked_row.contains('*'), "an unrelated row must not carry the marker: {unmarked_row:?}");
+        assert!(
+            marked_row.contains('*'),
+            "row previously bound should carry the * marker: {marked_row:?}"
+        );
+        assert!(
+            !unmarked_row.contains('*'),
+            "an unrelated row must not carry the marker: {unmarked_row:?}"
+        );
     }
 
     #[test]
@@ -1859,9 +2189,9 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-        owner_workspace: None,
+            owner_workspace: None,
             short_id: "aa".to_string(),
-            };
+        };
         let menu = super::super::AttachMenu {
             servers: vec![("Unknown".to_string(), server)],
             selected: 0,
@@ -1873,9 +2203,14 @@ mod tests {
         };
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[])).unwrap();
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .unwrap();
         let row = buffer_row_containing(&terminal, "fresh");
-        assert!(!row.contains('*'), "no row should be marked when previously_bound is None: {row:?}");
+        assert!(
+            !row.contains('*'),
+            "no row should be marked when previously_bound is None: {row:?}"
+        );
     }
 
     #[test]
@@ -1886,9 +2221,9 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-        owner_workspace: None,
+            owner_workspace: None,
             short_id: "aa".to_string(),
-            };
+        };
         let menu = super::super::AttachMenu {
             servers: vec![("Unknown".to_string(), server)],
             selected: 0,
@@ -1905,7 +2240,9 @@ mod tests {
         };
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[])).unwrap();
+        terminal
+            .draw(|frame| draw_attach_menu(frame, &menu, &HashSet::new(), None, &[]))
+            .unwrap();
         assert!(buffer_contains(&terminal, "new-name"));
         assert!(buffer_contains(&terminal, "name taken"));
     }
@@ -1913,8 +2250,19 @@ mod tests {
     #[test]
     fn leaf_rects_single_leaf_returns_the_whole_area() {
         let id = Uuid::new_v4();
-        let tree = SplitTree::Leaf(ClientPane { id, name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() });
-        let area = Rect { x: 0, y: 0, width: 80, height: 24 };
+        let tree = SplitTree::Leaf(ClientPane {
+            id,
+            name: None,
+            tabs: vec![],
+            active_tab: 0,
+            short_id: "aa".to_string(),
+        });
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
         let rects = leaf_rects(&tree, area);
         assert_eq!(rects, vec![(id, area)]);
     }
@@ -1927,10 +2275,27 @@ mod tests {
             id: Uuid::new_v4(),
             dir: SplitDir::Vertical,
             ratio: 0.5,
-            a: Box::new(SplitTree::Leaf(ClientPane { id: a, name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() })),
-            b: Box::new(SplitTree::Leaf(ClientPane { id: b, name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() })),
+            a: Box::new(SplitTree::Leaf(ClientPane {
+                id: a,
+                name: None,
+                tabs: vec![],
+                active_tab: 0,
+                short_id: "aa".to_string(),
+            })),
+            b: Box::new(SplitTree::Leaf(ClientPane {
+                id: b,
+                name: None,
+                tabs: vec![],
+                active_tab: 0,
+                short_id: "aa".to_string(),
+            })),
         };
-        let area = Rect { x: 0, y: 0, width: 81, height: 24 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 81,
+            height: 24,
+        };
         let rects = leaf_rects(&tree, area);
         assert_eq!(rects.len(), 2);
         let rect_a = rects.iter().find(|(id, _)| *id == a).unwrap().1;
@@ -1950,10 +2315,27 @@ mod tests {
             id: Uuid::new_v4(),
             dir: SplitDir::Horizontal,
             ratio: 0.5,
-            a: Box::new(SplitTree::Leaf(ClientPane { id: a, name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() })),
-            b: Box::new(SplitTree::Leaf(ClientPane { id: b, name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() })),
+            a: Box::new(SplitTree::Leaf(ClientPane {
+                id: a,
+                name: None,
+                tabs: vec![],
+                active_tab: 0,
+                short_id: "aa".to_string(),
+            })),
+            b: Box::new(SplitTree::Leaf(ClientPane {
+                id: b,
+                name: None,
+                tabs: vec![],
+                active_tab: 0,
+                short_id: "aa".to_string(),
+            })),
         };
-        let area = Rect { x: 0, y: 0, width: 80, height: 24 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
         let rects = leaf_rects(&tree, area);
         assert_eq!(rects.len(), 2);
         let rect_a = rects.iter().find(|(id, _)| *id == a).unwrap().1;

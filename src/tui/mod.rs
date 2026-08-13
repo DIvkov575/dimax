@@ -1,4 +1,4 @@
-//! The `dimux attach` frontend: connects to the daemon, subscribes to a
+//! The `dimax attach` frontend: connects to the daemon, subscribes to a
 //! workspace, and renders it with `ratatui`. See design doc "Default
 //! keybinds (TUI)" and "Protocol / Subscription model".
 //!
@@ -44,7 +44,7 @@
 //! - **Quit key: `Ctrl-Q` (byte `0x11`), not `Ctrl-C`.** The design doc's
 //!   keybind table has no quit binding at all — every other chord is a
 //!   Kitty-forwarded Cmd-sequence, and there was never a "how does the
-//!   user leave `dimux attach`" decision made. `Ctrl-C` was deliberately
+//!   user leave `dimax attach`" decision made. `Ctrl-C` was deliberately
 //!   *not* picked: it needs to `PassThrough` to whatever's running in the
 //!   focused pane (interrupting a stuck program is one of the most common
 //!   reasons to press it), and stealing it globally would make that
@@ -73,7 +73,7 @@
 //!   keep going until a `Response` arrives.
 //! - **Frame reads never happen directly inside `run`'s `tokio::select!`
 //!   — they go through [`FrameReader`], a background task + channel.**
-//!   Root cause of the "dimux hangs often" reports: `run`'s loop used to
+//!   Root cause of the "dimax hangs often" reports: `run`'s loop used to
 //!   race `stdin.read` against `protocol::framing::read_frame` on the
 //!   socket directly in the same `select!`. `read_frame` is built on
 //!   `AsyncReadExt::read_exact`, which tokio documents as NOT
@@ -119,11 +119,18 @@
 //!   one `Request::ResizeSplit` is sent, on `Up`, committing the final
 //!   position — other frontends see the resize only once it's released,
 //!   not live throughout the drag.
+//! - **Text selection reuses the same left-button event stream.** A press
+//!   inside pane content maps screen coordinates back to that pane's
+//!   `GridSnapshot`; drag updates a pane-local range and release returns
+//!   its text for an OSC 52 clipboard write. No terminal configuration or
+//!   platform-specific clipboard process is required.
 
+mod first_run;
 pub mod keys;
 pub(crate) mod kitty_setup;
 pub mod mouse;
 pub mod render;
+mod selection;
 
 use crate::cli::Client;
 use crate::protocol::{
@@ -173,7 +180,10 @@ impl FrameReader {
     /// off the socket, since the background task (not this call) owns the
     /// actual `read_frame` invocation.
     async fn next(&mut self) -> anyhow::Result<ServerMessage> {
-        self.rx.recv().await.ok_or_else(|| anyhow::anyhow!("connection closed"))?
+        self.rx
+            .recv()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("connection closed"))?
     }
 }
 
@@ -183,6 +193,7 @@ impl FrameReader {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     SwitchWorkspace(u8),
+    JumpSession(u8),
     SplitVertical,
     SplitHorizontal,
     CloseFocusedPane,
@@ -198,7 +209,7 @@ pub enum Action {
     FocusRight,
     FocusUp,
     FocusDown,
-    /// Not a dimux chord — forward these raw bytes to the focused
+    /// Not a dimax chord — forward these raw bytes to the focused
     /// client-pane's bound server-pane as keyboard input.
     PassThrough,
 }
@@ -306,7 +317,7 @@ struct SpawnInGroupState {
 }
 
 /// Raw byte, read outside `keys::parse`'s chord grammar entirely, that
-/// exits `dimux attach`. See module doc "Quit key" for why this isn't
+/// exits `dimax attach`. See module doc "Quit key" for why this isn't
 /// `Ctrl-C`.
 const QUIT_BYTE: u8 = 0x11; // Ctrl-Q
 
@@ -362,6 +373,10 @@ struct App {
     /// `live_ratio` patched in via `SplitTree::resize_split`, reflecting
     /// the drag immediately without touching daemon state.
     dragging_split: Option<(crate::protocol::SplitId, f32)>,
+    /// Pane-local text selection created by a left-button drag. The
+    /// completed range remains visible after release; a new click,
+    /// keyboard action, scroll, or incompatible layout change clears it.
+    text_selection: Option<selection::TextSelection>,
     /// Directory groups in the attach menu currently collapsed (their
     /// member server-pane rows hidden, header still shown) -- keyed by
     /// the same group-key strings `group_servers_by_cwd` produces.
@@ -424,7 +439,9 @@ impl App {
     ) -> anyhow::Result<Self> {
         protocol::framing::write_frame(
             write_half,
-            &Request::Subscribe { workspace: workspace.to_string() },
+            &Request::Subscribe {
+                workspace: workspace.to_string(),
+            },
         )
         .await?;
         loop {
@@ -440,6 +457,7 @@ impl App {
                         attach_menu: None,
                         frame_area: ratatui::layout::Rect::default(),
                         dragging_split: None,
+                        text_selection: None,
                         collapsed_groups: HashSet::new(),
                         attach_menu_preview: None,
                         pinned_dirs: Vec::new(),
@@ -473,7 +491,10 @@ impl App {
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
-        let available = match self.request(write_half, reader, Request::ConsumeShellFallback).await? {
+        let available = match self
+            .request(write_half, reader, Request::ConsumeShellFallback)
+            .await?
+        {
             Response::ShellFallback { available } => available,
             _ => false,
         };
@@ -499,24 +520,28 @@ impl App {
                 dir: None,
                 bind: Some(server.id.to_string()),
             };
-            if let Response::ClientPaneCreated { pane, .. } = self.request(write_half, reader, req).await? {
+            if let Response::ClientPaneCreated { pane, .. } =
+                self.request(write_half, reader, req).await?
+            {
                 self.focused = Some(pane);
             }
             return Ok(());
         }
-        if let Response::PinnedDirsList(pinned) =
-            self.request(write_half, reader, Request::PinnedDirsList).await?
+        if let Response::PinnedDirsList(pinned) = self
+            .request(write_half, reader, Request::PinnedDirsList)
+            .await?
         {
             self.pinned_dirs = pinned;
         }
-        if let Response::ServerPaneList(servers) =
-            self.request(write_half, reader, Request::ServerList).await?
+        if let Response::ServerPaneList(servers) = self
+            .request(write_half, reader, Request::ServerList)
+            .await?
         {
             self.attach_menu = Some(AttachMenu {
                 servers: group_servers_by_cwd(
-                filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
-                &self.pinned_dirs,
-            ),
+                    filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
+                    &self.pinned_dirs,
+                ),
                 selected: 0,
                 pending_delete: None,
                 rename: None,
@@ -562,6 +587,7 @@ impl App {
                 if workspace == self.workspace.id {
                     self.workspace.tree = tree;
                     self.reconcile_focus();
+                    self.reconcile_text_selection();
                 }
             }
             Event::GridDelta { snapshot } => {
@@ -569,6 +595,13 @@ impl App {
             }
             Event::ServerPaneDied { server_pane } => {
                 self.grids.remove(&server_pane);
+                if self
+                    .text_selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.server_pane() == server_pane)
+                {
+                    self.text_selection = None;
+                }
             }
         }
     }
@@ -581,11 +614,29 @@ impl App {
     /// `client close` from elsewhere — gets correct focus reassignment
     /// for free instead of needing its own bespoke recovery logic.
     fn reconcile_focus(&mut self) {
-        let still_valid = self
-            .focused
-            .is_some_and(|id| self.workspace.tree.as_ref().is_some_and(|t| t.find(id).is_some()));
+        let still_valid = self.focused.is_some_and(|id| {
+            self.workspace
+                .tree
+                .as_ref()
+                .is_some_and(|t| t.find(id).is_some())
+        });
         if !still_valid {
             self.focused = first_leaf(&self.workspace);
+        }
+    }
+
+    fn reconcile_text_selection(&mut self) {
+        let still_valid = self.text_selection.as_ref().is_some_and(|selection| {
+            self.workspace
+                .tree
+                .as_ref()
+                .and_then(|tree| tree.find(selection.pane()))
+                .and_then(|pane| pane.active_bound())
+                == Some(selection.server_pane())
+                && self.grids.contains_key(&selection.server_pane())
+        });
+        if !still_valid {
+            self.text_selection = None;
         }
     }
 
@@ -596,9 +647,17 @@ impl App {
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
         let old = self.workspace.id;
-        let _ = self.request(write_half, reader, Request::Unsubscribe { workspace: old }).await?;
+        let _ = self
+            .request(write_half, reader, Request::Unsubscribe { workspace: old })
+            .await?;
         let resp = self
-            .request(write_half, reader, Request::Subscribe { workspace: n.to_string() })
+            .request(
+                write_half,
+                reader,
+                Request::Subscribe {
+                    workspace: n.to_string(),
+                },
+            )
             .await?;
         if let Response::Snapshot { workspace, grids } = resp {
             self.focused = first_leaf(&workspace);
@@ -606,6 +665,7 @@ impl App {
             self.grids = grids.into_iter().map(|g| (g.server_pane, g)).collect();
             self.attach_menu = None;
             self.dragging_split = None;
+            self.text_selection = None;
         }
         Ok(())
     }
@@ -616,7 +676,7 @@ impl App {
     /// removed entirely in favor of this direct "split + new shell"
     /// shortcut. Binding a client-pane to an *existing* server-pane, e.g.
     /// to display one shell in two places, is still possible via the CLI:
-    /// `dimux client bind <workspace>/<pane> <server-name>`.)
+    /// `dimax client bind <workspace>/<pane> <server-name>`.)
     ///
     /// `split_of: self.focused` splits the focused pane if there is one;
     /// if the workspace is empty (`self.focused` is `None`), `ClientSpawn`
@@ -649,7 +709,9 @@ impl App {
             dir: Some(dir),
             bind: Some(server.id.to_string()),
         };
-        if let Response::ClientPaneCreated { pane, .. } = self.request(write_half, reader, req).await? {
+        if let Response::ClientPaneCreated { pane, .. } =
+            self.request(write_half, reader, req).await?
+        {
             self.focused = Some(pane);
         }
         Ok(())
@@ -662,13 +724,21 @@ impl App {
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
-        let Some(pane) = self.focused else { return Ok(()) };
-        let Some(bound) =
-            self.workspace.tree.as_ref().and_then(|t| t.find(pane)).and_then(|p| p.active_bound())
+        let Some(pane) = self.focused else {
+            return Ok(());
+        };
+        let Some(bound) = self
+            .workspace
+            .tree
+            .as_ref()
+            .and_then(|t| t.find(pane))
+            .and_then(|p| p.active_bound())
         else {
             return Ok(());
         };
-        let req = Request::ServerKill { target: bound.to_string() };
+        let req = Request::ServerKill {
+            target: bound.to_string(),
+        };
         let _ = self.request(write_half, reader, req).await?;
         Ok(())
     }
@@ -692,8 +762,14 @@ impl App {
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
-        let Some(pane) = self.focused else { return Ok(()) };
-        let leaf = self.workspace.tree.as_ref().and_then(|tree| tree.find(pane));
+        let Some(pane) = self.focused else {
+            return Ok(());
+        };
+        let leaf = self
+            .workspace
+            .tree
+            .as_ref()
+            .and_then(|tree| tree.find(pane));
         // Read the current binding from local workspace state *before*
         // unbinding -- see `AttachMenu.previously_bound`'s doc comment
         // for why this has to happen here, not after `ClientUnbind`
@@ -701,22 +777,28 @@ impl App {
         let previously_bound = leaf.and_then(|leaf| leaf.active_bound());
         let has_multiple_tabs = leaf.is_some_and(|leaf| leaf.tabs.len() > 1);
         if !has_multiple_tabs {
-            let req = Request::ClientUnbind { workspace: self.workspace.id.to_string(), pane };
+            let req = Request::ClientUnbind {
+                workspace: self.workspace.id.to_string(),
+                pane,
+            };
             let _ = self.request(write_half, reader, req).await?;
         }
-        if let Response::PinnedDirsList(pinned) =
-            self.request(write_half, reader, Request::PinnedDirsList).await?
+        if let Response::PinnedDirsList(pinned) = self
+            .request(write_half, reader, Request::PinnedDirsList)
+            .await?
         {
             self.pinned_dirs = pinned;
         }
-        if let Response::ServerPaneList(servers) =
-            self.request(write_half, reader, Request::ServerList).await?
+        if let Response::ServerPaneList(servers) = self
+            .request(write_half, reader, Request::ServerList)
+            .await?
         {
             let grouped = group_servers_by_cwd(
                 filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
                 &self.pinned_dirs,
             );
-            let selected = initial_selection_for(&grouped, &self.collapsed_groups, previously_bound);
+            let selected =
+                initial_selection_for(&grouped, &self.collapsed_groups, previously_bound);
             self.attach_menu = Some(AttachMenu {
                 servers: grouped,
                 selected,
@@ -740,20 +822,24 @@ impl App {
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
-        let Some(_pane) = self.focused else { return Ok(()) };
-        if let Response::PinnedDirsList(pinned) =
-            self.request(write_half, reader, Request::PinnedDirsList).await?
+        let Some(_pane) = self.focused else {
+            return Ok(());
+        };
+        if let Response::PinnedDirsList(pinned) = self
+            .request(write_half, reader, Request::PinnedDirsList)
+            .await?
         {
             self.pinned_dirs = pinned;
         }
-        if let Response::ServerPaneList(servers) =
-            self.request(write_half, reader, Request::ServerList).await?
+        if let Response::ServerPaneList(servers) = self
+            .request(write_half, reader, Request::ServerList)
+            .await?
         {
             self.attach_menu = Some(AttachMenu {
                 servers: group_servers_by_cwd(
-                filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
-                &self.pinned_dirs,
-            ),
+                    filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
+                    &self.pinned_dirs,
+                ),
                 selected: 0,
                 pending_delete: None,
                 rename: None,
@@ -775,15 +861,20 @@ impl App {
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
-        let Some(pane) = self.focused else { return Ok(()) };
-        let req =
-            Request::ClientCycleTab { workspace: self.workspace.id.to_string(), pane, forward };
+        let Some(pane) = self.focused else {
+            return Ok(());
+        };
+        let req = Request::ClientCycleTab {
+            workspace: self.workspace.id.to_string(),
+            pane,
+            forward,
+        };
         let _ = self.request(write_half, reader, req).await?;
         Ok(())
     }
 
     /// `cmd-w`: drop the focused client-pane's active tab AND kill its
-    /// bound server-pane -- unlike `dimux client close`/`ClientCloseTab`
+    /// bound server-pane -- unlike `dimax client close`/`ClientCloseTab`
     /// alone (which deliberately leaves the server-pane running for
     /// scripted callers), this chord is meant to fully clean up what it
     /// was looking at, the same way `cmd-shift-w` kills on demand. A
@@ -800,21 +891,32 @@ impl App {
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
-        let Some(pane) = self.focused else { return Ok(()) };
+        let Some(pane) = self.focused else {
+            return Ok(());
+        };
         // Read the active tab's binding *before* closing it -- once
         // `ClientCloseTab` lands, the tab (and, if it was the last one,
         // the leaf itself) is already gone, so there's no later point
         // at which this could still be read back (same reasoning as
         // `AttachMenu.previously_bound`'s doc comment).
-        let bound =
-            self.workspace.tree.as_ref().and_then(|t| t.find(pane)).and_then(|p| p.active_bound());
-        let req = Request::ClientCloseTab { workspace: self.workspace.id.to_string(), pane };
+        let bound = self
+            .workspace
+            .tree
+            .as_ref()
+            .and_then(|t| t.find(pane))
+            .and_then(|p| p.active_bound());
+        let req = Request::ClientCloseTab {
+            workspace: self.workspace.id.to_string(),
+            pane,
+        };
         let _ = self.request(write_half, reader, req).await?;
         // `cmd-w` closes the tab AND kills its server-pane -- an unbound
         // tab (or an already-unbound placeholder) has nothing to kill,
         // so this only fires when there was a real binding.
         if let Some(server_pane) = bound {
-            let req = Request::ServerKill { target: server_pane.to_string() };
+            let req = Request::ServerKill {
+                target: server_pane.to_string(),
+            };
             let _ = self.request(write_half, reader, req).await?;
         }
         Ok(())
@@ -829,7 +931,10 @@ impl App {
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
-        let is_renaming = self.attach_menu.as_ref().is_some_and(|m| m.rename.is_some());
+        let is_renaming = self
+            .attach_menu
+            .as_ref()
+            .is_some_and(|m| m.rename.is_some());
         if is_renaming {
             match bytes {
                 b"\r" | b"\n" => self.confirm_rename(write_half, reader).await?,
@@ -849,8 +954,10 @@ impl App {
             return Ok(());
         }
 
-        let is_spawning_in_group =
-            self.attach_menu.as_ref().is_some_and(|m| m.spawn_in_group.is_some());
+        let is_spawning_in_group = self
+            .attach_menu
+            .as_ref()
+            .is_some_and(|m| m.spawn_in_group.is_some());
         if is_spawning_in_group {
             match bytes {
                 // Plain Enter: spawn, bind into the just-detached
@@ -858,8 +965,14 @@ impl App {
                 // (the `\x1b_Ds\x1b\\` chord -- see `keys.rs` module
                 // doc's chord table): spawn and send, but leave it
                 // unbound so it doesn't disturb the current pane.
-                b"\r" | b"\n" => self.confirm_spawn_in_group(true, write_half, reader).await?,
-                keys::SHIFT_ENTER_CHORD => self.confirm_spawn_in_group(false, write_half, reader).await?,
+                b"\r" | b"\n" => {
+                    self.confirm_spawn_in_group(true, write_half, reader)
+                        .await?
+                }
+                keys::SHIFT_ENTER_CHORD => {
+                    self.confirm_spawn_in_group(false, write_half, reader)
+                        .await?
+                }
                 b"\x1b" => {
                     if let Some(menu) = &mut self.attach_menu {
                         menu.spawn_in_group = None;
@@ -876,8 +989,10 @@ impl App {
             return Ok(());
         }
 
-        let has_pending_delete =
-            self.attach_menu.as_ref().is_some_and(|m| m.pending_delete.is_some());
+        let has_pending_delete = self
+            .attach_menu
+            .as_ref()
+            .is_some_and(|m| m.pending_delete.is_some());
         if has_pending_delete {
             match bytes {
                 b"x" | b"\r" | b"\n" => self.confirm_delete(write_half, reader).await?,
@@ -911,7 +1026,8 @@ impl App {
         // inline field with it as the starting text. No separate "enter
         // input mode" key, per this field's whole point: a text box
         // that happens to be a menu row.
-        if let Some(AttachMenuRow::SpawnNewInGroup(server_index)) = self.selected_attach_menu_row() {
+        if let Some(AttachMenuRow::SpawnNewInGroup(server_index)) = self.selected_attach_menu_row()
+        {
             match bytes {
                 b"\x1b[A" | b"k" => self.move_attach_menu_selection(false),
                 b"\x1b[B" | b"j" => self.move_attach_menu_selection(true),
@@ -937,7 +1053,8 @@ impl App {
             return Ok(());
         }
 
-        self.dispatch_attach_menu_action(parse_attach_menu_input(bytes), write_half, reader).await
+        self.dispatch_attach_menu_action(parse_attach_menu_input(bytes), write_half, reader)
+            .await
     }
 
     /// Browse-mode dispatch: everything `handle_attach_menu_input` routes
@@ -954,15 +1071,23 @@ impl App {
         match action {
             AttachMenuAction::Up => self.move_attach_menu_selection(false),
             AttachMenuAction::Down => self.move_attach_menu_selection(true),
-            AttachMenuAction::Cancel => self.cancel_and_restore_previous_binding(write_half, reader).await?,
-            AttachMenuAction::Confirm => self.confirm_or_toggle_attach_menu(write_half, reader).await?,
+            AttachMenuAction::Cancel => {
+                self.cancel_and_restore_previous_binding(write_half, reader)
+                    .await?
+            }
+            AttachMenuAction::Confirm => {
+                self.confirm_or_toggle_attach_menu(write_half, reader)
+                    .await?
+            }
             AttachMenuAction::Delete => self.arm_delete(),
             AttachMenuAction::StartRename => self.start_rename(),
             AttachMenuAction::TogglePin => self.toggle_directory_pin(write_half, reader).await?,
             AttachMenuAction::ToggleShowAllWorkspaces => {
                 self.toggle_show_all_workspaces(write_half, reader).await?
             }
-            AttachMenuAction::DetachAll => self.detach_all_and_close_menu(write_half, reader).await?,
+            AttachMenuAction::DetachAll => {
+                self.detach_all_and_close_menu(write_half, reader).await?
+            }
             AttachMenuAction::Ignore => {}
         }
         Ok(())
@@ -984,7 +1109,7 @@ impl App {
     /// a previous selection in that case, so a header/spawn row never
     /// shows the last real pane's leftover content); otherwise fetches
     /// that pane's current screen via `Request::ServerRead` -- the same
-    /// wire request `dimux server read` uses, chosen because it needs
+    /// wire request `dimax server read` uses, chosen because it needs
     /// no workspace/client-pane binding at all, matching how little the
     /// rest of the attach menu (`ServerRead`'s siblings `ServerKill`/
     /// `ServerRename`) needs to reach a pane.
@@ -1003,9 +1128,13 @@ impl App {
             self.attach_menu_preview = None;
             return Ok(());
         };
-        let Some(menu) = &self.attach_menu else { return Ok(()) };
+        let Some(menu) = &self.attach_menu else {
+            return Ok(());
+        };
         let target = menu.servers[server_index].1.id;
-        let req = Request::ServerRead { target: target.to_string() };
+        let req = Request::ServerRead {
+            target: target.to_string(),
+        };
         if let Response::ServerReadOutput { text } = self.request(write_half, reader, req).await? {
             self.attach_menu_preview = Some((target, text));
         }
@@ -1014,9 +1143,15 @@ impl App {
 
     fn move_attach_menu_selection(&mut self, forward: bool) {
         let collapsed = self.collapsed_groups.clone();
-        let Some(menu) = &mut self.attach_menu else { return };
+        let Some(menu) = &mut self.attach_menu else {
+            return;
+        };
         let len = visible_attach_menu_rows(&menu.servers, &collapsed).len();
-        menu.selected = if forward { (menu.selected + 1) % len } else { (menu.selected + len - 1) % len };
+        menu.selected = if forward {
+            (menu.selected + 1) % len
+        } else {
+            (menu.selected + len - 1) % len
+        };
     }
 
     /// Enter/`\r` on a group header toggles that group's collapse; on a
@@ -1040,7 +1175,9 @@ impl App {
     /// Flip the collapsed state of the group whose first member sits at
     /// `menu.servers[server_index]`. A no-op if `attach_menu` is `None`.
     fn toggle_group_collapse(&mut self, server_index: usize) {
-        let Some(menu) = &self.attach_menu else { return };
+        let Some(menu) = &self.attach_menu else {
+            return;
+        };
         let key = menu.servers[server_index].0.clone();
         if !self.collapsed_groups.remove(&key) {
             self.collapsed_groups.insert(key);
@@ -1051,7 +1188,9 @@ impl App {
         // onto the new last row rather than leaving an out-of-bounds
         // index for the next lookup/render to trip over.
         let collapsed = self.collapsed_groups.clone();
-        let Some(menu) = &mut self.attach_menu else { return };
+        let Some(menu) = &mut self.attach_menu else {
+            return;
+        };
         let len = visible_attach_menu_rows(&menu.servers, &collapsed).len();
         if menu.selected >= len {
             menu.selected = len - 1;
@@ -1075,23 +1214,29 @@ impl App {
         let Some(AttachMenuRow::GroupHeader(server_index)) = self.selected_attach_menu_row() else {
             return Ok(());
         };
-        let Some(menu) = &self.attach_menu else { return Ok(()) };
+        let Some(menu) = &self.attach_menu else {
+            return Ok(());
+        };
         let dir = menu.servers[server_index].0.clone();
 
-        if let Response::PinnedDirsList(pinned) =
-            self.request(write_half, reader, Request::ToggleDirectoryPin { dir }).await?
+        if let Response::PinnedDirsList(pinned) = self
+            .request(write_half, reader, Request::ToggleDirectoryPin { dir })
+            .await?
         {
             self.pinned_dirs = pinned;
         }
-        if let Response::ServerPaneList(servers) =
-            self.request(write_half, reader, Request::ServerList).await?
+        if let Response::ServerPaneList(servers) = self
+            .request(write_half, reader, Request::ServerList)
+            .await?
         {
             let grouped = group_servers_by_cwd(
                 filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
                 &self.pinned_dirs,
             );
             let collapsed = self.collapsed_groups.clone();
-            let Some(menu) = &mut self.attach_menu else { return Ok(()) };
+            let Some(menu) = &mut self.attach_menu else {
+                return Ok(());
+            };
             menu.servers = grouped;
             let len = visible_attach_menu_rows(&menu.servers, &collapsed).len();
             if menu.selected >= len {
@@ -1112,15 +1257,18 @@ impl App {
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
         self.show_all_workspaces = !self.show_all_workspaces;
-        if let Response::ServerPaneList(servers) =
-            self.request(write_half, reader, Request::ServerList).await?
+        if let Response::ServerPaneList(servers) = self
+            .request(write_half, reader, Request::ServerList)
+            .await?
         {
             let grouped = group_servers_by_cwd(
                 filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
                 &self.pinned_dirs,
             );
             let collapsed = self.collapsed_groups.clone();
-            let Some(menu) = &mut self.attach_menu else { return Ok(()) };
+            let Some(menu) = &mut self.attach_menu else {
+                return Ok(());
+            };
             menu.servers = grouped;
             let len = visible_attach_menu_rows(&menu.servers, &collapsed).len();
             if menu.selected >= len {
@@ -1145,9 +1293,18 @@ impl App {
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
-        let previously_bound = self.attach_menu.take().and_then(|menu| menu.previously_bound);
-        let (Some(pane), Some(target)) = (self.focused, previously_bound) else { return Ok(()) };
-        let req = Request::ClientBind { workspace: self.workspace.id.to_string(), pane, target: target.to_string() };
+        let previously_bound = self
+            .attach_menu
+            .take()
+            .and_then(|menu| menu.previously_bound);
+        let (Some(pane), Some(target)) = (self.focused, previously_bound) else {
+            return Ok(());
+        };
+        let req = Request::ClientBind {
+            workspace: self.workspace.id.to_string(),
+            pane,
+            target: target.to_string(),
+        };
         let _ = self.request(write_half, reader, req).await?;
         Ok(())
     }
@@ -1165,7 +1322,9 @@ impl App {
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
         self.attach_menu = None;
-        let Some(pane) = self.focused else { return Ok(()) };
+        let Some(pane) = self.focused else {
+            return Ok(());
+        };
         for _ in 0..64 {
             let still_bound = self
                 .workspace
@@ -1176,7 +1335,10 @@ impl App {
             if !still_bound {
                 break;
             }
-            let req = Request::ClientUnbind { workspace: self.workspace.id.to_string(), pane };
+            let req = Request::ClientUnbind {
+                workspace: self.workspace.id.to_string(),
+                pane,
+            };
             let _ = self.request(write_half, reader, req).await?;
         }
         Ok(())
@@ -1186,8 +1348,12 @@ impl App {
     /// server-pane row; a no-op on a group header or the trailing "spawn
     /// new" row (nothing to delete there).
     fn arm_delete(&mut self) {
-        let Some(AttachMenuRow::Server(server_index)) = self.selected_attach_menu_row() else { return };
-        let Some(menu) = &mut self.attach_menu else { return };
+        let Some(AttachMenuRow::Server(server_index)) = self.selected_attach_menu_row() else {
+            return;
+        };
+        let Some(menu) = &mut self.attach_menu else {
+            return;
+        };
         menu.pending_delete = Some(server_index);
     }
 
@@ -1203,19 +1369,28 @@ impl App {
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
-        let Some(menu) = &mut self.attach_menu else { return Ok(()) };
-        let Some(index) = menu.pending_delete.take() else { return Ok(()) };
+        let Some(menu) = &mut self.attach_menu else {
+            return Ok(());
+        };
+        let Some(index) = menu.pending_delete.take() else {
+            return Ok(());
+        };
         let target = menu.servers[index].1.id.to_string();
-        let _ = self.request(write_half, reader, Request::ServerKill { target }).await?;
-        if let Response::ServerPaneList(servers) =
-            self.request(write_half, reader, Request::ServerList).await?
+        let _ = self
+            .request(write_half, reader, Request::ServerKill { target })
+            .await?;
+        if let Response::ServerPaneList(servers) = self
+            .request(write_half, reader, Request::ServerList)
+            .await?
         {
             let grouped = group_servers_by_cwd(
                 filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
                 &self.pinned_dirs,
             );
             let collapsed = self.collapsed_groups.clone();
-            let Some(menu) = &mut self.attach_menu else { return Ok(()) };
+            let Some(menu) = &mut self.attach_menu else {
+                return Ok(());
+            };
             menu.servers = grouped;
             let len = visible_attach_menu_rows(&menu.servers, &collapsed).len();
             if menu.selected >= len {
@@ -1232,11 +1407,24 @@ impl App {
     /// of the pre-filled text. A no-op on a group header or the trailing
     /// "spawn new" row.
     fn start_rename(&mut self) {
-        let Some(AttachMenuRow::Server(server_index)) = self.selected_attach_menu_row() else { return };
-        let Some(menu) = &mut self.attach_menu else { return };
-        let text = menu.servers[server_index].1.name.clone().unwrap_or_default();
+        let Some(AttachMenuRow::Server(server_index)) = self.selected_attach_menu_row() else {
+            return;
+        };
+        let Some(menu) = &mut self.attach_menu else {
+            return;
+        };
+        let text = menu.servers[server_index]
+            .1
+            .name
+            .clone()
+            .unwrap_or_default();
         let cursor = text.len();
-        menu.rename = Some(RenameState { index: server_index, text, cursor, error: None });
+        menu.rename = Some(RenameState {
+            index: server_index,
+            text,
+            cursor,
+            error: None,
+        });
     }
 
     /// Submit the active rename field's current text: a no-op if empty
@@ -1250,8 +1438,12 @@ impl App {
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
-        let Some(menu) = &self.attach_menu else { return Ok(()) };
-        let Some(rename) = &menu.rename else { return Ok(()) };
+        let Some(menu) = &self.attach_menu else {
+            return Ok(());
+        };
+        let Some(rename) = &menu.rename else {
+            return Ok(());
+        };
         if rename.text.is_empty() {
             return Ok(());
         }
@@ -1260,14 +1452,21 @@ impl App {
         let req = Request::ServerRename { target, new_name };
         match self.request(write_half, reader, req).await? {
             Response::Ack => {
-                if let Response::ServerPaneList(servers) =
-                    self.request(write_half, reader, Request::ServerList).await?
+                if let Response::ServerPaneList(servers) = self
+                    .request(write_half, reader, Request::ServerList)
+                    .await?
                 {
                     let grouped = group_servers_by_cwd(
-                filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
-                &self.pinned_dirs,
-            );
-                    let Some(menu) = &mut self.attach_menu else { return Ok(()) };
+                        filter_servers_for_menu(
+                            servers,
+                            self.workspace.id,
+                            self.show_all_workspaces,
+                        ),
+                        &self.pinned_dirs,
+                    );
+                    let Some(menu) = &mut self.attach_menu else {
+                        return Ok(());
+                    };
                     menu.servers = grouped;
                     menu.rename = None;
                 }
@@ -1296,8 +1495,12 @@ impl App {
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
-        let Some(row) = self.selected_attach_menu_row() else { return Ok(()) };
-        let Some(menu) = self.attach_menu.take() else { return Ok(()) };
+        let Some(row) = self.selected_attach_menu_row() else {
+            return Ok(());
+        };
+        let Some(menu) = self.attach_menu.take() else {
+            return Ok(());
+        };
         let adding_tab = menu.adding_tab;
         let target = match row {
             AttachMenuRow::Server(server_index) => menu.servers[server_index].1.id.to_string(),
@@ -1340,11 +1543,19 @@ impl App {
         };
         match self.focused {
             Some(pane) if adding_tab => {
-                let req = Request::ClientAddTab { workspace: self.workspace.id.to_string(), pane, target };
+                let req = Request::ClientAddTab {
+                    workspace: self.workspace.id.to_string(),
+                    pane,
+                    target,
+                };
                 let _ = self.request(write_half, reader, req).await?;
             }
             Some(pane) => {
-                let req = Request::ClientBind { workspace: self.workspace.id.to_string(), pane, target };
+                let req = Request::ClientBind {
+                    workspace: self.workspace.id.to_string(),
+                    pane,
+                    target,
+                };
                 let _ = self.request(write_half, reader, req).await?;
             }
             None => {
@@ -1358,7 +1569,9 @@ impl App {
                     dir: None,
                     bind: Some(target),
                 };
-                if let Response::ClientPaneCreated { pane, .. } = self.request(write_half, reader, req).await? {
+                if let Response::ClientPaneCreated { pane, .. } =
+                    self.request(write_half, reader, req).await?
+                {
                     self.focused = Some(pane);
                 }
             }
@@ -1389,8 +1602,12 @@ impl App {
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
-        let Some(menu) = &self.attach_menu else { return Ok(()) };
-        let Some(spawn) = &menu.spawn_in_group else { return Ok(()) };
+        let Some(menu) = &self.attach_menu else {
+            return Ok(());
+        };
+        let Some(spawn) = &menu.spawn_in_group else {
+            return Ok(());
+        };
         let cwd = menu.servers[spawn.group_server_index].0.clone();
         let text = spawn.text.clone();
 
@@ -1411,9 +1628,7 @@ impl App {
             _ => return Ok(()),
         };
 
-        if bind
-            && let Some(pane) = self.focused
-        {
+        if bind && let Some(pane) = self.focused {
             let adding_tab = self.attach_menu.as_ref().is_some_and(|m| m.adding_tab);
             let req = if adding_tab {
                 Request::ClientAddTab {
@@ -1432,18 +1647,23 @@ impl App {
         }
 
         if !text.is_empty() {
-            let req = Request::ServerSend { target: server_pane.to_string(), text, enter: true };
+            let req = Request::ServerSend {
+                target: server_pane.to_string(),
+                text,
+                enter: true,
+            };
             let _ = self.request(write_half, reader, req).await?;
         }
 
         if !bind {
-            if let Response::ServerPaneList(servers) =
-                self.request(write_half, reader, Request::ServerList).await?
+            if let Response::ServerPaneList(servers) = self
+                .request(write_half, reader, Request::ServerList)
+                .await?
             {
                 let grouped = group_servers_by_cwd(
-                filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
-                &self.pinned_dirs,
-            );
+                    filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
+                    &self.pinned_dirs,
+                );
                 let collapsed = self.collapsed_groups.clone();
                 if let Some(menu) = &mut self.attach_menu {
                     menu.servers = grouped;
@@ -1463,82 +1683,158 @@ impl App {
 
     fn move_focus(&mut self, direction: Direction) {
         if let Some(tree) = &self.workspace.tree
-            && let Some(next) = nearest_leaf_in_direction(tree, self.frame_area, self.focused, direction)
+            && let Some(next) =
+                nearest_leaf_in_direction(tree, self.frame_area, self.focused, direction)
         {
             self.focused = Some(next);
         }
     }
 
-    /// Route one parsed [`mouse::MouseEvent`] — divider drag-resizing
-    /// and click-to-focus. `Down` hit-tests against the current
-    /// layout's divider grab zones first (recomputed fresh every call
-    /// via `render::divider_rects`, since the layout can change between
-    /// mouse events); if that misses, it hit-tests `render::leaf_rects`
-    /// instead and focuses whichever leaf the click landed in. `Drag`
-    /// updates `dragging_split`'s live ratio purely locally — no
-    /// request sent — so the drag renders smoothly without
-    /// flooding the daemon (see the field doc on `dragging_split` for why
-    /// this replaced the original "send on every move" design). `Up`
-    /// commits the final position with exactly one `Request::ResizeSplit`
-    /// and clears the drag. A `Drag`/`Up` with no split currently held is
-    /// a plain mouse move with no button pressed on this pane (or a drag
-    /// that started outside any divider) and is ignored.
+    /// Route one parsed [`mouse::MouseEvent`] — divider drag-resizing,
+    /// click-to-focus, and pane-local text selection. `Down` hit-tests
+    /// against the current layout's divider grab zones first (recomputed
+    /// fresh every call via `render::divider_rects`, since the layout can
+    /// change between mouse events); if that misses, it focuses the leaf
+    /// under the pointer and starts a selection when the pointer is over
+    /// that leaf's terminal content. `Drag` updates either
+    /// `dragging_split`'s live ratio or the active text range purely
+    /// locally — no request is sent — so both interactions render
+    /// smoothly without flooding the daemon (see the field doc on
+    /// `dragging_split` for why this replaced the original "send on every
+    /// move" design). `Up`
+    /// commits a divider position with exactly one `Request::ResizeSplit`,
+    /// or returns the completed selection's text for the event loop to
+    /// copy through OSC 52. A plain click returns no text.
     async fn handle_mouse(
         &mut self,
         event: mouse::MouseEvent,
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<String>> {
         match event {
             mouse::MouseEvent::Down { col, row } => {
-                let Some(tree) = &self.workspace.tree else { return Ok(()) };
+                self.dragging_split = None;
+                self.text_selection = None;
+                let Some(tree) = &self.workspace.tree else {
+                    return Ok(None);
+                };
                 let hits = render::divider_rects(tree, self.frame_area);
                 if let Some(split) = hit_test_dividers(&hits, col, row) {
                     let hit = hits.iter().find(|h| h.split == split).expect(
                         "hit_test_dividers only returns a split id that came from this exact `hits` list",
                     );
                     self.dragging_split = Some((split, render::ratio_at(hit, col, row)));
-                } else if let Some((pane, _)) = render::leaf_rects(tree, self.frame_area)
+                } else if let Some((pane, rect)) = render::leaf_rects(tree, self.frame_area)
                     .into_iter()
                     .find(|(_, rect)| {
-                        col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+                        col >= rect.x
+                            && col < rect.x + rect.width
+                            && row >= rect.y
+                            && row < rect.y + rect.height
                     })
                 {
                     self.focused = Some(pane);
+                    let server_pane = tree.find(pane).and_then(|pane| pane.active_bound());
+                    if let Some(server_pane) = server_pane
+                        && let Some(snapshot) = self.grids.get(&server_pane)
+                        && let Some(position) = selection::position_at(rect, snapshot, col, row)
+                    {
+                        self.text_selection =
+                            Some(selection::TextSelection::new(pane, server_pane, position));
+                    }
                 }
             }
             mouse::MouseEvent::ScrollUp { col, row } => {
-                self.scroll_pane_under(col, row, SCROLL_ROWS_PER_TICK, write_half, reader).await?;
+                self.text_selection = None;
+                self.scroll_pane_under(col, row, SCROLL_ROWS_PER_TICK, write_half, reader)
+                    .await?;
             }
             mouse::MouseEvent::ScrollDown { col, row } => {
-                self.scroll_pane_under(col, row, -SCROLL_ROWS_PER_TICK, write_half, reader).await?;
+                self.text_selection = None;
+                self.scroll_pane_under(col, row, -SCROLL_ROWS_PER_TICK, write_half, reader)
+                    .await?;
             }
             mouse::MouseEvent::Drag { col, row } => {
-                let Some((split, _)) = self.dragging_split else { return Ok(()) };
-                let Some(tree) = &self.workspace.tree else { return Ok(()) };
-                let Some(hit) = render::divider_rects(tree, self.frame_area)
-                    .into_iter()
-                    .find(|hit| hit.split == split)
-                else {
-                    // The split disappeared from under the drag (e.g.
-                    // closed by another frontend mid-drag) -- nothing
-                    // left to resize.
-                    self.dragging_split = None;
-                    return Ok(());
-                };
-                self.dragging_split = Some((split, render::ratio_at(&hit, col, row)));
+                if let Some((split, _)) = self.dragging_split {
+                    let Some(tree) = &self.workspace.tree else {
+                        return Ok(None);
+                    };
+                    let Some(hit) = render::divider_rects(tree, self.frame_area)
+                        .into_iter()
+                        .find(|hit| hit.split == split)
+                    else {
+                        // The split disappeared from under the drag
+                        // (e.g. closed by another frontend mid-drag).
+                        self.dragging_split = None;
+                        return Ok(None);
+                    };
+                    self.dragging_split = Some((split, render::ratio_at(&hit, col, row)));
+                } else if let Some((pane, server_pane)) = self
+                    .text_selection
+                    .as_ref()
+                    .filter(|selection| selection.is_dragging())
+                    .map(|selection| (selection.pane(), selection.server_pane()))
+                    && let Some(position) = self.selection_position(pane, server_pane, col, row)
+                    && let Some(selection) = &mut self.text_selection
+                {
+                    selection.update(position);
+                }
             }
-            mouse::MouseEvent::Up { .. } => {
-                let Some((split, ratio)) = self.dragging_split.take() else { return Ok(()) };
-                let req = Request::ResizeSplit {
-                    workspace: self.workspace.id.to_string(),
-                    split,
-                    new_ratio: ratio,
+            mouse::MouseEvent::Up { col, row } => {
+                if let Some((split, ratio)) = self.dragging_split.take() {
+                    let req = Request::ResizeSplit {
+                        workspace: self.workspace.id.to_string(),
+                        split,
+                        new_ratio: ratio,
+                    };
+                    let _ = self.request(write_half, reader, req).await?;
+                    return Ok(None);
+                }
+
+                let Some((pane, server_pane)) = self
+                    .text_selection
+                    .as_ref()
+                    .filter(|selection| selection.is_dragging())
+                    .map(|selection| (selection.pane(), selection.server_pane()))
+                else {
+                    return Ok(None);
                 };
-                let _ = self.request(write_half, reader, req).await?;
+                let Some(position) = self.selection_position(pane, server_pane, col, row) else {
+                    self.text_selection = None;
+                    return Ok(None);
+                };
+                let selection = self
+                    .text_selection
+                    .as_mut()
+                    .expect("the active selection was read immediately above and cannot disappear");
+                if !selection.finish(position) {
+                    self.text_selection = None;
+                    return Ok(None);
+                }
+                let text = self
+                    .grids
+                    .get(&server_pane)
+                    .and_then(|snapshot| selection::selected_text(snapshot, selection))
+                    .filter(|text| !text.is_empty());
+                return Ok(text);
             }
         }
-        Ok(())
+        Ok(None)
+    }
+
+    fn selection_position(
+        &self,
+        pane: ClientPaneId,
+        server_pane: ServerPaneId,
+        col: u16,
+        row: u16,
+    ) -> Option<selection::GridPosition> {
+        let tree = self.workspace.tree.as_ref()?;
+        let (_, rect) = render::leaf_rects(tree, self.frame_area)
+            .into_iter()
+            .find(|(candidate, _)| *candidate == pane)?;
+        let snapshot = self.grids.get(&server_pane)?;
+        selection::clamped_position(rect, snapshot, col, row)
     }
 
     /// Hit-test `(col, row)` against the current workspace's leaves and
@@ -1554,11 +1850,16 @@ impl App {
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
-        let Some(tree) = &self.workspace.tree else { return Ok(()) };
+        let Some(tree) = &self.workspace.tree else {
+            return Ok(());
+        };
         let hit = render::leaf_rects(tree, self.frame_area)
             .into_iter()
             .find(|(_, rect)| {
-                col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+                col >= rect.x
+                    && col < rect.x + rect.width
+                    && row >= rect.y
+                    && row < rect.y + rect.height
             });
         let Some((pane, _)) = hit else { return Ok(()) };
         let req = Request::ScrollClientPane { pane, delta };
@@ -1574,8 +1875,10 @@ impl App {
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
+        self.text_selection = None;
         match action {
             Action::SwitchWorkspace(n) => self.switch_workspace(n, write_half, reader).await?,
+            Action::JumpSession(n) => self.jump_session(n, write_half, reader).await?,
             Action::SplitVertical => self.split(SplitDir::Vertical, write_half, reader).await?,
             Action::SplitHorizontal => self.split(SplitDir::Horizontal, write_half, reader).await?,
             Action::CloseFocusedPane => self.close_tab(write_half, reader).await?,
@@ -1592,11 +1895,44 @@ impl App {
             Action::FocusDown => self.move_focus(Direction::Down),
             Action::PassThrough => {
                 if let Some(pane) = self.focused {
-                    let req = Request::Input { pane, bytes: raw.to_vec() };
+                    let req = Request::Input {
+                        pane,
+                        bytes: raw.to_vec(),
+                    };
                     let _ = self.request(write_half, reader, req).await?;
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Bind the focused client-pane to the nth server-pane in the
+    /// daemon's stable, name-sorted list. Missing indices and an absent
+    /// focused pane are no-ops; this action never creates a session.
+    async fn jump_session(
+        &mut self,
+        number: u8,
+        write_half: &mut OwnedWriteHalf,
+        reader: &mut FrameReader,
+    ) -> anyhow::Result<()> {
+        let Some(pane) = self.focused else {
+            return Ok(());
+        };
+        let Response::ServerPaneList(servers) = self
+            .request(write_half, reader, Request::ServerList)
+            .await?
+        else {
+            return Ok(());
+        };
+        let Some(server) = servers.get(usize::from(number.saturating_sub(1))) else {
+            return Ok(());
+        };
+        let req = Request::ClientBind {
+            workspace: self.workspace.id.to_string(),
+            pane,
+            target: server.id.to_string(),
+        };
+        let _ = self.request(write_half, reader, req).await?;
         Ok(())
     }
 }
@@ -1605,7 +1941,10 @@ impl App {
 /// workspace is empty. Used both for the initial focus pick and whenever
 /// the tree changes out from under the current focus.
 fn first_leaf(workspace: &WorkspaceInfo) -> Option<ClientPaneId> {
-    workspace.tree.as_ref().and_then(|t| t.leaves().first().map(|p| p.id))
+    workspace
+        .tree
+        .as_ref()
+        .and_then(|t| t.leaves().first().map(|p| p.id))
 }
 
 /// Find whichever leaf is nearest to `current` in the given screen
@@ -1629,7 +1968,8 @@ fn nearest_leaf_in_direction(
     if rects.is_empty() {
         return None;
     }
-    let focused_rect = current.and_then(|id| rects.iter().find(|(pane, _)| *pane == id).map(|(_, r)| *r));
+    let focused_rect =
+        current.and_then(|id| rects.iter().find(|(pane, _)| *pane == id).map(|(_, r)| *r));
     let Some(focused_rect) = focused_rect else {
         return Some(rects[0].0);
     };
@@ -1652,7 +1992,11 @@ fn nearest_leaf_in_direction(
 
 /// Whether `other` is positioned in `direction` relative to `focused`
 /// -- strictly on that side, not overlapping it on the movement axis.
-fn is_in_direction(focused: ratatui::layout::Rect, other: ratatui::layout::Rect, direction: Direction) -> bool {
+fn is_in_direction(
+    focused: ratatui::layout::Rect,
+    other: ratatui::layout::Rect,
+    direction: Direction,
+) -> bool {
     match direction {
         Direction::Left => other.x + other.width <= focused.x,
         Direction::Right => other.x >= focused.x + focused.width,
@@ -1664,7 +2008,11 @@ fn is_in_direction(focused: ratatui::layout::Rect, other: ratatui::layout::Rect,
 /// The gap between `focused` and `other` along the movement axis --
 /// smaller means nearer. Only meaningful for a pair `is_in_direction`
 /// already confirmed, so this never underflows.
-fn axis_gap(focused: ratatui::layout::Rect, other: ratatui::layout::Rect, direction: Direction) -> u16 {
+fn axis_gap(
+    focused: ratatui::layout::Rect,
+    other: ratatui::layout::Rect,
+    direction: Direction,
+) -> u16 {
     match direction {
         Direction::Left => focused.x - (other.x + other.width),
         Direction::Right => other.x - (focused.x + focused.width),
@@ -1677,22 +2025,38 @@ fn axis_gap(focused: ratatui::layout::Rect, other: ratatui::layout::Rect, direct
 /// to `direction` -- larger means "more directly across from" rather
 /// than a diagonal neighbor. Zero if they don't overlap on that axis
 /// at all.
-fn perpendicular_overlap(focused: ratatui::layout::Rect, other: ratatui::layout::Rect, direction: Direction) -> u16 {
+fn perpendicular_overlap(
+    focused: ratatui::layout::Rect,
+    other: ratatui::layout::Rect,
+    direction: Direction,
+) -> u16 {
     let (focused_start, focused_end, other_start, other_end) = match direction {
-        Direction::Left | Direction::Right => {
-            (focused.y, focused.y + focused.height, other.y, other.y + other.height)
-        }
-        Direction::Up | Direction::Down => {
-            (focused.x, focused.x + focused.width, other.x, other.x + other.width)
-        }
+        Direction::Left | Direction::Right => (
+            focused.y,
+            focused.y + focused.height,
+            other.y,
+            other.y + other.height,
+        ),
+        Direction::Up | Direction::Down => (
+            focused.x,
+            focused.x + focused.width,
+            other.x,
+            other.x + other.width,
+        ),
     };
-    focused_end.min(other_end).saturating_sub(focused_start.max(other_start))
+    focused_end
+        .min(other_end)
+        .saturating_sub(focused_start.max(other_start))
 }
 
 /// Find whichever divider's grab zone contains `(col, row)`, if any. Pure
 /// hit-testing logic factored out of `App::handle_mouse` so it's directly
 /// unit-testable without a live connection.
-fn hit_test_dividers(hits: &[render::DividerHit], col: u16, row: u16) -> Option<crate::protocol::SplitId> {
+fn hit_test_dividers(
+    hits: &[render::DividerHit],
+    col: u16,
+    row: u16,
+) -> Option<crate::protocol::SplitId> {
     hits.iter()
         .find(|hit| {
             col >= hit.grab_zone.x
@@ -1845,12 +2209,17 @@ fn initial_selection_for(
     collapsed: &HashSet<String>,
     previously_bound: Option<ServerPaneId>,
 ) -> usize {
-    let Some(previously_bound) = previously_bound else { return 0 };
+    let Some(previously_bound) = previously_bound else {
+        return 0;
+    };
     let Some(server_index) = servers.iter().position(|(_, s)| s.id == previously_bound) else {
         return 0;
     };
     let rows = visible_attach_menu_rows(servers, collapsed);
-    if let Some(row_index) = rows.iter().position(|row| *row == AttachMenuRow::Server(server_index)) {
+    if let Some(row_index) = rows
+        .iter()
+        .position(|row| *row == AttachMenuRow::Server(server_index))
+    {
         return row_index;
     }
     // The group is collapsed -- its Server row is hidden, but its header
@@ -1864,12 +2233,12 @@ fn initial_selection_for(
 
 /// Filter `servers` down to what the attach menu should actually show:
 /// every pane owned by `current_workspace` plus every orphaned pane
-/// (`owner_workspace: None`, e.g. spawned via `dimux server spawn` from
+/// (`owner_workspace: None`, e.g. spawned via `dimax server spawn` from
 /// the CLI, which has no workspace context) -- unless `show_all` is set,
 /// in which case every pane passes through untouched. This is what makes
 /// "harder to access" real: another workspace's own panes are never
 /// listed by default, though nothing stops picking them once `a` reveals
-/// them, and it never affects the CLI (`dimux server ls` and friends
+/// them, and it never affects the CLI (`dimax server ls` and friends
 /// always see everything, filtering is purely an attach-menu UX
 /// concern).
 fn filter_servers_for_menu(
@@ -1882,7 +2251,10 @@ fn filter_servers_for_menu(
     }
     servers
         .into_iter()
-        .filter(|s| s.owner_workspace.is_none_or(|owner| owner == current_workspace))
+        .filter(|s| {
+            s.owner_workspace
+                .is_none_or(|owner| owner == current_workspace)
+        })
         .collect()
 }
 
@@ -1907,9 +2279,15 @@ const UNKNOWN_GROUP: &str = "Unknown";
 /// `Vec<Vec<_>>` so callers can walk it once and detect group
 /// boundaries by comparing consecutive keys, which is exactly what
 /// `render::draw_attach_menu` needs to decide where to emit a header.
-fn group_servers_by_cwd(mut servers: Vec<ServerPaneInfo>, pinned: &[String]) -> Vec<(String, ServerPaneInfo)> {
+fn group_servers_by_cwd(
+    mut servers: Vec<ServerPaneInfo>,
+    pinned: &[String],
+) -> Vec<(String, ServerPaneInfo)> {
     let key_of = |s: &ServerPaneInfo| -> String {
-        s.foreground.as_ref().and_then(|f| f.cwd.clone()).unwrap_or_else(|| UNKNOWN_GROUP.to_string())
+        s.foreground
+            .as_ref()
+            .and_then(|f| f.cwd.clone())
+            .unwrap_or_else(|| UNKNOWN_GROUP.to_string())
     };
     // `(pin_rank, key)`: `pin_rank` is the dir's index into `pinned`
     // (so earlier-pinned sorts first), `pinned.len()` for any real,
@@ -1925,7 +2303,9 @@ fn group_servers_by_cwd(mut servers: Vec<ServerPaneInfo>, pinned: &[String]) -> 
     };
     servers.sort_by(|a, b| {
         let (key_a, key_b) = (key_of(a), key_of(b));
-        rank_of(&key_a).cmp(&rank_of(&key_b)).then_with(|| key_a.cmp(&key_b))
+        rank_of(&key_a)
+            .cmp(&rank_of(&key_b))
+            .then_with(|| key_a.cmp(&key_b))
     });
     servers.into_iter().map(|s| (key_of(&s), s)).collect()
 }
@@ -2007,7 +2387,12 @@ fn parse_attach_menu_input(bytes: &[u8]) -> AttachMenuAction {
 /// stuck under the field. Enter/Esc are handled by each caller, not
 /// here, since they trigger network requests or close the field
 /// entirely -- concerns outside this pure buffer-editing function.
-fn apply_text_edit(text: &mut String, cursor: &mut usize, error: &mut Option<String>, bytes: &[u8]) {
+fn apply_text_edit(
+    text: &mut String,
+    cursor: &mut usize,
+    error: &mut Option<String>,
+    bytes: &[u8],
+) {
     match bytes {
         b"\x7f" | b"\x08" => {
             if *cursor > 0 {
@@ -2103,8 +2488,8 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Enable exactly the xterm mouse modes dimux's drag-resize needs: normal
-/// tracking (`?1000h`, click/release) + button-event tracking (`?1002h`,
+/// Enable exactly the xterm mouse modes dimax's mouse interactions need:
+/// normal tracking (`?1000h`, click/release) + button-event tracking (`?1002h`,
 /// motion reported only *while a button is held* — i.e. drags) + SGR
 /// extended-coordinate encoding (`?1006h`, what `mouse::parse` expects).
 ///
@@ -2112,18 +2497,10 @@ impl Drop for TerminalGuard {
 /// command additionally enables any-event tracking (`?1003h`), which
 /// reports *every* mouse movement — including with no button held at
 /// all, e.g. just passing the cursor over the window while typing
-/// elsewhere in it. `mouse::parse` only understands the left button
-/// (dimux has no use for right/middle/movement-only events) and returns
-/// `None` for anything else, which then falls through to `keys::parse`,
-/// which also doesn't recognize it, resolves to `Action::PassThrough`,
-/// and writes the raw unparsed escape sequence into the focused pane as
-/// literal keystrokes. Under `?1003h` this happens on every pixel of
-/// mouse motion, which is both the garbage-character symptom (a mouse
-/// move's SGR encoding — button number 3, i.e. `Cb=35` — landing in the
-/// shell as text) and the "random hangup" (each stray byte round-trips a
-/// `Request::Input` through the daemon; enough volume visibly stalls the
-/// event loop). `?1002h` alone never asks the terminal to report motion
-/// without a button down, so this class of event never arrives.
+/// elsewhere in it. dimax has no use for movement-only events, and
+/// `?1002h` alone never asks the terminal to report motion without a
+/// button down, avoiding both raw mouse bytes leaking into a pane and
+/// needless event-loop traffic.
 fn enable_button_event_mouse_tracking() -> std::io::Result<()> {
     use std::io::Write;
     write!(std::io::stdout(), "\x1b[?1000h\x1b[?1002h\x1b[?1006h")?;
@@ -2139,20 +2516,54 @@ fn disable_button_event_mouse_tracking() -> std::io::Result<()> {
     std::io::stdout().flush()
 }
 
+fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(selection::osc52_sequence(text).as_bytes())?;
+    stdout.flush()
+}
+
+/// Drive the first-run wizard's own tiny event loop -- draw, read one
+/// stdin chunk, apply it -- until it reports `WizardOutcome::Done`, then
+/// persist the chosen keybinding mode (and install Kitty bindings if
+/// that mode needs them, same as `dimax keys install --mode kitty`
+/// would) and the Claude skill if requested. Isolated from `run`'s main
+/// loop entirely -- no daemon connection exists yet at this point, and
+/// the wizard has no interaction with `App`/attach-menu/mouse state.
+async fn run_first_run_wizard(
+    terminal: &mut ratatui::DefaultTerminal,
+    stdin: &mut tokio::io::Stdin,
+    buf: &mut [u8; 512],
+) -> anyhow::Result<()> {
+    let mut wizard = first_run::Wizard::new();
+    loop {
+        terminal.draw(|frame| wizard.draw(frame))?;
+        let n = stdin.read(buf).await?;
+        if n == 0 {
+            break;
+        }
+        if let first_run::WizardOutcome::Done {
+            mode,
+            install_skill,
+        } = wizard.handle_input(&buf[..n])
+        {
+            keys::save_mode(mode)?;
+            if mode.kitty_enabled() {
+                let _ = kitty_setup::install();
+            }
+            if install_skill {
+                let _ = crate::skills_setup::install();
+            }
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Drives one attached frontend: connect, subscribe to the initial
 /// workspace, then loop handling terminal input events and pushed daemon
 /// `Event`s until the user quits.
 pub async fn run() -> anyhow::Result<()> {
-    // Best-effort, silent, before anything else starts -- see
-    // `kitty_setup::ensure_installed`'s doc comment for the exact
-    // conditions under which this does nothing (not running under
-    // Kitty, no existing kitty.conf to patch, a hand-written
-    // dimux.conf already present, etc.). Deliberately swallows its own
-    // errors internally rather than returning a `Result` here: whether
-    // the Cmd-chord config could be installed must never affect
-    // whether `dimux attach` itself starts.
-    kitty_setup::ensure_installed();
-
     let client = Client::connect().await?;
     let (read_half, mut write_half) = client.into_split();
     let mut reader = FrameReader::spawn(read_half);
@@ -2169,10 +2580,23 @@ pub async fn run() -> anyhow::Result<()> {
     let _guard = TerminalGuard;
     enable_button_event_mouse_tracking()?;
 
-    let mut app = App::bootstrap(&mut write_half, &mut reader, "1").await?;
-
     let mut stdin = tokio::io::stdin();
     let mut buf = [0u8; 512];
+
+    // One-time first-run wizard (keybinding mode + Claude skill install),
+    // gated by `keys::consume_first_run` so it only ever shows once per
+    // `keybindings.json` -- see `first_run` module doc. Runs before
+    // `bootstrap` since it's purely local (no daemon requests) and its
+    // choice of `BindingMode` needs to land on disk before `load_mode`
+    // is read just below.
+    if keys::consume_first_run() {
+        run_first_run_wizard(&mut terminal, &mut stdin, &mut buf).await?;
+    }
+
+    let mut app = App::bootstrap(&mut write_half, &mut reader, "1").await?;
+
+    let mut key_parser = keys::PortableParser::from_config();
+    let binding_mode = keys::load_mode();
     // Keeps the attach menu's preview panel showing a selected pane's
     // *live* output (see `refresh_attach_menu_preview`'s doc comment)
     // rather than only updating it right after a selection change --
@@ -2206,9 +2630,21 @@ pub async fn run() -> anyhow::Result<()> {
                     if let Some(tree) = &mut preview.tree {
                         let _ = tree.resize_split(split, ratio);
                     }
-                    render::draw(frame, &preview, &app.grids, app.focused);
+                    render::draw_with_selection(
+                        frame,
+                        &preview,
+                        &app.grids,
+                        app.focused,
+                        app.text_selection.as_ref(),
+                    );
                 }
-                None => render::draw(frame, &app.workspace, &app.grids, app.focused),
+                None => render::draw_with_selection(
+                    frame,
+                    &app.workspace,
+                    &app.grids,
+                    app.focused,
+                    app.text_selection.as_ref(),
+                ),
             }
             if let Some(menu) = &app.attach_menu {
                 render::draw_attach_menu(
@@ -2270,7 +2706,11 @@ pub async fn run() -> anyhow::Result<()> {
                 // into the focused pane as literal garbage keystrokes).
                 let (mouse_events, incomplete, leftover) = mouse::parse_all(&bytes);
                 for event in mouse_events {
-                    app.handle_mouse(event, &mut write_half, &mut reader).await?;
+                    if let Some(text) =
+                        app.handle_mouse(event, &mut write_half, &mut reader).await?
+                    {
+                        copy_to_clipboard(&text)?;
+                    }
                 }
                 if !incomplete.is_empty() {
                     // Cap how large a carried-over fragment can grow --
@@ -2295,8 +2735,21 @@ pub async fn run() -> anyhow::Result<()> {
                         // panel for up to one tick interval.
                         app.refresh_attach_menu_preview(&mut write_half, &mut reader).await?;
                     } else {
-                        let action = keys::parse(leftover);
-                        app.handle_action(action, leftover, &mut write_half, &mut reader).await?;
+                        match key_parser.parse(leftover, binding_mode) {
+                            keys::ParsedInput::Action(action) => {
+                                app.handle_action(action, &[], &mut write_half, &mut reader).await?;
+                            }
+                            keys::ParsedInput::PassThrough(raw) => {
+                                app.handle_action(
+                                    Action::PassThrough,
+                                    &raw,
+                                    &mut write_half,
+                                    &mut reader,
+                                )
+                                .await?;
+                            }
+                            keys::ParsedInput::Pending => {}
+                        }
                         // Catches the chord that just opened the menu
                         // (`Action::DetachAndAttach`) -- `attach_menu`
                         // was still `None` when this branch started, so
@@ -2339,15 +2792,32 @@ mod tests {
     use uuid::Uuid;
 
     fn leaf(id: ClientPaneId) -> SplitTree {
-        SplitTree::Leaf(ClientPane { id, name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() })
+        SplitTree::Leaf(ClientPane {
+            id,
+            name: None,
+            tabs: vec![],
+            active_tab: 0,
+            short_id: "aa".to_string(),
+        })
     }
 
     fn split(dir: SplitDir, a: SplitTree, b: SplitTree) -> SplitTree {
-        SplitTree::Split { id: Uuid::new_v4(), dir, ratio: 0.5, a: Box::new(a), b: Box::new(b) }
+        SplitTree::Split {
+            id: Uuid::new_v4(),
+            dir,
+            ratio: 0.5,
+            a: Box::new(a),
+            b: Box::new(b),
+        }
     }
 
     fn rect(x: u16, y: u16, width: u16, height: u16) -> ratatui::layout::Rect {
-        ratatui::layout::Rect { x, y, width, height }
+        ratatui::layout::Rect {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     #[test]
@@ -2355,7 +2825,12 @@ mod tests {
         let id = Uuid::new_v4();
         let tree = leaf(id);
         let area = rect(0, 0, 80, 24);
-        for dir in [Direction::Left, Direction::Right, Direction::Up, Direction::Down] {
+        for dir in [
+            Direction::Left,
+            Direction::Right,
+            Direction::Up,
+            Direction::Down,
+        ] {
             assert_eq!(nearest_leaf_in_direction(&tree, area, Some(id), dir), None);
         }
     }
@@ -2366,7 +2841,10 @@ mod tests {
         let b = Uuid::new_v4();
         let tree = split(SplitDir::Vertical, leaf(a), leaf(b));
         let area = rect(0, 0, 80, 24);
-        assert_eq!(nearest_leaf_in_direction(&tree, area, None, Direction::Right), Some(a));
+        assert_eq!(
+            nearest_leaf_in_direction(&tree, area, None, Direction::Right),
+            Some(a)
+        );
     }
 
     #[test]
@@ -2376,7 +2854,10 @@ mod tests {
         let tree = split(SplitDir::Vertical, leaf(a), leaf(b));
         let area = rect(0, 0, 80, 24);
         let stale = Uuid::new_v4();
-        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(stale), Direction::Left), Some(a));
+        assert_eq!(
+            nearest_leaf_in_direction(&tree, area, Some(stale), Direction::Left),
+            Some(a)
+        );
     }
 
     #[test]
@@ -2387,11 +2868,27 @@ mod tests {
         // "SplitDir -> ratatui::Direction mapping").
         let tree = split(SplitDir::Vertical, leaf(a), leaf(b));
         let area = rect(0, 0, 80, 24);
-        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(a), Direction::Right), Some(b));
-        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(b), Direction::Left), Some(a));
-        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(a), Direction::Up), None);
-        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(a), Direction::Down), None);
-        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(b), Direction::Right), None, "no wraparound");
+        assert_eq!(
+            nearest_leaf_in_direction(&tree, area, Some(a), Direction::Right),
+            Some(b)
+        );
+        assert_eq!(
+            nearest_leaf_in_direction(&tree, area, Some(b), Direction::Left),
+            Some(a)
+        );
+        assert_eq!(
+            nearest_leaf_in_direction(&tree, area, Some(a), Direction::Up),
+            None
+        );
+        assert_eq!(
+            nearest_leaf_in_direction(&tree, area, Some(a), Direction::Down),
+            None
+        );
+        assert_eq!(
+            nearest_leaf_in_direction(&tree, area, Some(b), Direction::Right),
+            None,
+            "no wraparound"
+        );
     }
 
     #[test]
@@ -2401,10 +2898,22 @@ mod tests {
         // Horizontal split = stacked panes.
         let tree = split(SplitDir::Horizontal, leaf(a), leaf(b));
         let area = rect(0, 0, 80, 24);
-        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(a), Direction::Down), Some(b));
-        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(b), Direction::Up), Some(a));
-        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(a), Direction::Left), None);
-        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(a), Direction::Right), None);
+        assert_eq!(
+            nearest_leaf_in_direction(&tree, area, Some(a), Direction::Down),
+            Some(b)
+        );
+        assert_eq!(
+            nearest_leaf_in_direction(&tree, area, Some(b), Direction::Up),
+            Some(a)
+        );
+        assert_eq!(
+            nearest_leaf_in_direction(&tree, area, Some(a), Direction::Left),
+            None
+        );
+        assert_eq!(
+            nearest_leaf_in_direction(&tree, area, Some(a), Direction::Right),
+            None
+        );
     }
 
     #[test]
@@ -2424,34 +2933,64 @@ mod tests {
             split(SplitDir::Vertical, leaf(bottom_left), leaf(bottom_right)),
         );
         let area = rect(0, 0, 80, 24);
-        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(bottom_left), Direction::Up), Some(top));
-        assert_eq!(nearest_leaf_in_direction(&tree, area, Some(bottom_right), Direction::Up), Some(top));
+        assert_eq!(
+            nearest_leaf_in_direction(&tree, area, Some(bottom_left), Direction::Up),
+            Some(top)
+        );
+        assert_eq!(
+            nearest_leaf_in_direction(&tree, area, Some(bottom_right), Direction::Up),
+            Some(top)
+        );
         assert_eq!(
             nearest_leaf_in_direction(&tree, area, Some(bottom_left), Direction::Right),
             Some(bottom_right)
         );
     }
 
-    fn divider_hit(split: crate::protocol::SplitId, zone: ratatui::layout::Rect) -> render::DividerHit {
+    fn divider_hit(
+        split: crate::protocol::SplitId,
+        zone: ratatui::layout::Rect,
+    ) -> render::DividerHit {
         render::DividerHit {
             split,
             dir: SplitDir::Vertical,
             grab_zone: zone,
-            parent_area: ratatui::layout::Rect { x: 0, y: 0, width: 40, height: 10 },
+            parent_area: ratatui::layout::Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 10,
+            },
         }
     }
 
     #[test]
     fn hit_test_dividers_finds_the_containing_zone() {
         let split_id = Uuid::new_v4();
-        let hits = vec![divider_hit(split_id, ratatui::layout::Rect { x: 20, y: 0, width: 1, height: 10 })];
+        let hits = vec![divider_hit(
+            split_id,
+            ratatui::layout::Rect {
+                x: 20,
+                y: 0,
+                width: 1,
+                height: 10,
+            },
+        )];
         assert_eq!(hit_test_dividers(&hits, 20, 5), Some(split_id));
     }
 
     #[test]
     fn hit_test_dividers_misses_outside_the_zone() {
         let split_id = Uuid::new_v4();
-        let hits = vec![divider_hit(split_id, ratatui::layout::Rect { x: 20, y: 0, width: 1, height: 10 })];
+        let hits = vec![divider_hit(
+            split_id,
+            ratatui::layout::Rect {
+                x: 20,
+                y: 0,
+                width: 1,
+                height: 10,
+            },
+        )];
         assert_eq!(hit_test_dividers(&hits, 19, 5), None);
         assert_eq!(hit_test_dividers(&hits, 21, 5), None);
         assert_eq!(hit_test_dividers(&hits, 20, 10), None); // one past the bottom edge
@@ -2462,8 +3001,24 @@ mod tests {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let hits = vec![
-            divider_hit(a, ratatui::layout::Rect { x: 10, y: 0, width: 1, height: 10 }),
-            divider_hit(b, ratatui::layout::Rect { x: 30, y: 0, width: 1, height: 10 }),
+            divider_hit(
+                a,
+                ratatui::layout::Rect {
+                    x: 10,
+                    y: 0,
+                    width: 1,
+                    height: 10,
+                },
+            ),
+            divider_hit(
+                b,
+                ratatui::layout::Rect {
+                    x: 30,
+                    y: 0,
+                    width: 1,
+                    height: 10,
+                },
+            ),
         ];
         assert_eq!(hit_test_dividers(&hits, 10, 0), Some(a));
         assert_eq!(hit_test_dividers(&hits, 30, 0), Some(b));
@@ -2474,7 +3029,12 @@ mod tests {
     fn changed_pane_sizes_reports_a_never_seen_pane() {
         let id = Uuid::new_v4();
         let tree = leaf(id);
-        let area = ratatui::layout::Rect { x: 0, y: 0, width: 80, height: 24 };
+        let area = ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
         let current: HashMap<ClientPaneId, crate::protocol::Size> = HashMap::new();
         let changed = changed_pane_sizes(&current, &tree, area);
         assert_eq!(changed.len(), 1);
@@ -2489,7 +3049,12 @@ mod tests {
     fn changed_pane_sizes_reports_nothing_when_unchanged() {
         let id = Uuid::new_v4();
         let tree = leaf(id);
-        let area = ratatui::layout::Rect { x: 0, y: 0, width: 80, height: 24 };
+        let area = ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
         let mut current = HashMap::new();
         current.insert(id, crate::protocol::Size { rows: 23, cols: 80 });
         let changed = changed_pane_sizes(&current, &tree, area);
@@ -2500,12 +3065,26 @@ mod tests {
     fn changed_pane_sizes_reports_a_genuinely_resized_pane() {
         let id = Uuid::new_v4();
         let tree = leaf(id);
-        let area = ratatui::layout::Rect { x: 0, y: 0, width: 100, height: 30 };
+        let area = ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 30,
+        };
         let mut current = HashMap::new();
         current.insert(id, crate::protocol::Size { rows: 23, cols: 80 });
         let changed = changed_pane_sizes(&current, &tree, area);
         assert_eq!(changed.len(), 1);
-        assert_eq!(changed[0], (id, crate::protocol::Size { rows: 29, cols: 100 }));
+        assert_eq!(
+            changed[0],
+            (
+                id,
+                crate::protocol::Size {
+                    rows: 29,
+                    cols: 100
+                }
+            )
+        );
     }
 
     #[test]
@@ -2550,7 +3129,10 @@ mod tests {
 
     #[test]
     fn parse_attach_menu_input_a_is_toggle_show_all_workspaces() {
-        assert_eq!(parse_attach_menu_input(b"a"), AttachMenuAction::ToggleShowAllWorkspaces);
+        assert_eq!(
+            parse_attach_menu_input(b"a"),
+            AttachMenuAction::ToggleShowAllWorkspaces
+        );
     }
 
     #[test]
@@ -2561,12 +3143,20 @@ mod tests {
     #[test]
     fn quit_byte_is_ctrl_q_not_ctrl_c() {
         assert!(is_quit(&[0x11]));
-        assert!(!is_quit(&[0x03]), "Ctrl-C must remain a pass-through byte, not the quit key");
+        assert!(
+            !is_quit(&[0x03]),
+            "Ctrl-C must remain a pass-through byte, not the quit key"
+        );
     }
 
     #[test]
     fn first_leaf_of_empty_workspace_is_none() {
-        let workspace = WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None };
+        let workspace = WorkspaceInfo {
+            id: Uuid::new_v4(),
+            number: 1,
+            name: None,
+            tree: None,
+        };
         assert_eq!(first_leaf(&workspace), None);
     }
 
@@ -2606,12 +3196,18 @@ mod tests {
             server_with_cwd("c", Some("/home/dev/api")),
         ];
         let grouped = group_servers_by_cwd(servers, &[]);
-        let names: Vec<&str> = grouped.iter().map(|(_, s)| s.name.as_deref().unwrap()).collect();
+        let names: Vec<&str> = grouped
+            .iter()
+            .map(|(_, s)| s.name.as_deref().unwrap())
+            .collect();
         // Ascending by cwd: api's two panes (in original relative order),
         // then web's one pane.
         assert_eq!(names, vec!["a", "c", "b"]);
         let keys: Vec<&str> = grouped.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(keys, vec!["/home/dev/api", "/home/dev/api", "/home/dev/web"]);
+        assert_eq!(
+            keys,
+            vec!["/home/dev/api", "/home/dev/api", "/home/dev/web"]
+        );
     }
 
     #[test]
@@ -2621,7 +3217,10 @@ mod tests {
             server_with_cwd("has-cwd", Some("/zzz/last-alphabetically")),
         ];
         let grouped = group_servers_by_cwd(servers, &[]);
-        let names: Vec<&str> = grouped.iter().map(|(_, s)| s.name.as_deref().unwrap()).collect();
+        let names: Vec<&str> = grouped
+            .iter()
+            .map(|(_, s)| s.name.as_deref().unwrap())
+            .collect();
         // "/zzz/..." sorts after "Unknown" alphabetically, but Unknown is
         // forced last regardless.
         assert_eq!(names, vec!["has-cwd", "no-cwd"]);
@@ -2651,17 +3250,31 @@ mod tests {
             server_owned_by("orphan", None),
         ];
         let filtered = filter_servers_for_menu(servers, ws_a, false);
-        let names: Vec<&str> = filtered.iter().map(|s| s.name.as_deref().unwrap()).collect();
-        assert_eq!(names, vec!["mine", "orphan"], "another workspace's own pane must be filtered out by default");
+        let names: Vec<&str> = filtered
+            .iter()
+            .map(|s| s.name.as_deref().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["mine", "orphan"],
+            "another workspace's own pane must be filtered out by default"
+        );
     }
 
     #[test]
     fn filter_servers_for_menu_show_all_bypasses_the_filter_entirely() {
         let ws_a = Uuid::new_v4();
         let ws_b = Uuid::new_v4();
-        let servers = vec![server_owned_by("mine", Some(ws_a)), server_owned_by("theirs", Some(ws_b))];
+        let servers = vec![
+            server_owned_by("mine", Some(ws_a)),
+            server_owned_by("theirs", Some(ws_b)),
+        ];
         let filtered = filter_servers_for_menu(servers, ws_a, true);
-        assert_eq!(filtered.len(), 2, "show_all must let every pane through regardless of ownership");
+        assert_eq!(
+            filtered.len(),
+            2,
+            "show_all must let every pane through regardless of ownership"
+        );
     }
 
     #[test]
@@ -2676,7 +3289,10 @@ mod tests {
         let pinned = vec!["/home/dev/zzz".to_string()];
         let grouped = group_servers_by_cwd(servers, &pinned);
         let keys: Vec<&str> = grouped.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(keys, vec!["/home/dev/zzz", "/home/dev/api", "/home/dev/web"]);
+        assert_eq!(
+            keys,
+            vec!["/home/dev/zzz", "/home/dev/api", "/home/dev/web"]
+        );
     }
 
     #[test]
@@ -2696,7 +3312,10 @@ mod tests {
 
     #[test]
     fn group_servers_by_cwd_unknown_group_stays_last_even_when_pinned_dirs_exist() {
-        let servers = vec![server_with_cwd("no-cwd", None), server_with_cwd("has-cwd", Some("/pinned"))];
+        let servers = vec![
+            server_with_cwd("no-cwd", None),
+            server_with_cwd("has-cwd", Some("/pinned")),
+        ];
         let pinned = vec!["/pinned".to_string()];
         let grouped = group_servers_by_cwd(servers, &pinned);
         let keys: Vec<&str> = grouped.iter().map(|(k, _)| k.as_str()).collect();
@@ -2776,7 +3395,11 @@ mod tests {
         // only the real per-group rows do.
         assert_eq!(
             rows,
-            vec![AttachMenuRow::GroupHeader(0), AttachMenuRow::Server(0), AttachMenuRow::SpawnNew]
+            vec![
+                AttachMenuRow::GroupHeader(0),
+                AttachMenuRow::Server(0),
+                AttachMenuRow::SpawnNew
+            ]
         );
     }
 
@@ -2787,7 +3410,10 @@ mod tests {
         let b_id = b.id;
         let servers = vec![("/x".to_string(), a), ("/x".to_string(), b)];
         // Rows: 0 = header, 1 = a's Server row, 2 = b's Server row, 3 = spawn-in-group.
-        assert_eq!(initial_selection_for(&servers, &HashSet::new(), Some(b_id)), 2);
+        assert_eq!(
+            initial_selection_for(&servers, &HashSet::new(), Some(b_id)),
+            2
+        );
     }
 
     #[test]
@@ -2799,7 +3425,10 @@ mod tests {
     #[test]
     fn initial_selection_for_falls_back_to_zero_when_the_pane_no_longer_exists() {
         let servers = vec![("/x".to_string(), server_with_cwd("a", Some("/x")))];
-        assert_eq!(initial_selection_for(&servers, &HashSet::new(), Some(Uuid::new_v4())), 0);
+        assert_eq!(
+            initial_selection_for(&servers, &HashSet::new(), Some(Uuid::new_v4())),
+            0
+        );
     }
 
     #[test]
@@ -2817,13 +3446,27 @@ mod tests {
     fn toggle_group_collapse_collapses_then_expands() {
         let servers = vec![("/a".to_string(), server_with_cwd("x", Some("/a")))];
         let mut app = App {
-            workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
+            workspace: WorkspaceInfo {
+                id: Uuid::new_v4(),
+                number: 1,
+                name: None,
+                tree: None,
+            },
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None, adding_tab: false }),
+            attach_menu: Some(AttachMenu {
+                servers,
+                selected: 0,
+                pending_delete: None,
+                rename: None,
+                previously_bound: None,
+                spawn_in_group: None,
+                adding_tab: false,
+            }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
+            text_selection: None,
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
@@ -2845,20 +3488,38 @@ mod tests {
         // (0..=1). Selecting the last row beforehand must not leave
         // `selected` pointing past that shrunk list.
         let mut app = App {
-            workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
+            workspace: WorkspaceInfo {
+                id: Uuid::new_v4(),
+                number: 1,
+                name: None,
+                tree: None,
+            },
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 3, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None, adding_tab: false }),
+            attach_menu: Some(AttachMenu {
+                servers,
+                selected: 3,
+                pending_delete: None,
+                rename: None,
+                previously_bound: None,
+                spawn_in_group: None,
+                adding_tab: false,
+            }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
+            text_selection: None,
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
             show_all_workspaces: false,
         };
         app.toggle_group_collapse(0);
-        assert_eq!(app.attach_menu.unwrap().selected, 1, "should clamp onto the new last row (global spawn-new)");
+        assert_eq!(
+            app.attach_menu.unwrap().selected,
+            1,
+            "should clamp onto the new last row (global spawn-new)"
+        );
     }
 
     #[test]
@@ -2868,13 +3529,27 @@ mod tests {
         // spawn-new -- len 4, so moving down from the last row wraps
         // back to 0, and up from 0 wraps to the last row.
         let mut app = App {
-            workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
+            workspace: WorkspaceInfo {
+                id: Uuid::new_v4(),
+                number: 1,
+                name: None,
+                tree: None,
+            },
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 3, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None, adding_tab: false }),
+            attach_menu: Some(AttachMenu {
+                servers,
+                selected: 3,
+                pending_delete: None,
+                rename: None,
+                previously_bound: None,
+                spawn_in_group: None,
+                adding_tab: false,
+            }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
+            text_selection: None,
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
@@ -2891,13 +3566,27 @@ mod tests {
         let servers = vec![("Unknown".to_string(), server_with_cwd("a", None))];
         // Rows: 0 = "Unknown" header, 1 = the server row, 2 = spawn-new.
         let mut app = App {
-            workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
+            workspace: WorkspaceInfo {
+                id: Uuid::new_v4(),
+                number: 1,
+                name: None,
+                tree: None,
+            },
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 1, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None, adding_tab: false }),
+            attach_menu: Some(AttachMenu {
+                servers,
+                selected: 1,
+                pending_delete: None,
+                rename: None,
+                previously_bound: None,
+                spawn_in_group: None,
+                adding_tab: false,
+            }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
+            text_selection: None,
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
@@ -2911,13 +3600,27 @@ mod tests {
     fn arm_delete_on_group_header_row_is_a_no_op() {
         let servers = vec![("Unknown".to_string(), server_with_cwd("a", None))];
         let mut app = App {
-            workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
+            workspace: WorkspaceInfo {
+                id: Uuid::new_v4(),
+                number: 1,
+                name: None,
+                tree: None,
+            },
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None, adding_tab: false }),
+            attach_menu: Some(AttachMenu {
+                servers,
+                selected: 0,
+                pending_delete: None,
+                rename: None,
+                previously_bound: None,
+                spawn_in_group: None,
+                adding_tab: false,
+            }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
+            text_selection: None,
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
@@ -2933,7 +3636,12 @@ mod tests {
         // Rows: 0 = "Unknown" header, 1 = the server row, 2 = spawn-new.
         let spawn_index = 2;
         let mut app = App {
-            workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
+            workspace: WorkspaceInfo {
+                id: Uuid::new_v4(),
+                number: 1,
+                name: None,
+                tree: None,
+            },
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
@@ -2948,6 +3656,7 @@ mod tests {
             }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
+            text_selection: None,
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
@@ -2958,7 +3667,12 @@ mod tests {
     }
 
     fn rename_state(text: &str, cursor: usize) -> RenameState {
-        RenameState { index: 0, text: text.to_string(), cursor, error: None }
+        RenameState {
+            index: 0,
+            text: text.to_string(),
+            cursor,
+            error: None,
+        }
     }
 
     #[test]
@@ -3042,13 +3756,27 @@ mod tests {
         let servers = vec![("Unknown".to_string(), server_with_cwd("my-name", None))];
         // Rows: 0 = "Unknown" header, 1 = the server row.
         let mut app = App {
-            workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
+            workspace: WorkspaceInfo {
+                id: Uuid::new_v4(),
+                number: 1,
+                name: None,
+                tree: None,
+            },
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 1, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None, adding_tab: false }),
+            attach_menu: Some(AttachMenu {
+                servers,
+                selected: 1,
+                pending_delete: None,
+                rename: None,
+                previously_bound: None,
+                spawn_in_group: None,
+                adding_tab: false,
+            }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
+            text_selection: None,
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
@@ -3065,13 +3793,27 @@ mod tests {
     fn start_rename_on_group_header_row_is_a_no_op() {
         let servers = vec![("Unknown".to_string(), server_with_cwd("a", None))];
         let mut app = App {
-            workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
+            workspace: WorkspaceInfo {
+                id: Uuid::new_v4(),
+                number: 1,
+                name: None,
+                tree: None,
+            },
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
-            attach_menu: Some(AttachMenu { servers, selected: 0, pending_delete: None, rename: None, previously_bound: None, spawn_in_group: None, adding_tab: false }),
+            attach_menu: Some(AttachMenu {
+                servers,
+                selected: 0,
+                pending_delete: None,
+                rename: None,
+                previously_bound: None,
+                spawn_in_group: None,
+                adding_tab: false,
+            }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
+            text_selection: None,
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
@@ -3087,7 +3829,12 @@ mod tests {
         // Rows: 0 = "Unknown" header, 1 = the server row, 2 = spawn-new.
         let spawn_index = 2;
         let mut app = App {
-            workspace: WorkspaceInfo { id: Uuid::new_v4(), number: 1, name: None, tree: None },
+            workspace: WorkspaceInfo {
+                id: Uuid::new_v4(),
+                number: 1,
+                name: None,
+                tree: None,
+            },
             grids: HashMap::new(),
             pane_sizes: HashMap::new(),
             focused: None,
@@ -3102,6 +3849,7 @@ mod tests {
             }),
             frame_area: ratatui::layout::Rect::default(),
             dragging_split: None,
+            text_selection: None,
             collapsed_groups: HashSet::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
@@ -3111,7 +3859,7 @@ mod tests {
         assert!(app.attach_menu.unwrap().rename.is_none());
     }
 
-    /// Regression test for the "dimux hangs often" bug: racing a frame
+    /// Regression test for the "dimax hangs often" bug: racing a frame
     /// read against a faster competing branch inside `tokio::select!`
     /// must never desync the connection. This is what `run`'s loop does
     /// every iteration (racing `stdin.read` against the next server
@@ -3174,7 +3922,10 @@ mod tests {
             }
         }
 
-        assert_eq!(received, 8, "expected all 8 frames to survive being raced against a faster branch");
+        assert_eq!(
+            received, 8,
+            "expected all 8 frames to survive being raced against a faster branch"
+        );
         writer.await.unwrap();
         let _ = std::fs::remove_file(&path);
     }
@@ -3201,27 +3952,44 @@ mod tests {
     /// this connection has read by now is scheduler-dependent, and only
     /// an explicit reset makes the returned state deterministic.
     async fn app_against_real_daemon() -> (App, OwnedWriteHalf, FrameReader) {
-        // Short filename -- `dimux-test-<full-uuid>.sock` under a long
+        // Short filename -- `dimax-test-<full-uuid>.sock` under a long
         // macOS temp dir can exceed `SUN_LEN`; this stays well under it.
         static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let socket_path = std::env::temp_dir().join(format!("dmx-am-{}-{id}.sock", std::process::id()));
-        crate::daemon::run(socket_path.clone()).await.expect("daemon should bind and start");
-        let stream = tokio::net::UnixStream::connect(&socket_path).await.expect("connect to test daemon");
+        let socket_path =
+            std::env::temp_dir().join(format!("dmx-am-{}-{id}.sock", std::process::id()));
+        crate::daemon::run(socket_path.clone())
+            .await
+            .expect("daemon should bind and start");
+        let stream = tokio::net::UnixStream::connect(&socket_path)
+            .await
+            .expect("connect to test daemon");
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = FrameReader::spawn(read_half);
-        let mut app = App::bootstrap(&mut write_half, &mut reader, "1").await.expect("bootstrap workspace 1");
+        let mut app = App::bootstrap(&mut write_half, &mut reader, "1")
+            .await
+            .expect("bootstrap workspace 1");
         if let Some(pane) = app.focused {
-            let req = Request::ClientClose { workspace: app.workspace.id.to_string(), pane };
-            let _ = app.request(&mut write_half, &mut reader, req).await.expect("close the shell-fallback leaf");
+            let req = Request::ClientClose {
+                workspace: app.workspace.id.to_string(),
+                pane,
+            };
+            let _ = app
+                .request(&mut write_half, &mut reader, req)
+                .await
+                .expect("close the shell-fallback leaf");
         }
-        let Response::ServerPaneList(servers) =
-            app.request(&mut write_half, &mut reader, Request::ServerList).await.expect("list server-panes")
+        let Response::ServerPaneList(servers) = app
+            .request(&mut write_half, &mut reader, Request::ServerList)
+            .await
+            .expect("list server-panes")
         else {
             panic!("expected ServerPaneList");
         };
         for server in servers {
-            let req = Request::ServerKill { target: server.id.to_string() };
+            let req = Request::ServerKill {
+                target: server.id.to_string(),
+            };
             let _ = app
                 .request(&mut write_half, &mut reader, req)
                 .await
@@ -3232,62 +4000,189 @@ mod tests {
         (app, write_half, reader)
     }
 
+    #[tokio::test]
+    async fn jump_session_binds_the_numbered_existing_session_without_creating_one() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+        let mut spawned = Vec::new();
+        for name in ["alpha", "beta"] {
+            let Response::ServerPane(server) = app
+                .request(
+                    &mut write_half,
+                    &mut reader,
+                    Request::ServerSpawn {
+                        name: Some(name.to_string()),
+                        cmd: None,
+                        cwd: None,
+                        workspace: None,
+                    },
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("expected ServerPane");
+            };
+            spawned.push(server.id);
+        }
+        let Response::ClientPaneCreated { pane, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientSpawn {
+                    workspace: "1".to_string(),
+                    split_of: None,
+                    dir: None,
+                    bind: Some(spawned[0].to_string()),
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneCreated");
+        };
+        app.focused = Some(pane);
+
+        app.jump_session(2, &mut write_half, &mut reader)
+            .await
+            .unwrap();
+
+        let Response::ClientPaneList { panes, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientList {
+                    workspace: Some("1".to_string()),
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneList");
+        };
+        assert_eq!(panes[0].active_bound(), Some(spawned[1]));
+
+        app.jump_session(9, &mut write_half, &mut reader)
+            .await
+            .unwrap();
+        let Response::ServerPaneList(servers) = app
+            .request(&mut write_half, &mut reader, Request::ServerList)
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPaneList");
+        };
+        assert_eq!(
+            servers.len(),
+            2,
+            "a missing number must not create a session"
+        );
+    }
+
     /// Deliberately does NOT use `app_against_real_daemon` -- that helper
     /// exists to *undo* the shell fallback (see its doc comment), which
     /// is the very thing under test here.
     #[tokio::test]
     async fn bootstrap_on_a_fresh_daemon_with_an_empty_workspace_spawns_a_default_shell() {
         // Short filename -- see `app_against_real_daemon` for why.
-        let socket_path = std::env::temp_dir().join(format!("dmx-boot1-{}.sock", std::process::id()));
-        crate::daemon::run(socket_path.clone()).await.expect("daemon should bind and start");
-        let stream = tokio::net::UnixStream::connect(&socket_path).await.expect("connect");
+        let socket_path =
+            std::env::temp_dir().join(format!("dmx-boot1-{}.sock", std::process::id()));
+        crate::daemon::run(socket_path.clone())
+            .await
+            .expect("daemon should bind and start");
+        let stream = tokio::net::UnixStream::connect(&socket_path)
+            .await
+            .expect("connect");
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = FrameReader::spawn(read_half);
-        let mut app = App::bootstrap(&mut write_half, &mut reader, "1").await.expect("bootstrap workspace 1");
+        let mut app = App::bootstrap(&mut write_half, &mut reader, "1")
+            .await
+            .expect("bootstrap workspace 1");
 
-        assert!(app.attach_menu.is_none(), "the very first attach should not open the picker");
-        assert!(app.focused.is_some(), "a default shell should already be spawned and focused");
+        assert!(
+            app.attach_menu.is_none(),
+            "the very first attach should not open the picker"
+        );
+        assert!(
+            app.focused.is_some(),
+            "a default shell should already be spawned and focused"
+        );
 
         // Assert the *daemon's* view rather than `app.workspace.tree`:
         // the spawn's `LayoutDelta` is pushed asynchronously, so whether
         // this connection has read it yet is scheduler-dependent, while
         // a fresh `ClientList` is authoritative either way.
         let Response::ClientPaneList { panes, .. } = app
-            .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientList {
+                    workspace: Some("1".to_string()),
+                },
+            )
             .await
             .unwrap()
         else {
             panic!("expected ClientPaneList");
         };
-        assert_eq!(panes.len(), 1, "exactly one default-shell leaf should exist");
-        assert_eq!(Some(panes[0].id), app.focused, "that leaf should be the focused one");
-        assert!(panes[0].active_bound().is_some(), "the default shell should be bound to a server-pane");
+        assert_eq!(
+            panes.len(),
+            1,
+            "exactly one default-shell leaf should exist"
+        );
+        assert_eq!(
+            Some(panes[0].id),
+            app.focused,
+            "that leaf should be the focused one"
+        );
+        assert!(
+            panes[0].active_bound().is_some(),
+            "the default shell should be bound to a server-pane"
+        );
     }
 
     #[tokio::test]
     async fn bootstrap_on_a_second_empty_workspace_attach_opens_the_picker_instead() {
         // Short filename -- mirrors `app_against_real_daemon`'s own naming
         // scheme (see its doc comment for why this stays short).
-        let socket_path = std::env::temp_dir().join(format!("dmx-boot2-{}.sock", std::process::id()));
-        crate::daemon::run(socket_path.clone()).await.expect("daemon should bind and start");
+        let socket_path =
+            std::env::temp_dir().join(format!("dmx-boot2-{}.sock", std::process::id()));
+        crate::daemon::run(socket_path.clone())
+            .await
+            .expect("daemon should bind and start");
 
         // First attach: consumes the fallback, spawns a shell in workspace "1".
-        let stream = tokio::net::UnixStream::connect(&socket_path).await.expect("connect");
+        let stream = tokio::net::UnixStream::connect(&socket_path)
+            .await
+            .expect("connect");
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = FrameReader::spawn(read_half);
-        let _first = App::bootstrap(&mut write_half, &mut reader, "1").await.expect("bootstrap workspace 1");
+        let _first = App::bootstrap(&mut write_half, &mut reader, "1")
+            .await
+            .expect("bootstrap workspace 1");
 
         // Second attach, to a *different* (still-empty) workspace: the
         // fallback has already been consumed, so this should get the
         // picker instead, not another free shell.
-        let stream2 = tokio::net::UnixStream::connect(&socket_path).await.expect("connect");
+        let stream2 = tokio::net::UnixStream::connect(&socket_path)
+            .await
+            .expect("connect");
         let (read_half2, mut write_half2) = stream2.into_split();
         let mut reader2 = FrameReader::spawn(read_half2);
-        let second = App::bootstrap(&mut write_half2, &mut reader2, "2").await.expect("bootstrap workspace 2");
+        let second = App::bootstrap(&mut write_half2, &mut reader2, "2")
+            .await
+            .expect("bootstrap workspace 2");
 
-        assert!(second.attach_menu.is_some(), "the second empty-workspace attach should open the picker");
-        assert_eq!(second.focused, None, "no leaf exists yet, so nothing should be focused");
-        assert!(second.workspace.tree.is_none(), "the picker path must not itself create a leaf");
+        assert!(
+            second.attach_menu.is_some(),
+            "the second empty-workspace attach should open the picker"
+        );
+        assert_eq!(
+            second.focused, None,
+            "no leaf exists yet, so nothing should be focused"
+        );
+        assert!(
+            second.workspace.tree.is_none(),
+            "the picker path must not itself create a leaf"
+        );
     }
 
     #[tokio::test]
@@ -3296,12 +4191,20 @@ mod tests {
         // fallback, leaving exactly the empty, unfocused workspace this
         // test needs -- no second daemon required.
         let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
-        assert_eq!(app.focused, None, "helper should hand back a leaf-less workspace");
+        assert_eq!(
+            app.focused, None,
+            "helper should hand back a leaf-less workspace"
+        );
         let Response::ServerPane(existing) = app
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None , workspace: None},
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: None,
+                    workspace: None,
+                },
             )
             .await
             .unwrap()
@@ -3327,17 +4230,31 @@ mod tests {
             "row 1 should be the existing server-pane's own row"
         );
 
-        app.confirm_attach_menu(&mut write_half, &mut reader).await.unwrap();
+        app.confirm_attach_menu(&mut write_half, &mut reader)
+            .await
+            .unwrap();
 
-        assert!(app.focused.is_some(), "confirming on a leaf-less workspace should focus the newly created leaf");
+        assert!(
+            app.focused.is_some(),
+            "confirming on a leaf-less workspace should focus the newly created leaf"
+        );
         let Response::ClientPaneList { panes, .. } = app
-            .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientList {
+                    workspace: Some("1".to_string()),
+                },
+            )
             .await
             .unwrap()
         else {
             panic!("expected ClientPaneList");
         };
-        let pane = panes.iter().find(|p| Some(p.id) == app.focused).expect("focused pane should exist");
+        let pane = panes
+            .iter()
+            .find(|p| Some(p.id) == app.focused)
+            .expect("focused pane should exist");
         assert_eq!(pane.active_bound(), Some(existing_id));
     }
 
@@ -3372,7 +4289,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None, workspace: None },
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: None,
+                    workspace: None,
+                },
             )
             .await
             .unwrap()
@@ -3396,16 +4318,26 @@ mod tests {
             panic!("expected ClientPaneCreated");
         };
         app.focused = Some(pane);
-        if let Response::Snapshot { workspace, .. } =
-            app.request(&mut write_half, &mut reader, Request::Subscribe { workspace: "1".to_string() }).await.unwrap()
+        if let Response::Snapshot { workspace, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::Subscribe {
+                    workspace: "1".to_string(),
+                },
+            )
+            .await
+            .unwrap()
         {
             app.workspace = workspace;
         }
 
         app.close_tab(&mut write_half, &mut reader).await.unwrap();
 
-        let Response::ServerPaneList(servers) =
-            app.request(&mut write_half, &mut reader, Request::ServerList).await.unwrap()
+        let Response::ServerPaneList(servers) = app
+            .request(&mut write_half, &mut reader, Request::ServerList)
+            .await
+            .unwrap()
         else {
             panic!("expected ServerPaneList");
         };
@@ -3425,7 +4357,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ClientSpawn { workspace: "1".to_string(), split_of: None, dir: None, bind: None },
+                Request::ClientSpawn {
+                    workspace: "1".to_string(),
+                    split_of: None,
+                    dir: None,
+                    bind: None,
+                },
             )
             .await
             .unwrap()
@@ -3433,8 +4370,16 @@ mod tests {
             panic!("expected ClientPaneCreated");
         };
         app.focused = Some(pane);
-        if let Response::Snapshot { workspace, .. } =
-            app.request(&mut write_half, &mut reader, Request::Subscribe { workspace: "1".to_string() }).await.unwrap()
+        if let Response::Snapshot { workspace, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::Subscribe {
+                    workspace: "1".to_string(),
+                },
+            )
+            .await
+            .unwrap()
         {
             app.workspace = workspace;
         }
@@ -3442,13 +4387,22 @@ mod tests {
         app.close_tab(&mut write_half, &mut reader).await.unwrap();
 
         let Response::ClientPaneList { panes, .. } = app
-            .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientList {
+                    workspace: Some("1".to_string()),
+                },
+            )
             .await
             .unwrap()
         else {
             panic!("expected ClientPaneList");
         };
-        assert!(!panes.iter().any(|p| p.id == pane), "the unbound leaf should still have been closed");
+        assert!(
+            !panes.iter().any(|p| p.id == pane),
+            "the unbound leaf should still have been closed"
+        );
     }
 
     /// `cmd-shift-z` end to end: the picker it opens must already have
@@ -3465,7 +4419,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None, workspace: None },
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: None,
+                    workspace: None,
+                },
             )
             .await
             .unwrap()
@@ -3490,13 +4449,23 @@ mod tests {
             panic!("expected ClientPaneCreated");
         };
         app.focused = Some(pane);
-        if let Response::Snapshot { workspace, .. } =
-            app.request(&mut write_half, &mut reader, Request::Subscribe { workspace: "1".to_string() }).await.unwrap()
+        if let Response::Snapshot { workspace, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::Subscribe {
+                    workspace: "1".to_string(),
+                },
+            )
+            .await
+            .unwrap()
         {
             app.workspace = workspace;
         }
 
-        app.detach_and_open_menu(&mut write_half, &mut reader).await.unwrap();
+        app.detach_and_open_menu(&mut write_half, &mut reader)
+            .await
+            .unwrap();
 
         let menu = app.attach_menu.as_ref().unwrap();
         match app.selected_attach_menu_row() {
@@ -3511,15 +4480,26 @@ mod tests {
 
         // Confirming immediately (no navigation) should reattach to the
         // exact same pane -- the whole point of preselecting it.
-        app.confirm_attach_menu(&mut write_half, &mut reader).await.unwrap();
+        app.confirm_attach_menu(&mut write_half, &mut reader)
+            .await
+            .unwrap();
         let Response::ClientPaneList { panes, .. } = app
-            .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientList {
+                    workspace: Some("1".to_string()),
+                },
+            )
             .await
             .unwrap()
         else {
             panic!("expected ClientPaneList");
         };
-        let leaf = panes.iter().find(|p| p.id == pane).expect("pane should still exist");
+        let leaf = panes
+            .iter()
+            .find(|p| p.id == pane)
+            .expect("pane should still exist");
         assert_eq!(leaf.active_bound(), Some(existing_id));
     }
 
@@ -3534,7 +4514,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None, workspace: None },
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: None,
+                    workspace: None,
+                },
             )
             .await
             .unwrap()
@@ -3559,26 +4544,50 @@ mod tests {
             panic!("expected ClientPaneCreated");
         };
         app.focused = Some(pane);
-        if let Response::Snapshot { workspace, .. } =
-            app.request(&mut write_half, &mut reader, Request::Subscribe { workspace: "1".to_string() }).await.unwrap()
+        if let Response::Snapshot { workspace, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::Subscribe {
+                    workspace: "1".to_string(),
+                },
+            )
+            .await
+            .unwrap()
         {
             app.workspace = workspace;
         }
 
-        app.detach_and_open_menu(&mut write_half, &mut reader).await.unwrap();
-        assert!(app.attach_menu.is_some(), "the picker should be open before Escape");
+        app.detach_and_open_menu(&mut write_half, &mut reader)
+            .await
+            .unwrap();
+        assert!(
+            app.attach_menu.is_some(),
+            "the picker should be open before Escape"
+        );
 
-        app.dispatch_attach_menu_action(AttachMenuAction::Cancel, &mut write_half, &mut reader).await.unwrap();
+        app.dispatch_attach_menu_action(AttachMenuAction::Cancel, &mut write_half, &mut reader)
+            .await
+            .unwrap();
 
         assert!(app.attach_menu.is_none(), "Escape should close the menu");
         let Response::ClientPaneList { panes, .. } = app
-            .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientList {
+                    workspace: Some("1".to_string()),
+                },
+            )
             .await
             .unwrap()
         else {
             panic!("expected ClientPaneList");
         };
-        let leaf = panes.iter().find(|p| p.id == pane).expect("pane should still exist");
+        let leaf = panes
+            .iter()
+            .find(|p| p.id == pane)
+            .expect("pane should still exist");
         assert_eq!(
             leaf.active_bound(),
             Some(existing_id),
@@ -3597,7 +4606,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ClientSpawn { workspace: "1".to_string(), split_of: None, dir: None, bind: None },
+                Request::ClientSpawn {
+                    workspace: "1".to_string(),
+                    split_of: None,
+                    dir: None,
+                    bind: None,
+                },
             )
             .await
             .unwrap()
@@ -3605,24 +4619,45 @@ mod tests {
             panic!("expected ClientPaneCreated");
         };
         app.focused = Some(pane);
-        if let Response::Snapshot { workspace, .. } =
-            app.request(&mut write_half, &mut reader, Request::Subscribe { workspace: "1".to_string() }).await.unwrap()
+        if let Response::Snapshot { workspace, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::Subscribe {
+                    workspace: "1".to_string(),
+                },
+            )
+            .await
+            .unwrap()
         {
             app.workspace = workspace;
         }
 
-        app.detach_and_open_menu(&mut write_half, &mut reader).await.unwrap();
-        app.dispatch_attach_menu_action(AttachMenuAction::Cancel, &mut write_half, &mut reader).await.unwrap();
+        app.detach_and_open_menu(&mut write_half, &mut reader)
+            .await
+            .unwrap();
+        app.dispatch_attach_menu_action(AttachMenuAction::Cancel, &mut write_half, &mut reader)
+            .await
+            .unwrap();
 
         assert!(app.attach_menu.is_none());
         let Response::ClientPaneList { panes, .. } = app
-            .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientList {
+                    workspace: Some("1".to_string()),
+                },
+            )
             .await
             .unwrap()
         else {
             panic!("expected ClientPaneList");
         };
-        let leaf = panes.iter().find(|p| p.id == pane).expect("pane should still exist");
+        let leaf = panes
+            .iter()
+            .find(|p| p.id == pane)
+            .expect("pane should still exist");
         assert_eq!(leaf.active_bound(), None);
     }
 
@@ -3638,7 +4673,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None, workspace: None },
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: None,
+                    workspace: None,
+                },
             )
             .await
             .unwrap()
@@ -3649,7 +4689,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None, workspace: None },
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: None,
+                    workspace: None,
+                },
             )
             .await
             .unwrap()
@@ -3676,36 +4721,70 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ClientAddTab { workspace: "1".to_string(), pane, target: sp2.id.to_string() },
+                Request::ClientAddTab {
+                    workspace: "1".to_string(),
+                    pane,
+                    target: sp2.id.to_string(),
+                },
             )
             .await
             .unwrap();
         app.focused = Some(pane);
-        if let Response::Snapshot { workspace, .. } =
-            app.request(&mut write_half, &mut reader, Request::Subscribe { workspace: "1".to_string() }).await.unwrap()
+        if let Response::Snapshot { workspace, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::Subscribe {
+                    workspace: "1".to_string(),
+                },
+            )
+            .await
+            .unwrap()
         {
             app.workspace = workspace;
         }
 
-        app.detach_and_open_menu(&mut write_half, &mut reader).await.unwrap();
+        app.detach_and_open_menu(&mut write_half, &mut reader)
+            .await
+            .unwrap();
         assert!(app.attach_menu.is_some());
 
-        app.dispatch_attach_menu_action(AttachMenuAction::DetachAll, &mut write_half, &mut reader).await.unwrap();
+        app.dispatch_attach_menu_action(AttachMenuAction::DetachAll, &mut write_half, &mut reader)
+            .await
+            .unwrap();
 
-        assert!(app.attach_menu.is_none(), "detach-all should close the menu");
+        assert!(
+            app.attach_menu.is_none(),
+            "detach-all should close the menu"
+        );
         let Response::ClientPaneList { panes, .. } = app
-            .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientList {
+                    workspace: Some("1".to_string()),
+                },
+            )
             .await
             .unwrap()
         else {
             panic!("expected ClientPaneList");
         };
-        let leaf = panes.iter().find(|p| p.id == pane).expect("pane should still exist");
-        assert!(leaf.tabs.is_empty(), "every tab should have been detached, leaf.tabs = {:?}", leaf.tabs);
+        let leaf = panes
+            .iter()
+            .find(|p| p.id == pane)
+            .expect("pane should still exist");
+        assert!(
+            leaf.tabs.is_empty(),
+            "every tab should have been detached, leaf.tabs = {:?}",
+            leaf.tabs
+        );
 
         // Both server-panes must still be running -- detaching is not killing.
-        let Response::ServerPaneList(servers) =
-            app.request(&mut write_half, &mut reader, Request::ServerList).await.unwrap()
+        let Response::ServerPaneList(servers) = app
+            .request(&mut write_half, &mut reader, Request::ServerList)
+            .await
+            .unwrap()
         else {
             panic!("expected ServerPaneList");
         };
@@ -3729,7 +4808,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None , workspace: None},
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: None,
+                    workspace: None,
+                },
             )
             .await
             .unwrap()
@@ -3740,7 +4824,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None , workspace: None},
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: None,
+                    workspace: None,
+                },
             )
             .await
             .unwrap()
@@ -3751,7 +4840,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None , workspace: None},
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: None,
+                    workspace: None,
+                },
             )
             .await
             .unwrap()
@@ -3780,20 +4874,34 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ClientAddTab { workspace: "1".to_string(), pane, target: sp2.id.to_string() },
+                Request::ClientAddTab {
+                    workspace: "1".to_string(),
+                    pane,
+                    target: sp2.id.to_string(),
+                },
             )
             .await
             .unwrap();
         // Sync local workspace state so `detach_and_open_menu` sees the
         // real (2-tab, active = sp2) leaf rather than the stale
         // single-tab snapshot from bootstrap.
-        if let Response::Snapshot { workspace, .. } =
-            app.request(&mut write_half, &mut reader, Request::Subscribe { workspace: "1".to_string() }).await.unwrap()
+        if let Response::Snapshot { workspace, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::Subscribe {
+                    workspace: "1".to_string(),
+                },
+            )
+            .await
+            .unwrap()
         {
             app.workspace = workspace;
         }
 
-        app.detach_and_open_menu(&mut write_half, &mut reader).await.unwrap();
+        app.detach_and_open_menu(&mut write_half, &mut reader)
+            .await
+            .unwrap();
         assert!(app.attach_menu.is_some(), "the picker should open");
 
         // Pick sp3 to replace the active tab (sp2). Row 0 is the
@@ -3802,16 +4910,27 @@ mod tests {
         let sp3_id = sp3.id;
         app.attach_menu.as_mut().unwrap().servers = vec![("Unknown".to_string(), sp3)];
         app.attach_menu.as_mut().unwrap().selected = 1;
-        app.confirm_attach_menu(&mut write_half, &mut reader).await.unwrap();
+        app.confirm_attach_menu(&mut write_half, &mut reader)
+            .await
+            .unwrap();
 
         let Response::ClientPaneList { panes, .. } = app
-            .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientList {
+                    workspace: Some("1".to_string()),
+                },
+            )
             .await
             .unwrap()
         else {
             panic!("expected ClientPaneList");
         };
-        let leaf = panes.iter().find(|p| p.id == pane).expect("pane should still exist");
+        let leaf = panes
+            .iter()
+            .find(|p| p.id == pane)
+            .expect("pane should still exist");
         assert_eq!(
             leaf.tabs,
             vec![sp1.id, sp3_id],
@@ -3834,7 +4953,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ClientSpawn { workspace: "2".to_string(), split_of: None, dir: None, bind: None },
+                Request::ClientSpawn {
+                    workspace: "2".to_string(),
+                    split_of: None,
+                    dir: None,
+                    bind: None,
+                },
             )
             .await
             .unwrap()
@@ -3863,7 +4987,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ClientSpawn { workspace: "1".to_string(), split_of: None, dir: None, bind: None },
+                Request::ClientSpawn {
+                    workspace: "1".to_string(),
+                    split_of: None,
+                    dir: None,
+                    bind: None,
+                },
             )
             .await
             .unwrap()
@@ -3872,22 +5001,34 @@ mod tests {
         };
         app.focused = Some(pane);
 
-        app.open_add_tab_menu(&mut write_half, &mut reader).await.unwrap();
+        app.open_add_tab_menu(&mut write_half, &mut reader)
+            .await
+            .unwrap();
         let servers_shown = |app: &App| -> Vec<uuid::Uuid> {
-            app.attach_menu.as_ref().unwrap().servers.iter().map(|(_, s)| s.id).collect()
+            app.attach_menu
+                .as_ref()
+                .unwrap()
+                .servers
+                .iter()
+                .map(|(_, s)| s.id)
+                .collect()
         };
         assert!(
             !servers_shown(&app).contains(&theirs.id),
             "workspace 2's own pane must not show in workspace 1's picker by default"
         );
 
-        app.toggle_show_all_workspaces(&mut write_half, &mut reader).await.unwrap();
+        app.toggle_show_all_workspaces(&mut write_half, &mut reader)
+            .await
+            .unwrap();
         assert!(
             servers_shown(&app).contains(&theirs.id),
             "toggling show-all should reveal workspace 2's pane"
         );
 
-        app.toggle_show_all_workspaces(&mut write_half, &mut reader).await.unwrap();
+        app.toggle_show_all_workspaces(&mut write_half, &mut reader)
+            .await
+            .unwrap();
         assert!(
             !servers_shown(&app).contains(&theirs.id),
             "toggling again should hide it again"
@@ -3909,7 +5050,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None , workspace: None},
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: None,
+                    workspace: None,
+                },
             )
             .await
             .unwrap()
@@ -3920,7 +5066,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: None , workspace: None},
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: None,
+                    workspace: None,
+                },
             )
             .await
             .unwrap()
@@ -3947,7 +5098,9 @@ mod tests {
         };
         app.focused = Some(pane);
 
-        app.open_add_tab_menu(&mut write_half, &mut reader).await.unwrap();
+        app.open_add_tab_menu(&mut write_half, &mut reader)
+            .await
+            .unwrap();
         assert!(app.attach_menu.is_some(), "cmd-t should open the picker");
         assert!(
             app.attach_menu.as_ref().unwrap().adding_tab,
@@ -3965,22 +5118,36 @@ mod tests {
         // real, both-panes-included ServerList).
         app.attach_menu.as_mut().unwrap().servers = vec![("Unknown".to_string(), sp2)];
         app.attach_menu.as_mut().unwrap().selected = 1;
-        app.confirm_attach_menu(&mut write_half, &mut reader).await.unwrap();
+        app.confirm_attach_menu(&mut write_half, &mut reader)
+            .await
+            .unwrap();
 
         let Response::ClientPaneList { panes, .. } = app
-            .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientList {
+                    workspace: Some("1".to_string()),
+                },
+            )
             .await
             .unwrap()
         else {
             panic!("expected ClientPaneList");
         };
-        let leaf = panes.iter().find(|p| p.id == pane).expect("pane should still exist");
+        let leaf = panes
+            .iter()
+            .find(|p| p.id == pane)
+            .expect("pane should still exist");
         assert_eq!(
             leaf.tabs,
             vec![sp1.id, sp2_id],
             "add-tab mode must append sp2 as a new tab, not replace sp1"
         );
-        assert_eq!(leaf.active_tab, 1, "the newly-added tab should become active");
+        assert_eq!(
+            leaf.active_tab, 1,
+            "the newly-added tab should become active"
+        );
     }
 
     /// Plain Enter on a group's spawn field: spawns a new server-pane in
@@ -3998,7 +5165,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ClientSpawn { workspace: "1".to_string(), split_of: None, dir: None, bind: None },
+                Request::ClientSpawn {
+                    workspace: "1".to_string(),
+                    split_of: None,
+                    dir: None,
+                    bind: None,
+                },
             )
             .await
             .unwrap()
@@ -4011,7 +5183,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) , workspace: None},
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: Some("/tmp".to_string()),
+                    workspace: None,
+                },
             )
             .await
             .unwrap()
@@ -4021,26 +5198,53 @@ mod tests {
         let existing_id = existing.id;
         open_menu_with_one_group(&mut app, "/tmp", existing);
 
-        app.handle_attach_menu_input(b"echo hi", &mut write_half, &mut reader).await.unwrap();
+        app.handle_attach_menu_input(b"echo hi", &mut write_half, &mut reader)
+            .await
+            .unwrap();
         assert_eq!(
-            app.attach_menu.as_ref().unwrap().spawn_in_group.as_ref().unwrap().text,
+            app.attach_menu
+                .as_ref()
+                .unwrap()
+                .spawn_in_group
+                .as_ref()
+                .unwrap()
+                .text,
             "echo hi",
             "typing while the spawn-in-group row is selected should open its field with that text"
         );
 
-        app.handle_attach_menu_input(b"\r", &mut write_half, &mut reader).await.unwrap();
-        assert!(app.attach_menu.is_none(), "confirming should close the menu");
+        app.handle_attach_menu_input(b"\r", &mut write_half, &mut reader)
+            .await
+            .unwrap();
+        assert!(
+            app.attach_menu.is_none(),
+            "confirming should close the menu"
+        );
 
         let Response::ClientPaneList { panes, .. } = app
-            .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientList {
+                    workspace: Some("1".to_string()),
+                },
+            )
             .await
             .unwrap()
         else {
             panic!("expected ClientPaneList");
         };
-        let bound_pane = panes.iter().find(|p| p.id == pane).expect("pane should still exist");
-        let new_server_pane = bound_pane.active_bound().expect("Enter should have bound the newly spawned pane");
-        assert_ne!(new_server_pane, existing_id, "should bind the NEW pane, not the pre-existing one");
+        let bound_pane = panes
+            .iter()
+            .find(|p| p.id == pane)
+            .expect("pane should still exist");
+        let new_server_pane = bound_pane
+            .active_bound()
+            .expect("Enter should have bound the newly spawned pane");
+        assert_ne!(
+            new_server_pane, existing_id,
+            "should bind the NEW pane, not the pre-existing one"
+        );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
@@ -4048,7 +5252,9 @@ mod tests {
                 .request(
                     &mut write_half,
                     &mut reader,
-                    Request::ServerRead { target: new_server_pane.to_string() },
+                    Request::ServerRead {
+                        target: new_server_pane.to_string(),
+                    },
                 )
                 .await
                 .unwrap()
@@ -4058,7 +5264,10 @@ mod tests {
             if text.contains("hi") {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "typed command never echoed back");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "typed command never echoed back"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
@@ -4074,7 +5283,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ClientSpawn { workspace: "1".to_string(), split_of: None, dir: None, bind: None },
+                Request::ClientSpawn {
+                    workspace: "1".to_string(),
+                    split_of: None,
+                    dir: None,
+                    bind: None,
+                },
             )
             .await
             .unwrap()
@@ -4087,7 +5301,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) , workspace: None},
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: Some("/tmp".to_string()),
+                    workspace: None,
+                },
             )
             .await
             .unwrap()
@@ -4097,33 +5316,60 @@ mod tests {
         let existing_id = existing.id;
         open_menu_with_one_group(&mut app, "/tmp", existing);
 
-        app.handle_attach_menu_input(b"echo unbound-test", &mut write_half, &mut reader).await.unwrap();
-        app.handle_attach_menu_input(keys::SHIFT_ENTER_CHORD, &mut write_half, &mut reader).await.unwrap();
-        assert!(app.attach_menu.is_some(), "Shift+Enter should keep the menu open, unlike plain Enter");
+        app.handle_attach_menu_input(b"echo unbound-test", &mut write_half, &mut reader)
+            .await
+            .unwrap();
+        app.handle_attach_menu_input(keys::SHIFT_ENTER_CHORD, &mut write_half, &mut reader)
+            .await
+            .unwrap();
+        assert!(
+            app.attach_menu.is_some(),
+            "Shift+Enter should keep the menu open, unlike plain Enter"
+        );
         assert!(
             app.attach_menu.as_ref().unwrap().spawn_in_group.is_none(),
             "the just-confirmed field should close even though the menu itself stays open"
         );
         assert!(
-            app.attach_menu.as_ref().unwrap().servers.iter().any(|(_, s)| s.id != existing_id),
+            app.attach_menu
+                .as_ref()
+                .unwrap()
+                .servers
+                .iter()
+                .any(|(_, s)| s.id != existing_id),
             "the newly spawned pane should already be visible in the still-open menu's row list"
         );
 
         let Response::ClientPaneList { panes, .. } = app
-            .request(&mut write_half, &mut reader, Request::ClientList { workspace: Some("1".to_string()) })
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientList {
+                    workspace: Some("1".to_string()),
+                },
+            )
             .await
             .unwrap()
         else {
             panic!("expected ClientPaneList");
         };
-        let bound_pane = panes.iter().find(|p| p.id == pane).expect("pane should still exist");
-        assert_eq!(bound_pane.active_bound(), None, "Shift+Enter must not bind the new pane into the focused client-pane");
+        let bound_pane = panes
+            .iter()
+            .find(|p| p.id == pane)
+            .expect("pane should still exist");
+        assert_eq!(
+            bound_pane.active_bound(),
+            None,
+            "Shift+Enter must not bind the new pane into the focused client-pane"
+        );
 
         // The command should still have been sent to *some* new pane --
         // find it by listing server-panes and reading whichever one
         // isn't `existing`.
-        let Response::ServerPaneList(server_panes) =
-            app.request(&mut write_half, &mut reader, Request::ServerList).await.unwrap()
+        let Response::ServerPaneList(server_panes) = app
+            .request(&mut write_half, &mut reader, Request::ServerList)
+            .await
+            .unwrap()
         else {
             panic!("expected ServerPaneList");
         };
@@ -4138,7 +5384,9 @@ mod tests {
                 .request(
                     &mut write_half,
                     &mut reader,
-                    Request::ServerRead { target: new_pane.id.to_string() },
+                    Request::ServerRead {
+                        target: new_pane.id.to_string(),
+                    },
                 )
                 .await
                 .unwrap()
@@ -4148,7 +5396,10 @@ mod tests {
             if text.contains("unbound-test") {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "typed command never echoed back");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "typed command never echoed back"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
@@ -4167,7 +5418,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) , workspace: None},
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: Some("/tmp".to_string()),
+                    workspace: None,
+                },
             )
             .await
             .unwrap()
@@ -4176,16 +5432,27 @@ mod tests {
         };
         // Rows: 0 = "/tmp" header, 1 = existing server, 2 = spawn-in-group.
         open_menu_with_one_group(&mut app, "/tmp", existing);
-        assert_eq!(app.selected_attach_menu_row(), Some(AttachMenuRow::SpawnNewInGroup(0)));
+        assert_eq!(
+            app.selected_attach_menu_row(),
+            Some(AttachMenuRow::SpawnNewInGroup(0))
+        );
 
-        app.handle_attach_menu_input(b"j", &mut write_half, &mut reader).await.unwrap();
+        app.handle_attach_menu_input(b"j", &mut write_half, &mut reader)
+            .await
+            .unwrap();
         assert!(
             app.attach_menu.as_ref().unwrap().spawn_in_group.is_none(),
             "`j` should navigate, not open the spawn field"
         );
-        assert_eq!(app.selected_attach_menu_row(), Some(AttachMenuRow::SpawnNew), "`j` should move to the next row");
+        assert_eq!(
+            app.selected_attach_menu_row(),
+            Some(AttachMenuRow::SpawnNew),
+            "`j` should move to the next row"
+        );
 
-        app.handle_attach_menu_input(b"\x1b[A", &mut write_half, &mut reader).await.unwrap();
+        app.handle_attach_menu_input(b"\x1b[A", &mut write_half, &mut reader)
+            .await
+            .unwrap();
         assert_eq!(
             app.selected_attach_menu_row(),
             Some(AttachMenuRow::SpawnNewInGroup(0)),
@@ -4205,7 +5472,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) , workspace: None},
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: Some("/tmp".to_string()),
+                    workspace: None,
+                },
             )
             .await
             .unwrap()
@@ -4216,26 +5488,38 @@ mod tests {
         // Row 0 = "/tmp" header, row 1 = the server row itself.
         open_menu_with_one_group(&mut app, "/tmp", existing);
         app.attach_menu.as_mut().unwrap().selected = 1;
-        assert_eq!(app.selected_attach_menu_row(), Some(AttachMenuRow::Server(0)));
+        assert_eq!(
+            app.selected_attach_menu_row(),
+            Some(AttachMenuRow::Server(0))
+        );
 
         app.request(
             &mut write_half,
             &mut reader,
-            Request::ServerSend { target: existing_id.to_string(), text: "preview-marker".to_string(), enter: true },
+            Request::ServerSend {
+                target: existing_id.to_string(),
+                text: "preview-marker".to_string(),
+                enter: true,
+            },
         )
         .await
         .unwrap();
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            app.refresh_attach_menu_preview(&mut write_half, &mut reader).await.unwrap();
+            app.refresh_attach_menu_preview(&mut write_half, &mut reader)
+                .await
+                .unwrap();
             if let Some((id, text)) = &app.attach_menu_preview
                 && *id == existing_id
                 && text.contains("preview-marker")
             {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "preview never picked up the sent text");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "preview never picked up the sent text"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
@@ -4250,7 +5534,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) , workspace: None},
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: Some("/tmp".to_string()),
+                    workspace: None,
+                },
             )
             .await
             .unwrap()
@@ -4259,12 +5548,22 @@ mod tests {
         };
         open_menu_with_one_group(&mut app, "/tmp", existing);
         app.attach_menu.as_mut().unwrap().selected = 1;
-        app.refresh_attach_menu_preview(&mut write_half, &mut reader).await.unwrap();
-        assert!(app.attach_menu_preview.is_some(), "expected a preview to be cached for the server row");
+        app.refresh_attach_menu_preview(&mut write_half, &mut reader)
+            .await
+            .unwrap();
+        assert!(
+            app.attach_menu_preview.is_some(),
+            "expected a preview to be cached for the server row"
+        );
 
         app.attach_menu.as_mut().unwrap().selected = 0; // the group header
-        app.refresh_attach_menu_preview(&mut write_half, &mut reader).await.unwrap();
-        assert!(app.attach_menu_preview.is_none(), "selecting the header should clear the cached preview");
+        app.refresh_attach_menu_preview(&mut write_half, &mut reader)
+            .await
+            .unwrap();
+        assert!(
+            app.attach_menu_preview.is_none(),
+            "selecting the header should clear the cached preview"
+        );
     }
 
     /// Install a deterministic two-leaf, side-by-side tree into `app`,
@@ -4292,11 +5591,112 @@ mod tests {
 
         // `right` occupies the rightmost half, so a click near the right
         // edge lands inside it regardless of the exact divider position.
-        app.handle_mouse(mouse::MouseEvent::Down { col: 75, row: 5 }, &mut write_half, &mut reader)
+        let _ = app
+            .handle_mouse(
+                mouse::MouseEvent::Down { col: 75, row: 5 },
+                &mut write_half,
+                &mut reader,
+            )
             .await
             .unwrap();
 
-        assert_eq!(app.focused, Some(right), "clicking inside the right pane should focus it");
+        assert_eq!(
+            app.focused,
+            Some(right),
+            "clicking inside the right pane should focus it"
+        );
+    }
+
+    #[tokio::test]
+    async fn dragging_pane_text_returns_it_for_clipboard_copy_and_keeps_highlight() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+        let (_left, right) = app_with_two_side_by_side_leaves(&mut app);
+        let server_pane = Uuid::new_v4();
+        let right_leaf = app
+            .workspace
+            .tree
+            .as_mut()
+            .unwrap()
+            .find_mut(right)
+            .unwrap();
+        right_leaf.tabs = vec![server_pane];
+        right_leaf.active_tab = 0;
+        let cells = "abcdef"
+            .chars()
+            .map(|ch| crate::protocol::Cell {
+                text: ch.to_string(),
+                fg: None,
+                bg: None,
+                bold: false,
+                italic: false,
+                underline: false,
+                reverse: false,
+            })
+            .collect();
+        app.grids.insert(
+            server_pane,
+            GridSnapshot {
+                server_pane,
+                size: Size { rows: 1, cols: 6 },
+                cursor: (0, 0),
+                lines: vec![cells],
+                scroll_offset: 0,
+            },
+        );
+        let (_, right_rect) =
+            render::leaf_rects(app.workspace.tree.as_ref().unwrap(), app.frame_area)
+                .into_iter()
+                .find(|(pane, _)| *pane == right)
+                .unwrap();
+        let start_col = right_rect.x + 1;
+        let content_row = right_rect.y + 1;
+
+        assert_eq!(
+            app.handle_mouse(
+                mouse::MouseEvent::Down {
+                    col: start_col,
+                    row: content_row
+                },
+                &mut write_half,
+                &mut reader,
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            app.handle_mouse(
+                mouse::MouseEvent::Drag {
+                    col: start_col + 2,
+                    row: content_row
+                },
+                &mut write_half,
+                &mut reader,
+            )
+            .await
+            .unwrap(),
+            None
+        );
+        let copied = app
+            .handle_mouse(
+                mouse::MouseEvent::Up {
+                    col: start_col + 2,
+                    row: content_row,
+                },
+                &mut write_half,
+                &mut reader,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(copied.as_deref(), Some("bcd"));
+        let selection = app
+            .text_selection
+            .as_ref()
+            .expect("highlight should remain after copying");
+        assert!(!selection.is_dragging());
+        assert!(selection.contains(0, 1));
+        assert!(selection.contains(0, 3));
     }
 
     #[tokio::test]
@@ -4308,13 +5708,29 @@ mod tests {
         // `handle_mouse` hit-tests against, rather than hardcoding it --
         // a 50/50 split of an 80-wide area lands it at 39, not 40.
         let divider = render::divider_rects(app.workspace.tree.as_ref().unwrap(), app.frame_area);
-        let [hit] = divider.as_slice() else { panic!("expected exactly one divider, got {divider:?}") };
+        let [hit] = divider.as_slice() else {
+            panic!("expected exactly one divider, got {divider:?}")
+        };
         let col = hit.grab_zone.x;
 
-        app.handle_mouse(mouse::MouseEvent::Down { col, row: 5 }, &mut write_half, &mut reader).await.unwrap();
+        let _ = app
+            .handle_mouse(
+                mouse::MouseEvent::Down { col, row: 5 },
+                &mut write_half,
+                &mut reader,
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(app.focused, Some(left), "clicking the divider should start a drag, not change focus");
-        assert!(app.dragging_split.is_some(), "the click should have been recognized as a divider grab");
+        assert_eq!(
+            app.focused,
+            Some(left),
+            "clicking the divider should start a drag, not change focus"
+        );
+        assert!(
+            app.dragging_split.is_some(),
+            "the click should have been recognized as a divider grab"
+        );
     }
 
     /// Serializes every test in this module that spawns a real daemon
@@ -4323,7 +5739,7 @@ mod tests {
     /// so without this a concurrently-running such test could read/write
     /// the wrong fake config dir mid-test -- and without redirecting
     /// `$XDG_CONFIG_HOME` at all, these tests would otherwise touch the
-    /// real user's `~/.config/dimux/pinned_dirs.json`.
+    /// real user's `~/.config/dimax/pinned_dirs.json`.
     static PIN_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     async fn app_against_real_daemon_with_fake_pin_config(
@@ -4343,7 +5759,8 @@ mod tests {
     /// not just `State::toggle_pinned_dir` directly.
     #[tokio::test]
     async fn toggle_directory_pin_on_a_header_row_sorts_it_first() {
-        let config_dir = std::env::temp_dir().join(format!("dmx-am-pin-config-{}", std::process::id()));
+        let config_dir =
+            std::env::temp_dir().join(format!("dmx-am-pin-config-{}", std::process::id()));
         let _guard = PIN_ENV_LOCK.lock().await;
         let (mut app, mut write_half, mut reader) =
             app_against_real_daemon_with_fake_pin_config(&config_dir).await;
@@ -4356,13 +5773,21 @@ mod tests {
         let dir_z = std::env::temp_dir().join(format!("dmx-am-pin-zzz-{}", std::process::id()));
         std::fs::create_dir_all(&dir_a).unwrap();
         std::fs::create_dir_all(&dir_z).unwrap();
-        let (dir_a_str, dir_z_str) = (dir_a.to_str().unwrap().to_string(), dir_z.to_str().unwrap().to_string());
+        let (dir_a_str, dir_z_str) = (
+            dir_a.to_str().unwrap().to_string(),
+            dir_z.to_str().unwrap().to_string(),
+        );
 
         let Response::ServerPane(a) = app
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some(dir_a_str) , workspace: None},
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: Some(dir_a_str),
+                    workspace: None,
+                },
             )
             .await
             .unwrap()
@@ -4373,7 +5798,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some(dir_z_str) , workspace: None},
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: Some(dir_z_str),
+                    workspace: None,
+                },
             )
             .await
             .unwrap()
@@ -4383,11 +5813,21 @@ mod tests {
         // Read back the *actually resolved* cwd (e.g. macOS resolves
         // `/tmp` to `/private/tmp` for a real process) rather than
         // assuming the input string round-trips exactly.
-        let resolved_a = a.foreground.as_ref().and_then(|f| f.cwd.clone()).expect("cwd should resolve for `cat`");
-        let resolved_z = z.foreground.as_ref().and_then(|f| f.cwd.clone()).expect("cwd should resolve for `cat`");
+        let resolved_a = a
+            .foreground
+            .as_ref()
+            .and_then(|f| f.cwd.clone())
+            .expect("cwd should resolve for `cat`");
+        let resolved_z = z
+            .foreground
+            .as_ref()
+            .and_then(|f| f.cwd.clone())
+            .expect("cwd should resolve for `cat`");
 
-        let Response::ServerPaneList(servers) =
-            app.request(&mut write_half, &mut reader, Request::ServerList).await.unwrap()
+        let Response::ServerPaneList(servers) = app
+            .request(&mut write_half, &mut reader, Request::ServerList)
+            .await
+            .unwrap()
         else {
             panic!("expected ServerPaneList");
         };
@@ -4415,15 +5855,23 @@ mod tests {
             Some(AttachMenuRow::GroupHeader(1)),
             "row 3 should be dir_z's header"
         );
-        app.toggle_directory_pin(&mut write_half, &mut reader).await.unwrap();
+        app.toggle_directory_pin(&mut write_half, &mut reader)
+            .await
+            .unwrap();
 
         assert_eq!(app.pinned_dirs, vec![resolved_z.clone()]);
-        assert_eq!(sort_key(&app), resolved_z, "pinning dir_z should move it to the front of the grouped list");
+        assert_eq!(
+            sort_key(&app),
+            resolved_z,
+            "pinning dir_z should move it to the front of the grouped list"
+        );
 
         // Confirm the pin also comes back from a totally fresh fetch
         // (i.e. it's real daemon-side state, not just local bookkeeping).
-        let Response::PinnedDirsList(pinned) =
-            app.request(&mut write_half, &mut reader, Request::PinnedDirsList).await.unwrap()
+        let Response::PinnedDirsList(pinned) = app
+            .request(&mut write_half, &mut reader, Request::PinnedDirsList)
+            .await
+            .unwrap()
         else {
             panic!("expected PinnedDirsList");
         };
@@ -4451,7 +5899,12 @@ mod tests {
             .request(
                 &mut write_half,
                 &mut reader,
-                Request::ServerSpawn { name: None, cmd: Some("cat".to_string()), cwd: Some("/tmp".to_string()) , workspace: None},
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: Some("/tmp".to_string()),
+                    workspace: None,
+                },
             )
             .await
             .unwrap()
@@ -4460,9 +5913,17 @@ mod tests {
         };
         open_menu_with_one_group(&mut app, "/tmp", existing);
         app.attach_menu.as_mut().unwrap().selected = 1; // the server row, not the header
-        assert_eq!(app.selected_attach_menu_row(), Some(AttachMenuRow::Server(0)));
+        assert_eq!(
+            app.selected_attach_menu_row(),
+            Some(AttachMenuRow::Server(0))
+        );
 
-        app.toggle_directory_pin(&mut write_half, &mut reader).await.unwrap();
-        assert!(app.pinned_dirs.is_empty(), "toggling on a non-header row must not pin anything");
+        app.toggle_directory_pin(&mut write_half, &mut reader)
+            .await
+            .unwrap();
+        assert!(
+            app.pinned_dirs.is_empty(),
+            "toggling on a non-header row must not pin anything"
+        );
     }
 }

@@ -30,7 +30,7 @@ relate to its bound server-pane's PTY:
 - No SIGWINCH/terminal-resize-signal handling — resize reporting piggybacks
   on the render loop's existing per-frame cadence (see "Resize" below for
   why this is sufficient without a signal handler).
-- No change to `dimux server ls`/CLI surface — both fixes are
+- No change to `dimax server ls`/CLI surface — both fixes are
   TUI-attach/daemon-protocol only.
 - No scrollback-position persistence across workspace switches or
   detach/reattach — switching away from a pane and back resets its
@@ -56,7 +56,7 @@ relate to its bound server-pane's PTY:
   sizing").
 - **The gap:** `src/tui/mod.rs` never constructs or sends a
   `Request::ResizeClientPane`. `client_pane_sizes` never gets an entry
-  for any pane opened via `dimux attach`, so `viewed_size` always
+  for any pane opened via `dimax attach`, so `viewed_size` always
   returns `None`, and every server-pane's PTY stays at whatever it was
   created with (`term::ServerPane::spawn`'s caller passes
   `DEFAULT_PTY_SIZE`, per `daemon/state.rs`'s `server_spawn`) —

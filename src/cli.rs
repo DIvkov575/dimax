@@ -1,4 +1,4 @@
-//! `dimux server ...` / `dimux client ...` subcommands, and the client
+//! `dimax server ...` / `dimax client ...` subcommands, and the client
 //! library both they and the TUI frontend use to talk to the daemon.
 //!
 //! `Client` is the one place that knows how to open the socket, ensure
@@ -7,7 +7,9 @@
 //! frontend callers" is implemented by both `cli` and `tui` going through
 //! this same type.
 
-use crate::protocol::{self, ClientPane, Request, Response, ServerMessage, ServerPaneInfo, ServerPaneStatus};
+use crate::protocol::{
+    self, ClientPane, Request, Response, ServerMessage, ServerPaneInfo, ServerPaneStatus,
+};
 use tokio::net::UnixStream;
 
 pub struct Client {
@@ -43,7 +45,12 @@ impl Client {
     /// that need to send requests and receive pushed `Event`s concurrently
     /// on the same connection, rather than the strict request/then-response
     /// cycle `request()` assumes.
-    pub fn into_split(self) -> (tokio::net::unix::OwnedReadHalf, tokio::net::unix::OwnedWriteHalf) {
+    pub fn into_split(
+        self,
+    ) -> (
+        tokio::net::unix::OwnedReadHalf,
+        tokio::net::unix::OwnedWriteHalf,
+    ) {
         self.stream.into_split()
     }
 }
@@ -68,16 +75,29 @@ pub enum Cli {
     /// Run the daemon in the foreground (used internally by the
     /// auto-spawn path; also useful for debugging).
     Daemon,
-    /// Regenerate `dimux.conf` (Kitty chord mappings) if needed, then
+    /// Regenerate `dimax.conf` (Kitty chord mappings) if needed, then
     /// open it in `$EDITOR`/`$VISUAL`.
     Config,
+    /// Install, inspect, or remove terminal keybindings.
+    Keys {
+        #[command(subcommand)]
+        cmd: KeysCmd,
+    },
+    /// Install, inspect, or remove the bundled Claude Code skill.
+    Skills {
+        #[command(subcommand)]
+        cmd: SkillsCmd,
+    },
 }
 
 /// `main.rs`'s actual clap entry point. `command` is `Option` so bare
-/// `dimux` (no subcommand at all) parses successfully instead of
+/// `dimax` (no subcommand at all) parses successfully instead of
 /// erroring -- `main` then defaults it to [`Cli::Attach`].
 #[derive(clap::Parser)]
-#[command(name = "dimux", about = "A terminal multiplexer. With no subcommand, attaches to the TUI.")]
+#[command(
+    name = "dimax",
+    about = "A terminal multiplexer. With no subcommand, attaches to the TUI."
+)]
 pub struct Args {
     #[command(subcommand)]
     pub command: Option<Cli>,
@@ -94,11 +114,18 @@ pub enum ServerCmd {
         #[arg(long)]
         cwd: Option<String>,
     },
-    Kill { target: String },
-    Rename { target: String, new_name: String },
+    Kill {
+        target: String,
+    },
+    Rename {
+        target: String,
+        new_name: String,
+    },
     Ls,
     /// Print a server-pane's current on-screen contents as plain text.
-    Read { target: String },
+    Read {
+        target: String,
+    },
     /// Type text into a server-pane, bypassing any workspace/client-pane
     /// binding.
     Send {
@@ -122,12 +149,76 @@ pub enum ClientCmd {
         #[arg(long)]
         bind: Option<String>,
     },
-    Close { addr: String },
-    Rename { addr: String, new_name: String },
-    Bind { addr: String, target: String },
-    Unbind { addr: String },
-    AddTab { addr: String, target: String },
-    Ls { workspace: Option<String> },
+    Close {
+        addr: String,
+    },
+    Rename {
+        addr: String,
+        new_name: String,
+    },
+    Bind {
+        addr: String,
+        target: String,
+    },
+    Unbind {
+        addr: String,
+    },
+    AddTab {
+        addr: String,
+        target: String,
+    },
+    Ls {
+        workspace: Option<String>,
+    },
+}
+
+#[derive(clap::Subcommand)]
+pub enum KeysCmd {
+    /// Select portable, Kitty, or combined keybindings.
+    Install {
+        #[arg(long, value_enum, default_value = "both")]
+        mode: crate::tui::keys::BindingMode,
+        /// Ask a running Kitty instance to reload after installation.
+        #[arg(long)]
+        reload: bool,
+        /// Skip the confirmation prompt before amending kitty.conf (assumes yes).
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Remove managed Kitty bindings and leave portable bindings active.
+    Uninstall,
+    /// Print generated bindings without changing any files.
+    Print {
+        #[arg(long, value_enum, default_value = "both")]
+        mode: crate::tui::keys::BindingMode,
+    },
+    /// Show the active mode and default binding table.
+    List,
+    /// Add aliases for an existing action.
+    Bind {
+        action: String,
+        #[arg(long)]
+        portable: Option<String>,
+        #[arg(long)]
+        kitty: Option<String>,
+    },
+    /// Remove custom aliases by their key sequence or chord.
+    Unbind {
+        #[arg(long)]
+        portable: Option<String>,
+        #[arg(long)]
+        kitty: Option<String>,
+    },
+    /// Remove every custom alias while preserving the selected mode.
+    Reset,
+}
+
+#[derive(clap::Subcommand)]
+pub enum SkillsCmd {
+    /// Write the bundled `dimax-pane-control` skill to
+    /// `~/.claude/skills/dimax-pane-control/SKILL.md`, overwriting any
+    /// previous copy.
+    Install,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -181,8 +272,15 @@ fn format_server_pane_line(info: &ServerPaneInfo) -> String {
         ServerPaneStatus::Running => "running",
         ServerPaneStatus::Dead => "dead",
     };
-    let process = info.foreground.as_ref().map_or("-", |f| f.process_name.as_str());
-    let cwd = info.foreground.as_ref().and_then(|f| f.cwd.as_deref()).unwrap_or("-");
+    let process = info
+        .foreground
+        .as_ref()
+        .map_or("-", |f| f.process_name.as_str());
+    let cwd = info
+        .foreground
+        .as_ref()
+        .and_then(|f| f.cwd.as_deref())
+        .unwrap_or("-");
     format!(
         "{}\t{}\t{}\t{}x{}\t{}\t{}",
         info.id, name, status, info.size.rows, info.size.cols, process, cwd
@@ -206,24 +304,49 @@ fn format_client_pane_line(pane: &ClientPane) -> String {
 }
 
 /// Execute a parsed `Cli` command against a real daemon connection and
-/// print human-readable output, mirroring what `dimux server ls` /
-/// `dimux client ls` etc. should show at the terminal. Split out from
+/// print human-readable output, mirroring what `dimax server ls` /
+/// `dimax client ls` etc. should show at the terminal. Split out from
 /// `main` so it's the one place both the real binary and any CLI-level
 /// tests invoke.
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli {
         Cli::Server { cmd } => run_server(cmd).await,
         Cli::Client { cmd } => run_client(cmd).await,
+        Cli::Keys { cmd } => run_keys(cmd),
+        Cli::Skills { cmd } => run_skills(cmd),
         // `main.rs` handles `Attach`/`Daemon`/`Config` itself and never
         // calls `run` with them; a caller doing so anyway is a
         // `main.rs` bug, not something to service here.
         Cli::Attach | Cli::Daemon | Cli::Config => {
-            anyhow::bail!("cli::run called with Attach/Daemon/Config, which main.rs should handle directly")
+            anyhow::bail!(
+                "cli::run called with Attach/Daemon/Config, which main.rs should handle directly"
+            )
         }
     }
 }
 
-/// `dimux config`: regenerate `dimux.conf` (Kitty chord mappings) if
+/// Ask before `dimax keys install` amends the user's `kitty.conf`.
+/// Defaults to yes (Enter, or any input starting with anything but `n`)
+/// since Kitty integration is the documented common case, but always
+/// gives the user a chance to decline before we touch a file we didn't
+/// generate. `--yes` bypasses the prompt for scripts; a non-interactive
+/// stdin (piped input, CI) also bypasses it rather than hanging on a
+/// read that will never resolve.
+fn confirm_kitty_amend(yes: bool) -> anyhow::Result<bool> {
+    use std::io::IsTerminal;
+
+    if yes || !std::io::stdin().is_terminal() {
+        return Ok(true);
+    }
+    print!("Amend ~/.config/kitty/kitty.conf with dimax's Cmd-key bindings? [Y/n] ");
+    std::io::Write::flush(&mut std::io::stdout())?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    let answer = answer.trim().to_ascii_lowercase();
+    Ok(answer.is_empty() || !answer.starts_with('n'))
+}
+
+/// `dimax config`: regenerate `dimax.conf` (Kitty chord mappings) if
 /// needed, then open it in `$EDITOR`/`$VISUAL`. Pure local file/process
 /// work -- unlike every other `Cli` variant this touches, it never
 /// connects to the daemon.
@@ -231,7 +354,7 @@ pub async fn run_config() -> anyhow::Result<()> {
     let path = crate::tui::kitty_setup::ensure_config_written()?;
     let editor = std::env::var("EDITOR")
         .or_else(|_| std::env::var("VISUAL"))
-        .map_err(|_| anyhow::anyhow!("set $EDITOR or $VISUAL to use `dimux config`"))?;
+        .map_err(|_| anyhow::anyhow!("set $EDITOR or $VISUAL to use `dimax config`"))?;
     let status = std::process::Command::new(editor).arg(&path).status()?;
     if !status.success() {
         anyhow::bail!("editor exited with {status}");
@@ -239,11 +362,122 @@ pub async fn run_config() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_keys(cmd: KeysCmd) -> anyhow::Result<()> {
+    use crate::tui::keys::BindingMode;
+
+    match cmd {
+        KeysCmd::Install { mode, reload, yes } => {
+            if reload && mode == BindingMode::Portable {
+                anyhow::bail!("--reload requires --mode kitty or --mode both");
+            }
+            let kitty_path = match mode {
+                BindingMode::Portable => None,
+                BindingMode::Kitty | BindingMode::Both => {
+                    if confirm_kitty_amend(yes)? {
+                        Some(crate::tui::kitty_setup::install()?)
+                    } else {
+                        println!("skipped amending kitty.conf; portable bindings remain active");
+                        None
+                    }
+                }
+            };
+            let config_path = crate::tui::keys::save_mode(mode)?;
+            println!("keybinding mode: {mode:?}");
+            println!("config: {}", config_path.display());
+            if let Some(path) = kitty_path {
+                println!("kitty bindings: {}", path.display());
+            }
+            if reload {
+                crate::tui::kitty_setup::reload()?;
+                println!("reloaded Kitty configuration");
+            }
+            Ok(())
+        }
+        KeysCmd::Uninstall => {
+            crate::tui::kitty_setup::uninstall()?;
+            let config_path = crate::tui::keys::save_mode(BindingMode::Portable)?;
+            println!("removed managed Kitty bindings");
+            println!(
+                "portable bindings remain active via {}",
+                config_path.display()
+            );
+            Ok(())
+        }
+        KeysCmd::Print { mode } => {
+            if matches!(mode, BindingMode::Portable | BindingMode::Both) {
+                print!("{}", crate::tui::keys::render_portable_bindings());
+            }
+            if matches!(mode, BindingMode::Kitty | BindingMode::Both) {
+                if mode == BindingMode::Both {
+                    println!();
+                }
+                print!("{}", crate::tui::kitty_setup::render_effective_dimax_conf());
+            }
+            Ok(())
+        }
+        KeysCmd::List => {
+            println!("active mode: {:?}", crate::tui::keys::load_mode());
+            print!("{}", crate::tui::keys::render_portable_bindings());
+            print!("{}", crate::tui::keys::render_custom_bindings());
+            Ok(())
+        }
+        KeysCmd::Bind {
+            action,
+            portable,
+            kitty,
+        } => {
+            let path = crate::tui::keys::add_custom_binding(
+                &action,
+                portable.as_deref(),
+                kitty.as_deref(),
+            )?;
+            if crate::tui::keys::load_mode().kitty_enabled() && kitty.is_some() {
+                let _ = crate::tui::kitty_setup::install()?;
+            }
+            println!("saved keybinding alias in {}", path.display());
+            Ok(())
+        }
+        KeysCmd::Unbind { portable, kitty } => {
+            let refresh_kitty = kitty.is_some() && crate::tui::keys::load_mode().kitty_enabled();
+            let path =
+                crate::tui::keys::remove_custom_binding(portable.as_deref(), kitty.as_deref())?;
+            if refresh_kitty {
+                let _ = crate::tui::kitty_setup::install()?;
+            }
+            println!("updated {}", path.display());
+            Ok(())
+        }
+        KeysCmd::Reset => {
+            let path = crate::tui::keys::reset_custom_bindings()?;
+            if crate::tui::keys::load_mode().kitty_enabled() {
+                let _ = crate::tui::kitty_setup::install()?;
+            }
+            println!("reset custom keybindings in {}", path.display());
+            Ok(())
+        }
+    }
+}
+
+fn run_skills(cmd: SkillsCmd) -> anyhow::Result<()> {
+    match cmd {
+        SkillsCmd::Install => {
+            let path = crate::skills_setup::install()?;
+            println!("installed dimax-pane-control skill to {}", path.display());
+            Ok(())
+        }
+    }
+}
+
 async fn run_server(cmd: ServerCmd) -> anyhow::Result<()> {
     let mut client = Client::connect().await?;
     match cmd {
         ServerCmd::Spawn { name, cmd, cwd } => {
-            let req = Request::ServerSpawn { name: Some(name), cmd, cwd, workspace: None };
+            let req = Request::ServerSpawn {
+                name: Some(name),
+                cmd,
+                cwd,
+                workspace: None,
+            };
             match client.request(req).await? {
                 Response::ServerPane(info) => {
                     let label = info.name.as_deref().unwrap_or("-");
@@ -254,7 +488,9 @@ async fn run_server(cmd: ServerCmd) -> anyhow::Result<()> {
             }
         }
         ServerCmd::Kill { target } => {
-            let req = Request::ServerKill { target: target.clone() };
+            let req = Request::ServerKill {
+                target: target.clone(),
+            };
             match client.request(req).await? {
                 Response::Ack => {
                     println!("killed server-pane {target}");
@@ -264,7 +500,10 @@ async fn run_server(cmd: ServerCmd) -> anyhow::Result<()> {
             }
         }
         ServerCmd::Rename { target, new_name } => {
-            let req = Request::ServerRename { target: target.clone(), new_name: new_name.clone() };
+            let req = Request::ServerRename {
+                target: target.clone(),
+                new_name: new_name.clone(),
+            };
             match client.request(req).await? {
                 Response::Ack => {
                     println!("renamed server-pane {target} to {new_name}");
@@ -292,8 +531,16 @@ async fn run_server(cmd: ServerCmd) -> anyhow::Result<()> {
                 other => Err(unexpected_response("server read", other)),
             }
         }
-        ServerCmd::Send { target, text, enter } => {
-            let req = Request::ServerSend { target: target.clone(), text, enter };
+        ServerCmd::Send {
+            target,
+            text,
+            enter,
+        } => {
+            let req = Request::ServerSend {
+                target: target.clone(),
+                text,
+                enter,
+            };
             match client.request(req).await? {
                 Response::Ack => {
                     println!("sent to server-pane {target}");
@@ -308,7 +555,12 @@ async fn run_server(cmd: ServerCmd) -> anyhow::Result<()> {
 async fn run_client(cmd: ClientCmd) -> anyhow::Result<()> {
     let mut client = Client::connect().await?;
     match cmd {
-        ClientCmd::Spawn { workspace, split, dir, bind } => {
+        ClientCmd::Spawn {
+            workspace,
+            split,
+            dir,
+            bind,
+        } => {
             let req = Request::ClientSpawn {
                 workspace,
                 split_of: split,
@@ -336,7 +588,11 @@ async fn run_client(cmd: ClientCmd) -> anyhow::Result<()> {
         }
         ClientCmd::Rename { addr, new_name } => {
             let (workspace, pane) = parse_pane_addr(&addr)?;
-            let req = Request::ClientRename { workspace, pane, new_name: new_name.clone() };
+            let req = Request::ClientRename {
+                workspace,
+                pane,
+                new_name: new_name.clone(),
+            };
             match client.request(req).await? {
                 Response::Ack => {
                     println!("renamed {addr} to {new_name}");
@@ -347,7 +603,11 @@ async fn run_client(cmd: ClientCmd) -> anyhow::Result<()> {
         }
         ClientCmd::Bind { addr, target } => {
             let (workspace, pane) = parse_pane_addr(&addr)?;
-            let req = Request::ClientBind { workspace, pane, target: target.clone() };
+            let req = Request::ClientBind {
+                workspace,
+                pane,
+                target: target.clone(),
+            };
             match client.request(req).await? {
                 Response::Ack => {
                     println!("bound {addr} to {target}");
@@ -369,7 +629,11 @@ async fn run_client(cmd: ClientCmd) -> anyhow::Result<()> {
         }
         ClientCmd::AddTab { addr, target } => {
             let (workspace, pane) = parse_pane_addr(&addr)?;
-            let req = Request::ClientAddTab { workspace, pane, target: target.clone() };
+            let req = Request::ClientAddTab {
+                workspace,
+                pane,
+                target: target.clone(),
+            };
             match client.request(req).await? {
                 Response::Ack => {
                     println!("added tab {target} to {addr}");
@@ -402,14 +666,93 @@ mod tests {
 
     #[test]
     fn bare_invocation_defaults_to_attach() {
-        let args = Args::try_parse_from(["dimux"]).unwrap();
+        let args = Args::try_parse_from(["dimax"]).unwrap();
         assert!(matches!(args.command, Some(Cli::Attach) | None));
     }
 
     #[test]
     fn config_subcommand_parses() {
-        let args = Args::try_parse_from(["dimux", "config"]).unwrap();
+        let args = Args::try_parse_from(["dimax", "config"]).unwrap();
         assert!(matches!(args.command, Some(Cli::Config)));
+    }
+
+    #[test]
+    fn skills_install_subcommand_parses() {
+        let args = Args::try_parse_from(["dimax", "skills", "install"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Cli::Skills {
+                cmd: SkillsCmd::Install
+            })
+        ));
+    }
+
+    #[test]
+    fn keys_install_both_parses() {
+        let args = Args::try_parse_from(["dimax", "keys", "install", "--mode", "both"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Cli::Keys {
+                cmd: KeysCmd::Install {
+                    mode: crate::tui::keys::BindingMode::Both,
+                    reload: false,
+                    yes: false,
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn keys_install_yes_flag_parses() {
+        let args =
+            Args::try_parse_from(["dimax", "keys", "install", "--mode", "kitty", "--yes"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Cli::Keys {
+                cmd: KeysCmd::Install {
+                    mode: crate::tui::keys::BindingMode::Kitty,
+                    reload: false,
+                    yes: true,
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn keys_install_short_y_flag_parses() {
+        let args =
+            Args::try_parse_from(["dimax", "keys", "install", "--mode", "kitty", "-y"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Cli::Keys {
+                cmd: KeysCmd::Install { yes: true, .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn keys_bind_portable_and_kitty_aliases_parse() {
+        let args = Args::try_parse_from([
+            "dimax",
+            "keys",
+            "bind",
+            "focus-left",
+            "--portable",
+            "x",
+            "--kitty",
+            "cmd+left",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Cli::Keys {
+                cmd: KeysCmd::Bind {
+                    action,
+                    portable: Some(portable),
+                    kitty: Some(kitty),
+                }
+            }) if action == "focus-left" && portable == "x" && kitty == "cmd+left"
+        ));
     }
 
     #[test]
@@ -494,10 +837,7 @@ mod tests {
             short_id: "aa".to_string(),
         };
         let line = format_client_pane_line(&pane);
-        assert_eq!(
-            line,
-            format!("{}\tshell\t{server_pane}\t1/1", Uuid::nil())
-        );
+        assert_eq!(line, format!("{}\tshell\t{server_pane}\t1/1", Uuid::nil()));
     }
 
     #[test]
@@ -512,15 +852,18 @@ mod tests {
             short_id: "aa".to_string(),
         };
         let line = format_client_pane_line(&pane);
-        assert_eq!(
-            line,
-            format!("{}\teditor\t{sp2}\t2/2", Uuid::nil())
-        );
+        assert_eq!(line, format!("{}\teditor\t{sp2}\t2/2", Uuid::nil()));
     }
 
     #[test]
     fn format_client_pane_line_unbound_unnamed() {
-        let pane = ClientPane { id: Uuid::nil(), name: None, tabs: vec![], active_tab: 0, short_id: "aa".to_string() };
+        let pane = ClientPane {
+            id: Uuid::nil(),
+            name: None,
+            tabs: vec![],
+            active_tab: 0,
+            short_id: "aa".to_string(),
+        };
         let line = format_client_pane_line(&pane);
         assert_eq!(line, format!("{}\t-\t-\t-", Uuid::nil()));
     }

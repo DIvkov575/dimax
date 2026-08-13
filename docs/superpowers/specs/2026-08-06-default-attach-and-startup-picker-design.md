@@ -1,12 +1,12 @@
-# Default Attach, Startup Picker, and `dimux config` — Design
+# Default Attach, Startup Picker, and `dimax config` — Design
 
 ## Goal
 
-Three small, related changes to how `dimux` starts up:
+Three small, related changes to how `dimax` starts up:
 
-1. Bare `dimux` (no subcommand) launches the TUI, same as `dimux attach`.
+1. Bare `dimax` (no subcommand) launches the TUI, same as `dimax attach`.
 2. Attaching to an empty workspace shows the server-pane picker instead of a static placeholder — except for the very first attach against a fresh daemon, which just spawns a default shell directly (so a brand-new install still gets a pane with zero clicks).
-3. `dimux config` opens the generated `dimux.conf` (Kitty chord mappings) in `$EDITOR`, regenerating it first if needed.
+3. `dimax config` opens the generated `dimax.conf` (Kitty chord mappings) in `$EDITOR`, regenerating it first if needed.
 
 ## CLI Entry Point
 
@@ -18,7 +18,7 @@ pub enum Cli {
     Server { cmd: ServerCmd },
     Client { cmd: ClientCmd },
     Daemon,
-    /// Regenerate `dimux.conf` (Kitty chord mappings) if needed, then
+    /// Regenerate `dimax.conf` (Kitty chord mappings) if needed, then
     /// open it in `$EDITOR`/`$VISUAL`.
     Config,
 }
@@ -28,14 +28,14 @@ pub enum Cli {
 
 ```rust
 #[derive(clap::Parser)]
-#[command(name = "dimux")]
+#[command(name = "dimax")]
 struct Args {
     #[command(subcommand)]
     command: Option<Cli>,
 }
 ```
 
-with `main` doing `Args::parse().command.unwrap_or(Cli::Attach)` before the existing `match`. No change to any existing subcommand's parsing; `dimux`, `dimux attach`, and `dimux server ls` etc. all keep working exactly as today, and `dimux --help` still lists every subcommand (clap's `Option<Subcommand>` prints the same help either way).
+with `main` doing `Args::parse().command.unwrap_or(Cli::Attach)` before the existing `match`. No change to any existing subcommand's parsing; `dimax`, `dimax attach`, and `dimax server ls` etc. all keep working exactly as today, and `dimax --help` still lists every subcommand (clap's `Option<Subcommand>` prints the same help either way).
 
 `Cli::Config`'s handler (in `cli.rs`, alongside `run_server`/`run_client`) does not touch the daemon at all — it's pure local file/process work:
 
@@ -44,7 +44,7 @@ async fn run_config() -> anyhow::Result<()> {
     let path = crate::tui::kitty_setup::ensure_config_written()?;
     let editor = std::env::var("EDITOR")
         .or_else(|_| std::env::var("VISUAL"))
-        .map_err(|_| anyhow::anyhow!("set $EDITOR or $VISUAL to use `dimux config`"))?;
+        .map_err(|_| anyhow::anyhow!("set $EDITOR or $VISUAL to use `dimax config`"))?;
     let status = std::process::Command::new(editor).arg(path).status()?;
     if !status.success() {
         anyhow::bail!("editor exited with {status}");
@@ -53,7 +53,7 @@ async fn run_config() -> anyhow::Result<()> {
 }
 ```
 
-`kitty_setup::ensure_installed` (today's best-effort, silent-on-failure, `dimux attach`-triggered installer) is refactored to expose a `pub fn ensure_config_written() -> anyhow::Result<PathBuf>` — the actual write logic — with `ensure_installed` becoming a thin `let _ = ensure_config_written();` wrapper preserving its existing silent-failure contract for the attach path. `dimux config` uses the fallible version directly so a real error (not running under Kitty, unwritable config dir) surfaces to the user instead of silently doing nothing before opening a possibly-stale or nonexistent file.
+`kitty_setup::ensure_installed` (today's best-effort, silent-on-failure, `dimax attach`-triggered installer) is refactored to expose a `pub fn ensure_config_written() -> anyhow::Result<PathBuf>` — the actual write logic — with `ensure_installed` becoming a thin `let _ = ensure_config_written();` wrapper preserving its existing silent-failure contract for the attach path. `dimax config` uses the fallible version directly so a real error (not running under Kitty, unwritable config dir) surfaces to the user instead of silently doing nothing before opening a possibly-stale or nonexistent file.
 
 ## Startup Picker
 
@@ -140,15 +140,15 @@ The `GroupHeader` row (toggle collapse, not a pick) and `SpawnNewInGroup`/`Spawn
 ## Non-Goals
 
 - No change to `cmd-shift-z`/`cmd-t`'s existing behavior on a workspace that already has a leaf — this only affects the *startup* case (bootstrap) and, by extension, whatever `confirm_attach_menu` does when `focused` happens to be `None` (which today could only happen transiently; after this change it's a real, reachable state).
-- No persistence of `used_shell_fallback` across daemon restarts — a fresh daemon (e.g. after `pkill -f "dimux daemon"` + reattach) always gets one more free shell-fallback attach, by design.
-- No config-menu TUI screen — `dimux config` is a plain CLI subcommand that shells out to `$EDITOR`, not a new in-TUI menu.
+- No persistence of `used_shell_fallback` across daemon restarts — a fresh daemon (e.g. after `pkill -f "dimax daemon"` + reattach) always gets one more free shell-fallback attach, by design.
+- No config-menu TUI screen — `dimax config` is a plain CLI subcommand that shells out to `$EDITOR`, not a new in-TUI menu.
 - No new keybind. The picker's browse/confirm/cancel/rename/delete/pin grammar is entirely reused as-is; the only new code path is *how it's constructed* (from `bootstrap` instead of from a chord handler) and *how a confirm without `self.focused` resolves* (spawn instead of bind).
 
 ## Testing
 
 - `daemon::state`: `consume_shell_fallback_returns_true_once_then_false` (calls it 3x, asserts `true, false, false`).
 - `daemon::mod`: wire-level test for `Request::ConsumeShellFallback` returning `available: true` once then `false` on repeat calls against the same daemon.
-- `cli`: no unit test for `run_config`'s `$EDITOR` exec (out of scope for automated testing — shelling to an interactive editor isn't unit-testable); do add a test that `Args::parse` with zero args yields `Cli::Attach` and that `dimux config` parses to `Cli::Config`.
+- `cli`: no unit test for `run_config`'s `$EDITOR` exec (out of scope for automated testing — shelling to an interactive editor isn't unit-testable); do add a test that `Args::parse` with zero args yields `Cli::Attach` and that `dimax config` parses to `Cli::Config`.
 - `tui::kitty_setup`: existing tests for `ensure_installed`'s idempotency/marker rules continue to pass unmodified against the renamed/split `ensure_config_written`; add one test confirming `ensure_config_written`'s `Err` path (e.g. not running under Kitty) surfaces an actual error rather than silently returning `Ok` with a stale path.
 - `tui::mod`: 
   - `bootstrap_on_a_fresh_daemon_with_an_empty_workspace_spawns_a_default_shell` — first attach against a fresh test daemon lands with a non-empty tree and one focused leaf bound to a freshly spawned server-pane.

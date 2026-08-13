@@ -1395,7 +1395,7 @@ struct GridBroadcast {
 /// to JSON is the actually expensive step (~22ms measured for the same
 /// 50x200 pane, roughly 10x the snapshot itself) — doing it while every
 /// other request in the daemon is blocked on the same global lock is
-/// what caused dimux to visibly freeze (stop responding to keystrokes in
+/// what caused dimax to visibly freeze (stop responding to keystrokes in
 /// any other pane) whenever a watched pane produced output rapidly
 /// enough (e.g. an animated startup banner).
 fn broadcast_grid_prepare(state: &State, server_pane: ServerPaneId) -> Option<GridBroadcast> {
@@ -1450,7 +1450,7 @@ struct GridBroadcast {
 /// to JSON is the actually expensive step (~22ms measured for the same
 /// 50x200 pane, roughly 10x the snapshot itself) — doing it while every
 /// other request in the daemon is blocked on the same global lock is
-/// what caused dimux to visibly freeze (stop responding to keystrokes in
+/// what caused dimax to visibly freeze (stop responding to keystrokes in
 /// any other pane) whenever a watched pane produced output rapidly
 /// enough (e.g. an animated startup banner).
 fn broadcast_grid_prepare(state: &State, server_pane: ServerPaneId) -> Option<GridBroadcast> {
@@ -1739,7 +1739,7 @@ Find the button-decode block in `parse`:
     // press/release; dragging=1 with button 0 is a drag. Any other
     // button number (middle, right, or the higher values used for
     // scroll/bare-movement encoding) is a recognized SGR mouse sequence
-    // dimux simply doesn't act on.
+    // dimax simply doesn't act on.
     let button_number = (cb & 0b0000_0011) | ((cb & 0b1100_0000) >> 4);
     let dragging = cb & 0b0010_0000 != 0;
     if button_number != 0 {
@@ -1769,7 +1769,7 @@ Replace with:
     // mouse button does, so `released`/`dragging` are meaningless for
     // these two button numbers and simply ignored). Any other button
     // number (middle, right, or the higher values used for
-    // bare-movement encoding) is a recognized SGR mouse sequence dimux
+    // bare-movement encoding) is a recognized SGR mouse sequence dimax
     // simply doesn't act on.
     let button_number = (cb & 0b0000_0011) | ((cb & 0b1100_0000) >> 4);
     let dragging = cb & 0b0010_0000 != 0;
@@ -2050,7 +2050,7 @@ fn draw_leaf(
     match pane.bound {
         None => {
             let placeholder =
-                Paragraph::new("(unbound — bind via `dimux client bind`)").block(block);
+                Paragraph::new("(unbound — bind via `dimax client bind`)").block(block);
             frame.render_widget(placeholder, area);
         }
         Some(server_pane_id) => match grids.get(&server_pane_id) {
@@ -2108,7 +2108,7 @@ fn draw_leaf(
     match pane.bound {
         None => {
             let placeholder =
-                Paragraph::new("(unbound — bind via `dimux client bind`)").block(block);
+                Paragraph::new("(unbound — bind via `dimax client bind`)").block(block);
             frame.render_widget(placeholder, area);
         }
         Some(_) => match snapshot {
@@ -2172,7 +2172,7 @@ cargo install --path .
 ```
 
 Then in Kitty:
-1. `dimux attach`, split into 2+ panes of different sizes (some tall,
+1. `dimax attach`, split into 2+ panes of different sizes (some tall,
    some wide, at least one larger than 24 rows / 80 cols).
 2. Run a command that fills the pane's height in each (e.g. `seq 1 100`
    in a shell) — confirm output fills the ENTIRE visible pane area, not

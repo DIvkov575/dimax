@@ -1,16 +1,16 @@
-# Default Attach, Startup Picker, and `dimux config` Implementation Plan
+# Default Attach, Startup Picker, and `dimax config` Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Bare `dimux` launches the TUI; an empty-workspace attach shows the server-pane picker (except the very first attach against a fresh daemon, which spawns a default shell); `dimux config` opens the generated Kitty chord config in `$EDITOR`.
+**Goal:** Bare `dimax` launches the TUI; an empty-workspace attach shows the server-pane picker (except the very first attach against a fresh daemon, which spawns a default shell); `dimax config` opens the generated Kitty chord config in `$EDITOR`.
 
-**Architecture:** `main.rs` wraps `Cli` in an `Args { command: Option<Cli> }` struct so bare invocation defaults to `Cli::Attach`. A new ephemeral `State::used_shell_fallback` flag plus `Request::ConsumeShellFallback`/`Response::ShellFallback` let `App::bootstrap` decide, once, whether to auto-spawn a shell or open the picker on an empty workspace. `confirm_attach_menu` gains a third branch (`ClientSpawn`) for when there's no `self.focused` pane to bind into. `kitty_setup::ensure_installed`'s write logic is split out into a fallible `ensure_config_written` that both the existing silent auto-install and the new `dimux config` subcommand call.
+**Architecture:** `main.rs` wraps `Cli` in an `Args { command: Option<Cli> }` struct so bare invocation defaults to `Cli::Attach`. A new ephemeral `State::used_shell_fallback` flag plus `Request::ConsumeShellFallback`/`Response::ShellFallback` let `App::bootstrap` decide, once, whether to auto-spawn a shell or open the picker on an empty workspace. `confirm_attach_menu` gains a third branch (`ClientSpawn`) for when there's no `self.focused` pane to bind into. `kitty_setup::ensure_installed`'s write logic is split out into a fallible `ensure_config_written` that both the existing silent auto-install and the new `dimax config` subcommand call.
 
 **Tech Stack:** Rust, tokio, serde, clap 4, ratatui
 
 ---
 
-### Task 1: `main.rs`/`cli.rs` — bare `dimux` defaults to attach, add `dimux config`
+### Task 1: `main.rs`/`cli.rs` — bare `dimax` defaults to attach, add `dimax config`
 
 **Files:**
 - Modify: `src/main.rs`
@@ -24,13 +24,13 @@ Add to `src/cli.rs`'s test module (near `parse_pane_addr_valid`):
 ```rust
 #[test]
 fn bare_invocation_defaults_to_attach() {
-    let args = Args::try_parse_from(["dimux"]).unwrap();
+    let args = Args::try_parse_from(["dimax"]).unwrap();
     assert!(matches!(args.command, Some(Cli::Attach) | None));
 }
 
 #[test]
 fn config_subcommand_parses() {
-    let args = Args::try_parse_from(["dimux", "config"]).unwrap();
+    let args = Args::try_parse_from(["dimax", "config"]).unwrap();
     assert!(matches!(args.command, Some(Cli::Config)));
 }
 ```
@@ -63,16 +63,16 @@ pub enum Cli {
     /// Run the daemon in the foreground (used internally by the
     /// auto-spawn path; also useful for debugging).
     Daemon,
-    /// Regenerate `dimux.conf` (Kitty chord mappings) if needed, then
+    /// Regenerate `dimax.conf` (Kitty chord mappings) if needed, then
     /// open it in `$EDITOR`/`$VISUAL`.
     Config,
 }
 
 /// `main.rs`'s actual clap entry point. `command` is `Option` so bare
-/// `dimux` (no subcommand at all) parses successfully instead of
+/// `dimax` (no subcommand at all) parses successfully instead of
 /// erroring -- `main` then defaults it to [`Cli::Attach`].
 #[derive(clap::Parser)]
-#[command(name = "dimux", about = "A terminal multiplexer. With no subcommand, attaches to the TUI.")]
+#[command(name = "dimax", about = "A terminal multiplexer. With no subcommand, attaches to the TUI.")]
 pub struct Args {
     #[command(subcommand)]
     pub command: Option<Cli>,
@@ -82,7 +82,7 @@ pub struct Args {
 The explicit `about` is required, not cosmetic: the crate has no `description`
 in `Cargo.toml`, so without it clap falls back to the struct's doc comment and
 prints that internal note (rustdoc link syntax and all) as the first line of
-`dimux --help`.
+`dimax --help`.
 
 - [ ] **Step 3: Update `main.rs` to parse `Args` and default to `Cli::Attach`**
 
@@ -90,15 +90,15 @@ Replace `src/main.rs` in full:
 
 ```rust
 use clap::Parser;
-use dimux::cli::{self, Args, Cli};
+use dimax::cli::{self, Args, Cli};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Args::parse().command.unwrap_or(Cli::Attach);
     match cli {
-        Cli::Attach => dimux::tui::run().await,
+        Cli::Attach => dimax::tui::run().await,
         Cli::Daemon => {
-            let daemon = dimux::daemon::run(dimux::protocol::socket_path()).await?;
+            let daemon = dimax::daemon::run(dimax::protocol::socket_path()).await?;
             let _ = daemon;
             std::future::pending::<()>().await;
             Ok(())
@@ -140,19 +140,19 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
 - [ ] **Step 6: Run the new tests**
 
-Run: `cargo test -p dimux --lib cli:: 2>&1 | tail -20`
+Run: `cargo test -p dimax --lib cli:: 2>&1 | tail -20`
 Expected: `bare_invocation_defaults_to_attach` and `config_subcommand_parses` PASS.
 
 - [ ] **Step 7: Manual check — `--help` still lists every subcommand, bare invocation parses**
 
 Run: `cargo run -- --help 2>&1 | tail -20`
-Expected: `Usage: dimux [COMMAND]` (note `[COMMAND]`, not a bare `COMMAND` — confirms it's optional), and `config` listed among `attach`/`server`/`client`/`daemon`/`help`.
+Expected: `Usage: dimax [COMMAND]` (note `[COMMAND]`, not a bare `COMMAND` — confirms it's optional), and `config` listed among `attach`/`server`/`client`/`daemon`/`help`.
 
 - [ ] **Step 8: Commit**
 
 ```bash
 git add src/main.rs src/cli.rs
-git commit -m "feat(cli): bare dimux defaults to attach, add config subcommand stub"
+git commit -m "feat(cli): bare dimax defaults to attach, add config subcommand stub"
 ```
 
 ---
@@ -166,15 +166,15 @@ git commit -m "feat(cli): bare dimux defaults to attach, add config subcommand s
 
 - [ ] **Step 1: Write the failing test for `ensure_config_written`'s `Ok(PathBuf)` return**
 
-Add to `src/tui/kitty_setup.rs`'s test module, right after `ensure_installed_writes_dimux_conf_and_patches_kitty_conf`:
+Add to `src/tui/kitty_setup.rs`'s test module, right after `ensure_installed_writes_dimax_conf_and_patches_kitty_conf`:
 
 ```rust
 #[test]
-fn ensure_config_written_returns_the_dimux_conf_path() {
+fn ensure_config_written_returns_the_dimax_conf_path() {
     let dir = std::env::temp_dir().join(format!("dmx-kitty-config-path-{}", std::process::id()));
     setup_fake_kitty_config(&dir, Some(""), None);
     let path = with_fake_kitty_env(&dir, || ensure_config_written().unwrap());
-    assert_eq!(path, dir.join("dimux.conf"));
+    assert_eq!(path, dir.join("dimax.conf"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -191,7 +191,7 @@ fn ensure_config_written_errors_when_not_under_kitty() {
             None => std::env::remove_var("KITTY_WINDOW_ID"),
         }
     }
-    assert!(result.is_err(), "dimux config should surface a real error, not silently no-op, when not under Kitty");
+    assert!(result.is_err(), "dimax config should surface a real error, not silently no-op, when not under Kitty");
 }
 ```
 
@@ -203,10 +203,10 @@ Expected: compile error — `ensure_config_written` doesn't exist yet.
 Replace `src/tui/kitty_setup.rs:99-153` (from the `ensure_installed` doc comment through the end of `try_ensure_installed`):
 
 ```rust
-/// Best-effort install of dimux's Kitty chord mappings: writes
-/// `<kitty-config-dir>/dimux.conf` (regenerated fresh every time, since
-/// it's marked as dimux-owned -- see [`GENERATED_MARKER`]) and adds
-/// `include dimux.conf` to the top of `kitty.conf` if not already
+/// Best-effort install of dimax's Kitty chord mappings: writes
+/// `<kitty-config-dir>/dimax.conf` (regenerated fresh every time, since
+/// it's marked as dimax-owned -- see [`GENERATED_MARKER`]) and adds
+/// `include dimax.conf` to the top of `kitty.conf` if not already
 /// present. A complete no-op, silently, in any of these cases:
 /// - not running under Kitty at all (see [`running_under_kitty`]) --
 ///   nothing to install into.
@@ -214,18 +214,18 @@ Replace `src/tui/kitty_setup.rs:99-153` (from the `ensure_installed` doc comment
 ///   no config file at all is unusual enough, and risky enough to get
 ///   wrong (what should the *rest* of a from-scratch config look like?),
 ///   that this only ever patches an existing file, never creates one.
-/// - `dimux.conf` exists but does NOT start with [`GENERATED_MARKER`] --
-///   treated as a user's own hand-written file dimux must never
+/// - `dimax.conf` exists but does NOT start with [`GENERATED_MARKER`] --
+///   treated as a user's own hand-written file dimax must never
 ///   overwrite, even if it happens to share the name. Uses `.starts_with`
 ///   after a read rather than a separate sentinel/lock file so "did
-///   dimux write this" is self-contained in the file itself, inspectable
+///   dimax write this" is self-contained in the file itself, inspectable
 ///   by just opening it.
 /// - any I/O error along the way (permissions, disk full, etc.).
 ///
 /// Called once at the top of [`super::run`], before anything else --
 /// see that call site for why a failure here must never propagate.
 /// Thin wrapper over [`ensure_config_written`] that swallows every
-/// error for that silent-failure contract; `dimux config` (which wants
+/// error for that silent-failure contract; `dimax config` (which wants
 /// a *real* error, not silence) calls `ensure_config_written` directly.
 pub fn ensure_installed() {
     let _ = ensure_config_written();
@@ -233,14 +233,14 @@ pub fn ensure_installed() {
 
 /// The fallible core of [`ensure_installed`]: same silent-no-op rules
 /// documented there (not under Kitty / no existing `kitty.conf` / a
-/// hand-written `dimux.conf`), but returns those as `Ok(path)` --
+/// hand-written `dimax.conf`), but returns those as `Ok(path)` --
 /// callers that only care about "did it run" use [`ensure_installed`]
-/// instead. Also returns `Ok(path)` when a hand-written `dimux.conf`
-/// blocked the actual write, since `dimux config` still wants to open
+/// instead. Also returns `Ok(path)` when a hand-written `dimax.conf`
+/// blocked the actual write, since `dimax config` still wants to open
 /// *that* file (just not overwrite it first). Returns an `Err` only for
 /// a genuine failure: not running under Kitty at all (nothing to open),
 /// no resolvable Kitty config directory, or an I/O error. On success,
-/// returns the path to `dimux.conf` (written or left alone) so the
+/// returns the path to `dimax.conf` (written or left alone) so the
 /// caller can open it directly rather than recomputing the path itself.
 pub fn ensure_config_written() -> anyhow::Result<PathBuf> {
     if !running_under_kitty() {
@@ -248,41 +248,41 @@ pub fn ensure_config_written() -> anyhow::Result<PathBuf> {
     }
     let config_dir = kitty_config_dir()
         .ok_or_else(|| anyhow::anyhow!("could not resolve a Kitty config directory (no $HOME or $KITTY_CONFIG_DIRECTORY)"))?;
-    let dimux_conf = config_dir.join("dimux.conf");
+    let dimax_conf = config_dir.join("dimax.conf");
     let kitty_conf = config_dir.join("kitty.conf");
     if !kitty_conf.is_file() {
         // No existing kitty.conf to patch -- nothing written, but the
         // path is still meaningful for a caller that wants to inspect
         // or create it themselves.
-        return Ok(dimux_conf);
+        return Ok(dimax_conf);
     }
 
-    let is_ours = match std::fs::read_to_string(&dimux_conf) {
+    let is_ours = match std::fs::read_to_string(&dimax_conf) {
         Ok(existing) => existing.starts_with(GENERATED_MARKER),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
         Err(e) => return Err(e.into()),
     };
     if !is_ours {
-        // A hand-written dimux.conf -- leave it untouched, but this is
+        // A hand-written dimax.conf -- leave it untouched, but this is
         // still the file a caller should open.
-        return Ok(dimux_conf);
+        return Ok(dimax_conf);
     }
-    std::fs::write(&dimux_conf, render_dimux_conf())?;
+    std::fs::write(&dimax_conf, render_dimax_conf())?;
 
     let kitty_conf_text = std::fs::read_to_string(&kitty_conf)?;
-    if !kitty_conf_text.lines().any(|line| line.trim() == "include dimux.conf") {
+    if !kitty_conf_text.lines().any(|line| line.trim() == "include dimax.conf") {
         let mut file = std::fs::OpenOptions::new().append(true).open(&kitty_conf)?;
         // A leading newline in case the existing file has no trailing
         // one, so this never gets glued onto the previous line.
-        writeln!(file, "\ninclude dimux.conf")?;
+        writeln!(file, "\ninclude dimax.conf")?;
     }
-    Ok(dimux_conf)
+    Ok(dimax_conf)
 }
 ```
 
 - [ ] **Step 3: Update every existing test that called `try_ensure_installed` to call `ensure_config_written` instead**
 
-In `src/tui/kitty_setup.rs`'s test module, replace every occurrence of `try_ensure_installed().unwrap()` with `ensure_config_written().unwrap()` (there are 6: in `ensure_installed_is_a_no_op_when_not_running_under_kitty`, `ensure_installed_does_nothing_if_kitty_conf_does_not_exist`, `ensure_installed_writes_dimux_conf_and_patches_kitty_conf`, `ensure_installed_does_not_duplicate_the_include_line_on_a_second_run` (2 occurrences), `ensure_installed_refreshes_a_previously_generated_dimux_conf`, `ensure_installed_never_overwrites_a_hand_written_dimux_conf`).
+In `src/tui/kitty_setup.rs`'s test module, replace every occurrence of `try_ensure_installed().unwrap()` with `ensure_config_written().unwrap()` (there are 6: in `ensure_installed_is_a_no_op_when_not_running_under_kitty`, `ensure_installed_does_nothing_if_kitty_conf_does_not_exist`, `ensure_installed_writes_dimax_conf_and_patches_kitty_conf`, `ensure_installed_does_not_duplicate_the_include_line_on_a_second_run` (2 occurrences), `ensure_installed_refreshes_a_previously_generated_dimax_conf`, `ensure_installed_never_overwrites_a_hand_written_dimax_conf`).
 
 Note: `ensure_installed_is_a_no_op_when_not_running_under_kitty` currently asserts `try_ensure_installed().unwrap()` succeeds when not under Kitty (today's `Ok(())` no-op). Since `ensure_config_written` now returns `Err` in that case, update this specific test's assertion:
 
@@ -302,7 +302,7 @@ fn ensure_installed_is_a_no_op_when_not_running_under_kitty() {
     }
     assert!(result.is_err());
     // ensure_installed itself, which swallows the error, must still be
-    // a true no-op: no dimux.conf/kitty.conf files should exist to
+    // a true no-op: no dimax.conf/kitty.conf files should exist to
     // check here since none were set up by this test.
 }
 ```
@@ -311,7 +311,7 @@ fn ensure_installed_is_a_no_op_when_not_running_under_kitty() {
 
 - [ ] **Step 4: Run kitty_setup tests**
 
-Run: `cargo test -p dimux --lib tui::kitty_setup 2>&1 | tail -30`
+Run: `cargo test -p dimax --lib tui::kitty_setup 2>&1 | tail -30`
 Expected: all PASS.
 
 - [ ] **Step 5: Implement `run_config` in `cli.rs`**
@@ -319,7 +319,7 @@ Expected: all PASS.
 Replace the Task-1 stub in `src/cli.rs`:
 
 ```rust
-/// `dimux config`: regenerate `dimux.conf` (Kitty chord mappings) if
+/// `dimax config`: regenerate `dimax.conf` (Kitty chord mappings) if
 /// needed, then open it in `$EDITOR`/`$VISUAL`. Pure local file/process
 /// work -- unlike every other `Cli` variant this touches, it never
 /// connects to the daemon.
@@ -327,7 +327,7 @@ pub async fn run_config() -> anyhow::Result<()> {
     let path = crate::tui::kitty_setup::ensure_config_written()?;
     let editor = std::env::var("EDITOR")
         .or_else(|_| std::env::var("VISUAL"))
-        .map_err(|_| anyhow::anyhow!("set $EDITOR or $VISUAL to use `dimux config`"))?;
+        .map_err(|_| anyhow::anyhow!("set $EDITOR or $VISUAL to use `dimax config`"))?;
     let status = std::process::Command::new(editor).arg(&path).status()?;
     if !status.success() {
         anyhow::bail!("editor exited with {status}");
@@ -349,7 +349,7 @@ Expected: no errors.
 
 ```bash
 git add src/tui/kitty_setup.rs src/tui/mod.rs src/cli.rs
-git commit -m "feat(cli): implement dimux config -- regenerate dimux.conf then open \$EDITOR"
+git commit -m "feat(cli): implement dimax config -- regenerate dimax.conf then open \$EDITOR"
 ```
 
 ---
@@ -438,7 +438,7 @@ Add the method (near `pinned_dirs`/`toggle_pinned_dir`, after `toggle_pinned_dir
 
 - [ ] **Step 4: Run the state test**
 
-Run: `cargo test -p dimux --lib daemon::state::tests::consume_shell_fallback 2>&1 | tail -10`
+Run: `cargo test -p dimax --lib daemon::state::tests::consume_shell_fallback 2>&1 | tail -10`
 Expected: PASS.
 
 - [ ] **Step 5: Add the dispatch arm**
@@ -475,7 +475,7 @@ async fn consume_shell_fallback_over_the_wire_grants_once_then_denies() {
 
 - [ ] **Step 7: Run tests**
 
-Run: `cargo test -p dimux --lib daemon:: 2>&1 | tail -30`
+Run: `cargo test -p dimax --lib daemon:: 2>&1 | tail -30`
 Expected: all PASS, including the two new tests.
 
 - [ ] **Step 8: Commit**
@@ -761,7 +761,7 @@ Replace `src/tui/mod.rs:2665-2677` in full:
     /// workspace" state this helper always promised, without touching
     /// any of its 7+ existing callers.
     async fn app_against_real_daemon() -> (App, OwnedWriteHalf, FrameReader) {
-        // Short filename -- `dimux-test-<full-uuid>.sock` under a long
+        // Short filename -- `dimax-test-<full-uuid>.sock` under a long
         // macOS temp dir can exceed `SUN_LEN`; this stays well under it.
         static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -781,7 +781,7 @@ Replace `src/tui/mod.rs:2665-2677` in full:
 
 - [ ] **Step 7: Run every test that calls `app_against_real_daemon` and confirm they all still pass unmodified**
 
-Run: `cargo test -p dimux --lib tui:: 2>&1 | tail -60`
+Run: `cargo test -p dimax --lib tui:: 2>&1 | tail -60`
 Expected: ALL PASS, including the 8 tests named above plus the 3 new bootstrap tests from Step 5. If any of the 8 pre-existing tests still fails, its failure message will name the assertion that broke; re-read that test's setup in `src/tui/mod.rs` to see what it still assumes about workspace `"1"`'s starting state, and fix `app_against_real_daemon` further (not the individual test) so the invariant holds again.
 
 - [ ] **Step 8: Run the full test suite**
@@ -821,28 +821,28 @@ Expected: success.
 
 ```bash
 cargo build --release
-./target/release/dimux --help  # confirm `config` is listed, [COMMAND] is optional
-EDITOR=cat ./target/release/dimux config  # should print the generated dimux.conf if running under Kitty, or a clear "not running inside Kitty" error otherwise
+./target/release/dimax --help  # confirm `config` is listed, [COMMAND] is optional
+EDITOR=cat ./target/release/dimax config  # should print the generated dimax.conf if running under Kitty, or a clear "not running inside Kitty" error otherwise
 ```
 
 - [ ] **Step 5: Push and open draft PR**
 
 ```bash
 git push -u origin feat/default-attach-startup-picker
-gh pr create --draft --title "feat: default to attach, startup picker, dimux config" --body "$(cat <<'EOF'
+gh pr create --draft --title "feat: default to attach, startup picker, dimax config" --body "$(cat <<'EOF'
 ## Summary
-- Bare `dimux` (no subcommand) now launches the TUI, same as `dimux attach`.
+- Bare `dimax` (no subcommand) now launches the TUI, same as `dimax attach`.
 - The very first empty-workspace attach against a fresh daemon spawns a default shell directly; every attach after that shows the server-pane picker instead of the old static placeholder.
-- New `dimux config` subcommand: regenerates `dimux.conf` (Kitty chord mappings) if needed, then opens it in `$EDITOR`/`$VISUAL`.
+- New `dimax config` subcommand: regenerates `dimax.conf` (Kitty chord mappings) if needed, then opens it in `$EDITOR`/`$VISUAL`.
 
 See `docs/superpowers/specs/2026-08-06-default-attach-and-startup-picker-design.md` and the matching plan doc for full design/rationale.
 
 ## Test plan
 - [ ] `cargo test` passes
 - [ ] `cargo clippy -- -D warnings` clean
-- [ ] Manual: `dimux` with no args opens the TUI
-- [ ] Manual: fresh daemon + `dimux attach` on an empty workspace gets a shell with zero keypresses; a second attach to another empty workspace shows the picker
-- [ ] Manual: `dimux config` opens dimux.conf in `$EDITOR`
+- [ ] Manual: `dimax` with no args opens the TUI
+- [ ] Manual: fresh daemon + `dimax attach` on an empty workspace gets a shell with zero keypresses; a second attach to another empty workspace shows the picker
+- [ ] Manual: `dimax config` opens dimax.conf in `$EDITOR`
 EOF
 )"
 ```

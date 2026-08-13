@@ -1750,7 +1750,7 @@ Add to `src/daemon/mod.rs`'s `mod tests` block, after
     /// actions (see docs/superpowers/specs/2026-08-03-attach-menu-groups-
     /// and-shortcuts-design.md): both requests the menu now issues
     /// directly must still round-trip through the wire protocol exactly
-    /// as `dimux server kill`/`rename` already do. This is regression
+    /// as `dimax server kill`/`rename` already do. This is regression
     /// coverage for the wiring, not new daemon logic -- ServerKill and
     /// ServerRename's actual behavior is already covered by
     /// `server_kill_unbinds_client_panes_across_workspaces` above and by
@@ -1842,7 +1842,7 @@ git commit -m "test: add attach menu delete/rename wire-protocol regression cove
 ### Task 8: Manual verification + update the design doc's keybind table
 
 **Files:**
-- Modify: `docs/superpowers/specs/2026-07-30-dimux-design.md` (the
+- Modify: `docs/superpowers/specs/2026-07-30-dimax-design.md` (the
   "Default keybinds (TUI)" table doesn't mention `x`/`r` since those are
   menu-local, not global chords — but the "Attach menu identification
   columns" section describes the now-outdated 5-column
@@ -1851,8 +1851,8 @@ git commit -m "test: add attach menu delete/rename wire-protocol regression cove
 
 - [ ] **Step 1: Update the design doc's "Attach menu identification columns" section**
 
-In `docs/superpowers/specs/2026-07-30-dimux-design.md`, find the
-paragraph starting "The attach menu (and `dimux server ls`) list every
+In `docs/superpowers/specs/2026-07-30-dimax-design.md`, find the
+paragraph starting "The attach menu (and `dimax server ls`) list every
 server-pane with five columns: `name | cwd | process | id | status`."
 Replace that sentence with:
 
@@ -1862,7 +1862,7 @@ non-selectable header lines (one per distinct `cwd`, with a synthetic
 "Unknown" group sorted last for panes with no resolvable `cwd` —
 see docs/superpowers/specs/2026-08-03-attach-menu-groups-and-shortcuts-design.md).
 Each row then shows four columns: `name | process | id | status` (`cwd`
-moved to the group header, no longer repeated per row). `dimux server
+moved to the group header, no longer repeated per row). `dimax server
 ls`'s CLI output is unaffected — it still lists all five fields per row;
 only the TUI attach menu groups/drops columns.
 ```
@@ -1880,10 +1880,10 @@ Expected: clean build.
 Manually verify (requires Kitty, per the design doc's platform
 constraint):
 1. `cargo install --path .`
-2. Run `dimux attach` inside Kitty.
+2. Run `dimax attach` inside Kitty.
 3. Spawn 2-3 server-panes with different working directories (e.g.
-   `cd /tmp && dimux server spawn` in one terminal, then `cd ~ &&
-   dimux server spawn` in another, from outside the TUI via the CLI).
+   `cd /tmp && dimax server spawn` in one terminal, then `cd ~ &&
+   dimax server spawn` in another, from outside the TUI via the CLI).
 4. Press `cmd-shift-z` on a focused pane to open the attach menu.
 5. Confirm: rows are grouped under cwd header lines, matching the
    working directories used above.
@@ -1905,6 +1905,6 @@ constraint):
 - [ ] **Step 3: Commit the doc update**
 
 ```bash
-git add docs/superpowers/specs/2026-07-30-dimux-design.md
+git add docs/superpowers/specs/2026-07-30-dimax-design.md
 git commit -m "docs: update attach menu column description for cwd grouping"
 ```

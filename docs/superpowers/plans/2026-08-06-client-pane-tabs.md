@@ -412,7 +412,7 @@ Update every test in `state.rs` that reads/writes `.bound`:
 
 - [ ] **Step 14: Run tests**
 
-Run: `cargo test -p dimux --lib daemon::state 2>&1 | tail -20`
+Run: `cargo test -p dimax --lib daemon::state 2>&1 | tail -20`
 Expected: All existing tests pass with the new field shape.
 
 - [ ] **Step 15: Write new unit tests for `client_add_tab`/`client_cycle_tab`/`client_close_tab`**
@@ -507,7 +507,7 @@ fn unbind_all_removes_killed_server_pane_from_background_tabs() {
 
 - [ ] **Step 16: Run tests**
 
-Run: `cargo test -p dimux --lib daemon::state 2>&1 | tail -20`
+Run: `cargo test -p dimax --lib daemon::state 2>&1 | tail -20`
 Expected: PASS
 
 - [ ] **Step 17: Commit**
@@ -616,10 +616,10 @@ assert_eq!(leaf.active_bound(), None, "client-pane should be unbound");
 
 - [ ] **Step 5: Run tests**
 
-Run: `cargo test -p dimux --lib daemon::mod 2>&1 | tail -30`
+Run: `cargo test -p dimax --lib daemon::mod 2>&1 | tail -30`
 Expected: PASS (may still have compile errors in cli/tui — that's fine, `--lib` filters).
 
-Actually run: `cargo test -p dimux --lib daemon 2>&1 | tail -30`
+Actually run: `cargo test -p dimax --lib daemon 2>&1 | tail -30`
 
 - [ ] **Step 6: Commit**
 
@@ -763,7 +763,7 @@ fn format_client_pane_line_unbound_unnamed() {
 
 - [ ] **Step 5: Run tests**
 
-Run: `cargo test -p dimux --lib cli 2>&1 | tail -20`
+Run: `cargo test -p dimax --lib cli 2>&1 | tail -20`
 Expected: PASS
 
 - [ ] **Step 6: Commit**
@@ -855,7 +855,7 @@ fn cycle_tab_backward() {
 
 - [ ] **Step 6: Run tests**
 
-Run: `cargo test -p dimux --lib tui::keys 2>&1 | tail -20`
+Run: `cargo test -p dimax --lib tui::keys 2>&1 | tail -20`
 Expected: PASS
 
 - [ ] **Step 7: Commit**
@@ -1048,7 +1048,7 @@ let previously_bound =
 
 - [ ] **Step 11: Run tests**
 
-Run: `cargo test -p dimux --lib tui 2>&1 | tail -30`
+Run: `cargo test -p dimax --lib tui 2>&1 | tail -30`
 Expected: PASS (render.rs may still fail — that's the next task).
 
 - [ ] **Step 12: Commit**
@@ -1233,13 +1233,13 @@ gh pr create --draft --title "feat: cyclable client-pane tabs" --body "$(cat <<'
 - Replace `ClientPane.bound: Option<ServerPaneId>` with `tabs: Vec<ServerPaneId>` + `active_tab: usize`
 - Add `ClientAddTab`, `ClientCycleTab`, `ClientCloseTab` wire requests
 - New TUI chords: `cmd-t` (add tab via menu), `cmd-]`/`cmd-[` (cycle), `cmd-w` (close tab)
-- `dimux client add-tab` CLI subcommand; `client ls` output now shows `N/M` tab position
+- `dimax client add-tab` CLI subcommand; `client ls` output now shows `N/M` tab position
 - Title bar shows `(N/M)` only when >1 tab; single-tab leaves are pixel-identical to before
 
 ## Test plan
 - [ ] `cargo test` passes
-- [ ] Manual: `dimux attach`, split pane, `cmd-t` to add a second tab, `cmd-]`/`cmd-[` to cycle, `cmd-w` to close one tab
-- [ ] Manual: `dimux client add-tab <addr> <target>` from CLI works
+- [ ] Manual: `dimax attach`, split pane, `cmd-t` to add a second tab, `cmd-]`/`cmd-[` to cycle, `cmd-w` to close one tab
+- [ ] Manual: `dimax client add-tab <addr> <target>` from CLI works
 - [ ] Manual: killing a background tab's server-pane removes it from the tab list cleanly
 EOF
 )"

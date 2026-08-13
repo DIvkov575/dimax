@@ -259,7 +259,7 @@ Replace `src/tui/mod.rs:57-65`:
 
 - [ ] **Step 7: Run the new tests**
 
-Run: `cargo test -p dimux --lib tui:: -- nearest_leaf 2>&1 | tail -20`
+Run: `cargo test -p dimax --lib tui:: -- nearest_leaf 2>&1 | tail -20`
 Expected: all 6 new tests PASS.
 
 - [ ] **Step 8: Run the full crate check and test suite**
@@ -388,7 +388,7 @@ Expected: compiles (both tests exercise only existing behavior at this point, so
 
 - [ ] **Step 2: Run the tests to confirm the expected failure**
 
-Run: `cargo test -p dimux --lib tui:: -- click_inside_a_pane_focuses_it 2>&1 | tail -20`
+Run: `cargo test -p dimax --lib tui:: -- click_inside_a_pane_focuses_it 2>&1 | tail -20`
 Expected: FAILS at `assert_eq!(app.focused, Some(right), ...)` — `app.focused` is still `Some(left)`.
 
 - [ ] **Step 3: Add the click-to-focus fallback in `handle_mouse`**
@@ -417,7 +417,7 @@ Replace `src/tui/mod.rs:1302-1311`:
 
 - [ ] **Step 4: Run both new tests**
 
-Run: `cargo test -p dimux --lib tui:: -- click_inside_a_pane_focuses_it click_on_a_divider_does_not_change_focus 2>&1 | tail -20`
+Run: `cargo test -p dimax --lib tui:: -- click_inside_a_pane_focuses_it click_on_a_divider_does_not_change_focus 2>&1 | tail -20`
 Expected: both PASS.
 
 - [ ] **Step 5: Update `handle_mouse`'s doc comment**
@@ -490,7 +490,7 @@ Expected: success.
 
 ```bash
 cargo build --release
-./target/release/dimux
+./target/release/dimax
 ```
 Split into a 2x2 grid (`cmd-d` then `cmd-shift-d` on each half), then confirm: `cmd-h`/`cmd-l` move focus left/right between the correct panes, `cmd-j`/`cmd-k` move focus down/up between the correct panes, a chord with nothing in that direction does nothing (no wraparound), and clicking inside any pane focuses it.
 

@@ -1,10 +1,18 @@
 [package]
-name = "dimux"
+name = "dimax"
 version = "0.3.0"
 edition = "2024"
+description = "A terminal multiplexer with persistent sessions and synchronized workspaces"
+readme = "README.txt"
+repository = "https://github.com/DIvkov575/dimax"
+homepage = "https://github.com/DIvkov575/dimax"
+keywords = ["terminal", "multiplexer", "tui", "shell"]
+categories = ["command-line-utilities"]
+include = ["src/**", "Cargo.toml", "Cargo.lock", "README.txt"]
 
 [dependencies]
 anyhow = "1.0.104"
+base64 = "0.22.1"
 clap = { version = "4.6.4", features = ["derive"] }
 libc = "0.2.189"
 portable-pty = "0.9.0"
