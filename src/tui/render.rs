@@ -502,7 +502,7 @@ const PREVIEW_PANEL_HEIGHT: u16 = 12;
 /// Rendered along the row-list block's bottom border -- must stay in sync
 /// with `parse_attach_menu_input`'s actual byte matches (`tui/mod.rs`),
 /// which is the source of truth this is only a display of.
-const ATTACH_MENU_KEY_HINTS: &str = "↑↓ move · Enter attach · x del · r rename · p pin · a all-ws · g group · d detach · q quit · Esc cancel";
+const ATTACH_MENU_KEY_HINTS: &str = "↑↓ move · Enter attach · x del · r rename · p pin · f agents · a all-ws · g group · d detach · q quit · Esc cancel";
 
 /// Overlay for `cmd-shift-z`'s attach menu: lists every server-pane
 /// (grouped under selectable per-cwd headers) plus a trailing "spawn

@@ -282,6 +282,16 @@ itself. The same tag shows up as a `[claude]`/`[codex]`/etc. marker in
 the attach menu's row list, so a recognized session stands out at a
 glance there too.
 
+The attach menu (`cmd-shift-z` / `Ctrl-Space Z`) defaults to an
+agents-only view: only server-panes tagged with a recognized `kind` are
+listed. Press `f` inside the menu to flip between the agents-only
+default and the full unfiltered list (plain shells, editors, and every
+other non-agent pane). `f` composes with `a` (all-workspaces): with
+both toggled on you see every recognized agent session across every
+workspace, with neither toggled you see only agent sessions bound to
+this workspace's own panes plus orphans -- same rule as `a` alone, just
+additionally agent-filtered.
+
 Client-panes and workspaces (the TUI's grid) are also fully scriptable:
 
     dimax client spawn <workspace> [--split <pane-uuid>] [--dir h|v] [--bind <target>]
