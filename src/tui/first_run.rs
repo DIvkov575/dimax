@@ -36,13 +36,19 @@ pub struct Wizard {
     install_skill: bool,
 }
 
-const MODES: [BindingMode; 3] = [BindingMode::Portable, BindingMode::Kitty, BindingMode::Both];
+const MODES: [BindingMode; 4] = [
+    BindingMode::Portable,
+    BindingMode::Kitty,
+    BindingMode::Both,
+    BindingMode::Tmux,
+];
 
 fn mode_label(mode: BindingMode) -> &'static str {
     match mode {
         BindingMode::Portable => "Portable (Ctrl-Space prefix, no terminal config changes)",
         BindingMode::Kitty => "Kitty (Cmd-key chords, amends kitty.conf)",
         BindingMode::Both => "Both (Ctrl-Space prefix and Cmd-key chords)",
+        BindingMode::Tmux => "Tmux (Ctrl-B prefix, tmux-compatible chords)",
     }
 }
 
@@ -238,6 +244,8 @@ mod tests {
         wizard.handle_input(b"j");
         assert_eq!(MODES[wizard.mode_selected], BindingMode::Both);
         wizard.handle_input(b"j");
+        assert_eq!(MODES[wizard.mode_selected], BindingMode::Tmux);
+        wizard.handle_input(b"j");
         assert_eq!(MODES[wizard.mode_selected], BindingMode::Portable);
     }
 
@@ -245,7 +253,7 @@ mod tests {
     fn up_from_the_first_mode_wraps_to_the_last() {
         let mut wizard = Wizard::new();
         wizard.handle_input(b"k");
-        assert_eq!(MODES[wizard.mode_selected], BindingMode::Both);
+        assert_eq!(MODES[wizard.mode_selected], BindingMode::Tmux);
     }
 
     #[test]

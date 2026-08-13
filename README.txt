@@ -90,11 +90,12 @@ set later by hand -- see "Keybinding modes" and "Claude Code skill".
 Keybinding modes
 ----------------
 
-Three modes; the recommendation is `both` on Kitty:
+Four modes; the recommendation is `both` on Kitty:
 
     dimax keys install --mode both --reload   # recommended on Kitty
     dimax keys install --mode kitty
     dimax keys install --mode portable        # non-Kitty terminals
+    dimax keys install --mode tmux            # tmux-compatible chords
 
 `both` enables both input layers -- Kitty's Cmd-key chords for the main
 day-to-day actions, and the portable Ctrl-Space prefix as a fallback
@@ -102,8 +103,16 @@ that keeps working in any terminal (e.g. when you SSH into a remote
 box or open a non-Kitty pane). `kitty` alone drops the fallback and is
 mostly useful for a scripted install that will never see anything but
 Kitty. `portable` never modifies any terminal files and is the right
-choice when you can't (or don't want to) run Kitty. The selection is
-stored in `~/.config/dimax/keybindings.json`, or under
+choice when you can't (or don't want to) run Kitty. `tmux` swaps the
+Ctrl-Space prefix for tmux's own `Ctrl-B`, then maps tmux's standard
+chords (`%` to split side-by-side, `"` to split stacked, `c` for a new
+tab, `d` to detach/quit, `s` for the attach menu, `1`-`9` to switch
+workspaces, `h`/`j`/`k`/`l` for focus) onto the dimax actions -- pick
+this if you have tmux muscle memory and want to keep it. It's
+standalone: Kitty chords and the Ctrl-Space prefix are both off in this
+mode.
+
+The selection is stored in `~/.config/dimax/keybindings.json`, or under
 `$XDG_CONFIG_HOME/dimax` when that variable is set.
 
 Installing `kitty` or `both` mode amends `~/.config/kitty/kitty.conf` (one
@@ -111,7 +120,8 @@ Installing `kitty` or `both` mode amends `~/.config/kitty/kitty.conf` (one
 real terminal you're asked to confirm first, defaulting to yes; pass
 `--yes`/`-y` to skip the prompt for scripted installs, or run in a
 non-interactive context (piped stdin, CI) where it's assumed automatically.
-Remove everything it added with `dimax keys uninstall`.
+Remove everything it added with `dimax keys uninstall`. `tmux` and
+`portable` modes never touch any terminal config file.
 
 Inspect bindings without changing files:
 
@@ -119,6 +129,7 @@ Inspect bindings without changing files:
     dimax keys print --mode portable
     dimax keys print --mode kitty
     dimax keys print --mode both
+    dimax keys print --mode tmux
 
 Add aliases for an existing action:
 
@@ -158,6 +169,30 @@ Session numbers use the same stable, name-sorted order shown by
 `dimax server ls`. A missing session number is a no-op and never creates a
 session. Workspace numbers retain their existing behavior and may create or
 switch to the corresponding workspace.
+
+Tmux bindings
+-------------
+
+Only active in `--mode tmux`. Press Ctrl-B, release it, then press the
+listed key (tmux's default prefix and chord vocabulary, mapped to the
+semantically-closest dimax action):
+
+    1..9    switch to workspace 1..9
+    %       split side-by-side (tmux split-window -h)
+    "       split stacked (tmux split-window -v)
+    c       add a tab (tmux new-window)
+    x       close the focused tab (tmux kill-pane)
+    &       kill the focused server session (tmux kill-window)
+    s       detach and open the session picker (tmux choose-tree)
+    d       quit dimax (tmux detach-client -- returns to the shell)
+    h/j/k/l focus left/down/up/right
+    n / p   next / previous tab
+
+Press Ctrl-B twice to send a literal Ctrl-B to the focused process, same
+convention as tmux's `send-prefix`. Tmux mode is standalone: Kitty
+Cmd-chords and the portable Ctrl-Space prefix are both off in this
+mode. There is no tmux-mode analog of `session-1..9` (tmux itself has
+no per-session numeric-jump concept -- use `s` for the picker).
 
 Mouse selection
 ---------------
