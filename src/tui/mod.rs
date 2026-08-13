@@ -403,6 +403,17 @@ struct App {
     /// (`g` on any row) and applied by `visible_attach_menu_rows`/
     /// `initial_selection_for` everywhere the menu's row list is built.
     grouped_view: bool,
+    /// Whether the attach menu shows only recognized AI-coding-CLI
+    /// sessions (see `protocol::SessionKind`) or every server-pane.
+    /// Defaults to `true` -- the whole point of tagging sessions is to
+    /// make "which of these panes is actually an agent I started" the
+    /// *easy* question to answer, and a picker mixing plain shells in
+    /// with agent sessions by default undoes that. Toggled by
+    /// `AttachMenuAction::ToggleAgentsOnly` (`f` on any row), same
+    /// local-UI-preference category as `grouped_view`/
+    /// `show_all_workspaces` -- lives here so it survives closing and
+    /// reopening the menu.
+    agents_only_view: bool,
     /// Every known server-pane's current id/name, keyed by id -- kept
     /// fresh by `refresh_server_names` on the same tick as
     /// `refresh_attach_menu_preview`, and consulted by the render loop so
@@ -487,6 +498,7 @@ impl App {
                         text_selection: None,
                         collapsed_groups: HashSet::new(),
                         grouped_view: true,
+                        agents_only_view: true,
                         server_names: HashMap::new(),
                         attach_menu_preview: None,
                         pinned_dirs: Vec::new(),
@@ -568,7 +580,12 @@ impl App {
         {
             self.attach_menu = Some(AttachMenu {
                 servers: group_servers_by_cwd(
-                    filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
+                    filter_servers_for_menu(
+                        servers,
+                        self.workspace.id,
+                        self.show_all_workspaces,
+                        self.agents_only_view,
+                    ),
                     &self.pinned_dirs,
                 ),
                 selected: 0,
@@ -823,7 +840,12 @@ impl App {
             .await?
         {
             let grouped = group_servers_by_cwd(
-                filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
+                filter_servers_for_menu(
+                    servers,
+                    self.workspace.id,
+                    self.show_all_workspaces,
+                    self.agents_only_view,
+                ),
                 &self.pinned_dirs,
             );
             let selected = initial_selection_for(
@@ -869,7 +891,12 @@ impl App {
             .await?
         {
             let grouped = group_servers_by_cwd(
-                filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
+                filter_servers_for_menu(
+                    servers,
+                    self.workspace.id,
+                    self.show_all_workspaces,
+                    self.agents_only_view,
+                ),
                 &self.pinned_dirs,
             );
             // Default to the trailing `SpawnNew` row ("generic new tab")
@@ -1135,6 +1162,9 @@ impl App {
             AttachMenuAction::ToggleShowAllWorkspaces => {
                 self.toggle_show_all_workspaces(write_half, reader).await?
             }
+            AttachMenuAction::ToggleAgentsOnly => {
+                self.toggle_agents_only(write_half, reader).await?
+            }
             AttachMenuAction::ToggleGrouping => self.toggle_grouping(),
             AttachMenuAction::DetachAll => {
                 self.detach_all_and_close_menu(write_half, reader).await?
@@ -1322,7 +1352,12 @@ impl App {
             .await?
         {
             let grouped = group_servers_by_cwd(
-                filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
+                filter_servers_for_menu(
+                    servers,
+                    self.workspace.id,
+                    self.show_all_workspaces,
+                    self.agents_only_view,
+                ),
                 &self.pinned_dirs,
             );
             let collapsed = self.collapsed_groups.clone();
@@ -1354,7 +1389,12 @@ impl App {
             .await?
         {
             let grouped = group_servers_by_cwd(
-                filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
+                filter_servers_for_menu(
+                    servers,
+                    self.workspace.id,
+                    self.show_all_workspaces,
+                    self.agents_only_view,
+                ),
                 &self.pinned_dirs,
             );
             let collapsed = self.collapsed_groups.clone();
@@ -1365,6 +1405,46 @@ impl App {
             let len = visible_attach_menu_rows(&menu.servers, &collapsed, self.grouped_view).len();
             if menu.selected >= len {
                 menu.selected = len - 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// `f` on any row: flip `App.agents_only_view` and re-fetch/re-
+    /// filter so the toggle takes effect immediately, mirroring
+    /// `toggle_show_all_workspaces`'s shape. Called out here from a
+    /// separate method (rather than reusing the show-all one) because
+    /// they *both* need to run their own network round-trip and their
+    /// own clamp step even though the mutation is different -- keeping
+    /// them separate is clearer than a two-flag "which one changed"
+    /// parameter.
+    async fn toggle_agents_only(
+        &mut self,
+        write_half: &mut OwnedWriteHalf,
+        reader: &mut FrameReader,
+    ) -> anyhow::Result<()> {
+        self.agents_only_view = !self.agents_only_view;
+        if let Response::ServerPaneList(servers) = self
+            .request(write_half, reader, Request::ServerList)
+            .await?
+        {
+            let grouped = group_servers_by_cwd(
+                filter_servers_for_menu(
+                    servers,
+                    self.workspace.id,
+                    self.show_all_workspaces,
+                    self.agents_only_view,
+                ),
+                &self.pinned_dirs,
+            );
+            let collapsed = self.collapsed_groups.clone();
+            let Some(menu) = &mut self.attach_menu else {
+                return Ok(());
+            };
+            menu.servers = grouped;
+            let len = visible_attach_menu_rows(&menu.servers, &collapsed, self.grouped_view).len();
+            if menu.selected >= len {
+                menu.selected = len.saturating_sub(1);
             }
         }
         Ok(())
@@ -1476,7 +1556,12 @@ impl App {
             .await?
         {
             let grouped = group_servers_by_cwd(
-                filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
+                filter_servers_for_menu(
+                    servers,
+                    self.workspace.id,
+                    self.show_all_workspaces,
+                    self.agents_only_view,
+                ),
                 &self.pinned_dirs,
             );
             let collapsed = self.collapsed_groups.clone();
@@ -1553,6 +1638,7 @@ impl App {
                             servers,
                             self.workspace.id,
                             self.show_all_workspaces,
+                            self.agents_only_view,
                         ),
                         &self.pinned_dirs,
                     );
@@ -1753,7 +1839,12 @@ impl App {
                 .await?
             {
                 let grouped = group_servers_by_cwd(
-                    filter_servers_for_menu(servers, self.workspace.id, self.show_all_workspaces),
+                    filter_servers_for_menu(
+                        servers,
+                        self.workspace.id,
+                        self.show_all_workspaces,
+                        self.agents_only_view,
+                    ),
                     &self.pinned_dirs,
                 );
                 let collapsed = self.collapsed_groups.clone();
@@ -2353,19 +2444,42 @@ fn initial_selection_for(
 /// them, and it never affects the CLI (`dimax server ls` and friends
 /// always see everything, filtering is purely an attach-menu UX
 /// concern).
+///
+/// `agents_only`, when set, additionally drops every pane whose
+/// foreground process isn't a recognized AI-coding CLI tool (see
+/// `protocol::SessionKind`/`App::agents_only_view`'s doc comment on why
+/// this is the *default* view, not an opt-in one). Applied after the
+/// workspace filter, same "purely an attach-menu UX concern, CLI
+/// unaffected" rule -- and same caveat as `session_kind` itself: a
+/// `Dead` pane has no foreground process to classify at all, so a
+/// finished agent session drops out of this view along with everything
+/// else non-agent; `a`/toggling this off still finds it.
 fn filter_servers_for_menu(
     servers: Vec<ServerPaneInfo>,
     current_workspace: WorkspaceId,
     show_all: bool,
+    agents_only: bool,
 ) -> Vec<ServerPaneInfo> {
-    if show_all {
+    let servers: Vec<ServerPaneInfo> = if show_all {
+        servers
+    } else {
+        servers
+            .into_iter()
+            .filter(|s| {
+                s.owner_workspace
+                    .is_none_or(|owner| owner == current_workspace)
+            })
+            .collect()
+    };
+    if !agents_only {
         return servers;
     }
     servers
         .into_iter()
         .filter(|s| {
-            s.owner_workspace
-                .is_none_or(|owner| owner == current_workspace)
+            s.foreground
+                .as_ref()
+                .is_some_and(|f| f.session_kind.is_some())
         })
         .collect()
 }
@@ -2453,6 +2567,11 @@ enum AttachMenuAction {
     /// a flat list (see `App::toggle_grouping`). Purely a local
     /// re-render -- no network round-trip, unlike `ToggleShowAllWorkspaces`.
     ToggleGrouping,
+    /// `f` on any row: flip `App.agents_only_view` between "only
+    /// recognized AI-coding CLI sessions" (default) and "every pane".
+    /// Same shape as `ToggleShowAllWorkspaces` -- re-fetches and
+    /// re-filters immediately so the row list updates in-place.
+    ToggleAgentsOnly,
     /// `d` on any row: detach every tab from the leaf that opened this
     /// menu (see `App::detach_all_and_close_menu`), then close the
     /// menu -- distinct from `Cancel` (`Esc`), which restores whatever
@@ -2493,6 +2612,7 @@ fn parse_attach_menu_input(bytes: &[u8]) -> AttachMenuAction {
         b"r" => AttachMenuAction::StartRename,
         b"p" => AttachMenuAction::TogglePin,
         b"a" => AttachMenuAction::ToggleShowAllWorkspaces,
+        b"f" => AttachMenuAction::ToggleAgentsOnly,
         b"g" => AttachMenuAction::ToggleGrouping,
         b"d" => AttachMenuAction::DetachAll,
         b"q" => AttachMenuAction::Quit,
@@ -2971,7 +3091,7 @@ async fn reconnect() -> anyhow::Result<(OwnedWriteHalf, FrameReader)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::ClientPane;
+    use crate::protocol::{ClientPane, SessionKind};
     use uuid::Uuid;
 
     fn leaf(id: ClientPaneId) -> SplitTree {
@@ -3327,6 +3447,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_attach_menu_input_f_is_toggle_agents_only() {
+        assert_eq!(
+            parse_attach_menu_input(b"f"),
+            AttachMenuAction::ToggleAgentsOnly
+        );
+    }
+
+    #[test]
     fn parse_attach_menu_input_d_is_detach_all() {
         assert_eq!(parse_attach_menu_input(b"d"), AttachMenuAction::DetachAll);
     }
@@ -3496,7 +3624,7 @@ mod tests {
             server_owned_by("theirs", Some(ws_b)),
             server_owned_by("orphan", None),
         ];
-        let filtered = filter_servers_for_menu(servers, ws_a, false);
+        let filtered = filter_servers_for_menu(servers, ws_a, false, false);
         let names: Vec<&str> = filtered
             .iter()
             .map(|s| s.name.as_deref().unwrap())
@@ -3516,12 +3644,85 @@ mod tests {
             server_owned_by("mine", Some(ws_a)),
             server_owned_by("theirs", Some(ws_b)),
         ];
-        let filtered = filter_servers_for_menu(servers, ws_a, true);
+        let filtered = filter_servers_for_menu(servers, ws_a, true, false);
         assert_eq!(
             filtered.len(),
             2,
             "show_all must let every pane through regardless of ownership"
         );
+    }
+
+    fn server_with_kind(name: &str, kind: Option<SessionKind>) -> ServerPaneInfo {
+        let mut s = server_with_cwd(name, Some("/tmp"));
+        if let Some(fg) = s.foreground.as_mut() {
+            fg.session_kind = kind;
+        }
+        s
+    }
+
+    #[test]
+    fn filter_servers_for_menu_agents_only_keeps_only_recognized_sessions() {
+        let ws = Uuid::new_v4();
+        let servers = vec![
+            server_with_kind("shell", None),
+            server_with_kind("editor", None),
+            server_with_kind("agent-a", Some(SessionKind::Claude)),
+            server_with_kind("agent-b", Some(SessionKind::Codex)),
+        ];
+        let filtered = filter_servers_for_menu(servers, ws, true, true);
+        let names: Vec<&str> = filtered
+            .iter()
+            .map(|s| s.name.as_deref().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["agent-a", "agent-b"],
+            "agents_only must drop every pane whose session_kind is None"
+        );
+    }
+
+    #[test]
+    fn filter_servers_for_menu_agents_only_drops_dead_panes_with_no_foreground() {
+        let ws = Uuid::new_v4();
+        let mut dead = server_with_kind("dead-agent", None);
+        dead.status = crate::protocol::ServerPaneStatus::Dead;
+        dead.foreground = None;
+        let servers = vec![
+            dead,
+            server_with_kind("live-agent", Some(SessionKind::Claude)),
+        ];
+        let filtered = filter_servers_for_menu(servers, ws, true, true);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name.as_deref(), Some("live-agent"));
+    }
+
+    #[test]
+    fn filter_servers_for_menu_agents_only_stacks_with_show_all() {
+        let ws_a = Uuid::new_v4();
+        let ws_b = Uuid::new_v4();
+        let mut mine_agent = server_with_kind("mine-agent", Some(SessionKind::Claude));
+        mine_agent.owner_workspace = Some(ws_a);
+        let mut theirs_agent = server_with_kind("theirs-agent", Some(SessionKind::Codex));
+        theirs_agent.owner_workspace = Some(ws_b);
+        let mut mine_shell = server_with_kind("mine-shell", None);
+        mine_shell.owner_workspace = Some(ws_a);
+        let servers = vec![mine_agent, theirs_agent, mine_shell];
+
+        // Default view: workspace-filtered + agents-only. Only mine-agent.
+        let filtered = filter_servers_for_menu(servers.clone(), ws_a, false, true);
+        let names: Vec<&str> = filtered
+            .iter()
+            .map(|s| s.name.as_deref().unwrap())
+            .collect();
+        assert_eq!(names, vec!["mine-agent"]);
+
+        // show_all + agents_only: both agents visible, shell still hidden.
+        let filtered = filter_servers_for_menu(servers, ws_a, true, true);
+        let names: Vec<&str> = filtered
+            .iter()
+            .map(|s| s.name.as_deref().unwrap())
+            .collect();
+        assert_eq!(names, vec!["mine-agent", "theirs-agent"]);
     }
 
     #[test]
@@ -3748,6 +3949,7 @@ mod tests {
             text_selection: None,
             collapsed_groups: HashSet::new(),
             grouped_view: true,
+            agents_only_view: true,
             server_names: HashMap::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
@@ -3792,6 +3994,7 @@ mod tests {
             text_selection: None,
             collapsed_groups: HashSet::new(),
             grouped_view: true,
+            agents_only_view: true,
             server_names: HashMap::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
@@ -3838,6 +4041,7 @@ mod tests {
             text_selection: None,
             collapsed_groups: HashSet::new(),
             grouped_view: true,
+            agents_only_view: true,
             server_names: HashMap::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
@@ -3884,6 +4088,7 @@ mod tests {
             text_selection: None,
             collapsed_groups: HashSet::new(),
             grouped_view: true,
+            agents_only_view: true,
             server_names: HashMap::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
@@ -3923,6 +4128,7 @@ mod tests {
             text_selection: None,
             collapsed_groups: HashSet::new(),
             grouped_view: true,
+            agents_only_view: true,
             server_names: HashMap::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
@@ -3959,6 +4165,7 @@ mod tests {
             text_selection: None,
             collapsed_groups: HashSet::new(),
             grouped_view: true,
+            agents_only_view: true,
             server_names: HashMap::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
@@ -3997,6 +4204,7 @@ mod tests {
             text_selection: None,
             collapsed_groups: HashSet::new(),
             grouped_view: true,
+            agents_only_view: true,
             server_names: HashMap::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
@@ -4119,6 +4327,7 @@ mod tests {
             text_selection: None,
             collapsed_groups: HashSet::new(),
             grouped_view: true,
+            agents_only_view: true,
             server_names: HashMap::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
@@ -4158,6 +4367,7 @@ mod tests {
             text_selection: None,
             collapsed_groups: HashSet::new(),
             grouped_view: true,
+            agents_only_view: true,
             server_names: HashMap::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
@@ -4196,6 +4406,7 @@ mod tests {
             text_selection: None,
             collapsed_groups: HashSet::new(),
             grouped_view: true,
+            agents_only_view: true,
             server_names: HashMap::new(),
             attach_menu_preview: None,
             pinned_dirs: Vec::new(),
@@ -4343,6 +4554,15 @@ mod tests {
         }
         app.workspace.tree = None;
         app.focused = None;
+        // Tests spawn plain `cat`/`sh` server-panes -- none of them are
+        // recognized as agent sessions, so the default agents-only
+        // filter (`agents_only_view: true` from `App::bootstrap`) would
+        // hide every test pane from `filter_servers_for_menu`. Flip it
+        // off for the test harness so existing coverage still exercises
+        // the full attach-menu logic; a dedicated test below covers the
+        // filter's *own* behavior against a mixed set of agent and
+        // non-agent panes.
+        app.agents_only_view = false;
         (app, write_half, reader)
     }
 
