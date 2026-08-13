@@ -99,6 +99,25 @@ pub enum Cli {
         #[command(subcommand)]
         cmd: SkillsCmd,
     },
+    /// Pin, unpin, or list pinned directories -- the same grouping
+    /// preference the attach menu's `p` key controls, exposed for
+    /// scripting (see `daemon::pinned_dirs`).
+    Pin {
+        #[command(subcommand)]
+        cmd: PinCmd,
+    },
+}
+
+#[derive(clap::Subcommand)]
+pub enum PinCmd {
+    /// Pin `dir` so it sorts first among the attach menu's
+    /// directory-cwd groups. A no-op (still succeeds) if `dir` is
+    /// already pinned.
+    Add { dir: String },
+    /// Unpin `dir`. A no-op if it isn't currently pinned.
+    Remove { dir: String },
+    /// List currently pinned directories, earliest-pinned first.
+    List,
 }
 
 #[derive(clap::Subcommand)]
@@ -191,6 +210,19 @@ pub enum ClientCmd {
     AddTab {
         addr: String,
         target: String,
+    },
+    /// Drop the pane's active tab (its bound server-pane keeps running).
+    /// Closes the whole pane if that was its last tab, same as `close`.
+    CloseTab {
+        addr: String,
+    },
+    /// Step the pane's active tab one position forward, wrapping.
+    /// A no-op on a pane with fewer than two tabs.
+    CycleTab {
+        addr: String,
+        /// Step backward instead of forward.
+        #[arg(long)]
+        backward: bool,
     },
     Ls {
         workspace: Option<String>,
@@ -290,7 +322,14 @@ fn unexpected_response(context: &str, resp: Response) -> anyhow::Error {
     }
 }
 
-/// Format one `ServerPaneInfo` as a single scriptable line: `id  name  status  rows x cols`.
+/// Format one `ServerPaneInfo` as a single scriptable line: `id  name
+/// status  rows x cols  process  cwd  kind`. `kind` is the trailing
+/// column (added after the others were already relied on as
+/// positional/scriptable output) so existing callers reading fields by
+/// index from the front are unaffected -- `-` when the foreground
+/// process isn't a recognized AI-coding CLI tool (see
+/// `protocol::SessionKind`), which is the common case for a plain
+/// shell or editor.
 fn format_server_pane_line(info: &ServerPaneInfo) -> String {
     let name = info.name.as_deref().unwrap_or("-");
     let status = match info.status {
@@ -306,9 +345,14 @@ fn format_server_pane_line(info: &ServerPaneInfo) -> String {
         .as_ref()
         .and_then(|f| f.cwd.as_deref())
         .unwrap_or("-");
+    let kind = info
+        .foreground
+        .as_ref()
+        .and_then(|f| f.session_kind)
+        .map_or("-".to_string(), |k| format!("{k:?}").to_lowercase());
     format!(
-        "{}\t{}\t{}\t{}x{}\t{}\t{}",
-        info.id, name, status, info.size.rows, info.size.cols, process, cwd
+        "{}\t{}\t{}\t{}x{}\t{}\t{}\t{}",
+        info.id, name, status, info.size.rows, info.size.cols, process, cwd, kind
     )
 }
 
@@ -343,6 +387,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             cmd: Some(DaemonCmd::Reload),
             ..
         } => run_daemon_reload().await,
+        Cli::Pin { cmd } => run_pin(cmd).await,
         // `main.rs` handles bare `Attach`/`Config`, and `Daemon` with no
         // subcommand (the actual foreground run, fresh or
         // `--resume-from`), itself, and never calls `run` with those; a
@@ -370,6 +415,64 @@ async fn run_daemon_reload() -> anyhow::Result<()> {
         }
         Response::Error { message } => anyhow::bail!(message),
         other => anyhow::bail!("unexpected response to DaemonReload: {other:?}"),
+    }
+}
+
+/// `dimax pin add/remove/list`. `ToggleDirectoryPin` on the wire is a
+/// raw toggle (matching the attach menu's `p` key, which always wants
+/// "flip it"); a CLI caller wants idempotent `add`/`remove` instead --
+/// a script that pins the same directory twice should still end up
+/// pinned, not accidentally unpin it. So `add`/`remove` each check the
+/// current list first and only send `ToggleDirectoryPin` when it would
+/// actually move `dir` into the requested state.
+async fn run_pin(cmd: PinCmd) -> anyhow::Result<()> {
+    let mut client = Client::connect().await?;
+    match cmd {
+        PinCmd::Add { dir } => {
+            if current_pins(&mut client).await?.iter().any(|p| p == &dir) {
+                println!("already pinned: {dir}");
+                return Ok(());
+            }
+            toggle_pin(&mut client, dir.clone()).await?;
+            println!("pinned: {dir}");
+            Ok(())
+        }
+        PinCmd::Remove { dir } => {
+            if !current_pins(&mut client).await?.iter().any(|p| p == &dir) {
+                println!("not pinned: {dir}");
+                return Ok(());
+            }
+            toggle_pin(&mut client, dir.clone()).await?;
+            println!("unpinned: {dir}");
+            Ok(())
+        }
+        PinCmd::List => {
+            let pins = current_pins(&mut client).await?;
+            if pins.is_empty() {
+                println!("no pinned directories");
+            } else {
+                for dir in pins {
+                    println!("{dir}");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn current_pins(client: &mut Client) -> anyhow::Result<Vec<String>> {
+    match client.request(Request::PinnedDirsList).await? {
+        Response::PinnedDirsList(pins) => Ok(pins),
+        Response::Error { message } => anyhow::bail!(message),
+        other => anyhow::bail!("unexpected response to PinnedDirsList: {other:?}"),
+    }
+}
+
+async fn toggle_pin(client: &mut Client, dir: String) -> anyhow::Result<()> {
+    match client.request(Request::ToggleDirectoryPin { dir }).await? {
+        Response::PinnedDirsList(_) => Ok(()),
+        Response::Error { message } => anyhow::bail!(message),
+        other => anyhow::bail!("unexpected response to ToggleDirectoryPin: {other:?}"),
     }
 }
 
@@ -698,6 +801,33 @@ async fn run_client(cmd: ClientCmd) -> anyhow::Result<()> {
                 other => Err(unexpected_response("client add-tab", other)),
             }
         }
+        ClientCmd::CloseTab { addr } => {
+            let (workspace, pane) = parse_pane_addr(&addr)?;
+            let req = Request::ClientCloseTab { workspace, pane };
+            match client.request(req).await? {
+                Response::Ack => {
+                    println!("closed active tab on {addr}");
+                    Ok(())
+                }
+                other => Err(unexpected_response("client close-tab", other)),
+            }
+        }
+        ClientCmd::CycleTab { addr, backward } => {
+            let (workspace, pane) = parse_pane_addr(&addr)?;
+            let req = Request::ClientCycleTab {
+                workspace,
+                pane,
+                forward: !backward,
+            };
+            match client.request(req).await? {
+                Response::Ack => {
+                    let direction = if backward { "backward" } else { "forward" };
+                    println!("cycled {addr} {direction}");
+                    Ok(())
+                }
+                other => Err(unexpected_response("client cycle-tab", other)),
+            }
+        }
         ClientCmd::Ls { workspace } => {
             let req = Request::ClientList { workspace };
             match client.request(req).await? {
@@ -856,6 +986,7 @@ mod tests {
             foreground: Some(ForegroundProcessInfo {
                 process_name: "vim".to_string(),
                 cwd: Some("/home/dev".to_string()),
+                session_kind: None,
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
@@ -863,7 +994,7 @@ mod tests {
         let line = format_server_pane_line(&info);
         assert_eq!(
             line,
-            format!("{}\teditor\trunning\t24x80\tvim\t/home/dev", Uuid::nil())
+            format!("{}\teditor\trunning\t24x80\tvim\t/home/dev\t-", Uuid::nil())
         );
     }
 
@@ -879,7 +1010,32 @@ mod tests {
             short_id: "aa".to_string(),
         };
         let line = format_server_pane_line(&info);
-        assert_eq!(line, format!("{}\t-\tdead\t10x20\t-\t-", Uuid::nil()));
+        assert_eq!(line, format!("{}\t-\tdead\t10x20\t-\t-\t-", Uuid::nil()));
+    }
+
+    #[test]
+    fn format_server_pane_line_shows_recognized_session_kind() {
+        let info = ServerPaneInfo {
+            id: Uuid::nil(),
+            name: None,
+            size: Size { rows: 24, cols: 80 },
+            status: ServerPaneStatus::Running,
+            foreground: Some(ForegroundProcessInfo {
+                process_name: "claude".to_string(),
+                cwd: Some("/home/dev".to_string()),
+                session_kind: Some(crate::protocol::SessionKind::Claude),
+            }),
+            owner_workspace: None,
+            short_id: "aa".to_string(),
+        };
+        let line = format_server_pane_line(&info);
+        assert_eq!(
+            line,
+            format!(
+                "{}\t-\trunning\t24x80\tclaude\t/home/dev\tclaude",
+                Uuid::nil()
+            )
+        );
     }
 
     #[test]

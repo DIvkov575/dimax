@@ -3428,6 +3428,7 @@ mod tests {
             foreground: cwd.map(|c| crate::protocol::ForegroundProcessInfo {
                 process_name: "bash".to_string(),
                 cwd: Some(c.to_string()),
+                session_kind: None,
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),

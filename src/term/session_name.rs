@@ -28,7 +28,43 @@
 //! itself -- still a real improvement over an anonymous short id, without
 //! guessing at an unverified file format.
 
+use crate::protocol::SessionKind;
 use std::path::{Path, PathBuf};
+
+/// Classify a foreground process's short name (`ForegroundProcessInfo::
+/// process_name`, e.g. `"claude"`, `"codex"`) as one of the recognized
+/// tools, if any -- see [`SessionKind`]. Binary-name matching only --
+/// the same rules [`is_claude_invocation`]/[`is_codex_invocation`]/
+/// [`named_by_binary_only`] use for title-lookup dispatch, just without
+/// needing the full command line those also inspect for `claude`'s
+/// `--session-id`/`--resume` flag (irrelevant for classification, only
+/// for finding its transcript). Decoupled from [`derive_session_name`]'s
+/// title lookup (which only ever runs once, while a pane is still
+/// unnamed -- see `daemon::state::State::server_list`): this is meant
+/// to run on every pane on every `server_list` call, since it needs
+/// nothing more than the `process_name` string `ServerPane::
+/// foreground_info` already fetches.
+pub fn classify(process_name: &str) -> Option<SessionKind> {
+    let name = process_name.to_lowercase();
+    if name.contains("claude") {
+        return Some(SessionKind::Claude);
+    }
+    if name.contains("codex") {
+        return Some(SessionKind::Codex);
+    }
+    if name.contains("opencode") {
+        return Some(SessionKind::Opencode);
+    }
+    // Exact match only -- see `named_by_binary_only`'s doc comment on
+    // why a substring match on "omp" false-positives too easily.
+    if name == "omp" {
+        return Some(SessionKind::Omp);
+    }
+    if name.contains("herdr") {
+        return Some(SessionKind::Herdr);
+    }
+    None
+}
 
 /// Look up a display name for the CLI session running as `cmd` (the
 /// foreground process's full command line, `argv[0]` first) with
@@ -369,6 +405,37 @@ fn truncate_at_word_boundary(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_recognizes_every_supported_tool() {
+        assert_eq!(classify("claude"), Some(SessionKind::Claude));
+        assert_eq!(classify("codex"), Some(SessionKind::Codex));
+        assert_eq!(classify("opencode"), Some(SessionKind::Opencode));
+        assert_eq!(classify("omp"), Some(SessionKind::Omp));
+        assert_eq!(classify("herdr"), Some(SessionKind::Herdr));
+    }
+
+    #[test]
+    fn classify_is_case_insensitive() {
+        assert_eq!(classify("Claude"), Some(SessionKind::Claude));
+        assert_eq!(classify("CODEX"), Some(SessionKind::Codex));
+    }
+
+    #[test]
+    fn classify_omp_requires_an_exact_match() {
+        // Same false-positive concern as `named_by_binary_only`: "omp"
+        // is short enough that a substring match would misclassify an
+        // unrelated binary.
+        assert_eq!(classify("compass"), None);
+        assert_eq!(classify("omp"), Some(SessionKind::Omp));
+    }
+
+    #[test]
+    fn classify_returns_none_for_unrecognized_processes() {
+        assert_eq!(classify("bash"), None);
+        assert_eq!(classify("vim"), None);
+        assert_eq!(classify(""), None);
+    }
 
     #[test]
     fn is_claude_invocation_matches_plain_and_versioned_paths() {

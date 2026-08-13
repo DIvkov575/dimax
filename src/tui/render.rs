@@ -1628,6 +1628,7 @@ mod tests {
             foreground: Some(ForegroundProcessInfo {
                 process_name: "vim".to_string(),
                 cwd: Some("/home/dev/project".to_string()),
+                session_kind: None,
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
@@ -1796,6 +1797,7 @@ mod tests {
             foreground: Some(ForegroundProcessInfo {
                 process_name: "vim".to_string(),
                 cwd: Some("/home/dev/project".to_string()),
+                session_kind: None,
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
@@ -2008,6 +2010,7 @@ mod tests {
             foreground: Some(ForegroundProcessInfo {
                 process_name: "bash".to_string(),
                 cwd: Some("/home/dev/api".to_string()),
+                session_kind: None,
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
@@ -2020,6 +2023,7 @@ mod tests {
             foreground: Some(ForegroundProcessInfo {
                 process_name: "bash".to_string(),
                 cwd: Some("/home/dev/web".to_string()),
+                session_kind: None,
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
@@ -2061,6 +2065,7 @@ mod tests {
             foreground: Some(ForegroundProcessInfo {
                 process_name: "bash".to_string(),
                 cwd: Some("/home/dev/api".to_string()),
+                session_kind: None,
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
@@ -2106,6 +2111,7 @@ mod tests {
             foreground: Some(ForegroundProcessInfo {
                 process_name: "bash".to_string(),
                 cwd: Some("/home/dev/api".to_string()),
+                session_kind: None,
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
@@ -2118,6 +2124,7 @@ mod tests {
             foreground: Some(ForegroundProcessInfo {
                 process_name: "bash".to_string(),
                 cwd: Some("/home/dev/web".to_string()),
+                session_kind: None,
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
@@ -2164,6 +2171,7 @@ mod tests {
             foreground: Some(ForegroundProcessInfo {
                 process_name: "bash".to_string(),
                 cwd: Some("/home/dev/api".to_string()),
+                session_kind: None,
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),
@@ -2211,6 +2219,7 @@ mod tests {
             foreground: Some(ForegroundProcessInfo {
                 process_name: "bash".to_string(),
                 cwd: Some("/home/dev/api".to_string()),
+                session_kind: None,
             }),
             owner_workspace: None,
             short_id: "aa".to_string(),

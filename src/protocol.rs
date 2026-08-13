@@ -277,6 +277,30 @@ pub struct ForegroundProcessInfo {
     /// The foreground process's current working directory, if it could
     /// be determined.
     pub cwd: Option<String>,
+    /// `Some` if `process_name` matches one of the recognized AI-coding
+    /// CLI tools (see `term::session_name::classify`) -- a stable,
+    /// parseable tag so a caller can ask "is this a recognized session,
+    /// and which tool" directly, instead of re-deriving it by
+    /// pattern-matching `process_name` itself. Unlike the pane's `name`
+    /// (a one-shot auto-derived title, only ever set while still
+    /// unnamed), this is recomputed fresh every time `foreground` is.
+    pub session_kind: Option<SessionKind>,
+}
+
+/// A recognized AI-coding-CLI tool -- see [`ForegroundProcessInfo::
+/// session_kind`] and `term::session_name::classify`. Lives here
+/// (rather than in `term`) alongside every other wire-visible type this
+/// crate's `term`/`daemon`/`tui`/`cli` modules all depend on, not the
+/// reverse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionKind {
+    Claude,
+    Codex,
+    Opencode,
+    /// "Oh My Pi" -- see `term::session_name`'s module doc.
+    Omp,
+    Herdr,
 }
 
 /// One screen cell. Kept intentionally simple for v1 — enough styling to
