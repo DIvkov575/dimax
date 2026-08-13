@@ -73,8 +73,19 @@ pub enum Cli {
         cmd: ClientCmd,
     },
     /// Run the daemon in the foreground (used internally by the
-    /// auto-spawn path; also useful for debugging).
-    Daemon,
+    /// auto-spawn path; also useful for debugging), or hot-reload the
+    /// one already running.
+    Daemon {
+        #[command(subcommand)]
+        cmd: Option<DaemonCmd>,
+        /// Internal: resume from this state snapshot (produced by a
+        /// `reload`, see `daemon::mod`'s "Hot reload" module doc)
+        /// instead of starting fresh. `main.rs`'s own `execve` call is
+        /// the only thing that ever sets this -- not meant to be typed
+        /// by hand.
+        #[arg(long, hide = true)]
+        resume_from: Option<std::path::PathBuf>,
+    },
     /// Regenerate `dimax.conf` (Kitty chord mappings) if needed, then
     /// open it in `$EDITOR`/`$VISUAL`.
     Config,
@@ -88,6 +99,20 @@ pub enum Cli {
         #[command(subcommand)]
         cmd: SkillsCmd,
     },
+}
+
+#[derive(clap::Subcommand)]
+pub enum DaemonCmd {
+    /// Hot-reload the running daemon onto whatever binary
+    /// `cargo install`/a rebuild last put at this path, without killing
+    /// any server-pane -- see `daemon::mod`'s "Hot reload" module doc
+    /// for the mechanism (fd inheritance across `execve`, not a
+    /// restart). Prints once the reload has been *attempted*; a
+    /// successful `execve` never returns, so there is no way to
+    /// confirm success over this same connection -- run `dimax server
+    /// ls` afterward if you want to check the daemon actually came
+    /// back.
+    Reload,
 }
 
 /// `main.rs`'s actual clap entry point. `command` is `Option` so bare
@@ -314,14 +339,37 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Cli::Client { cmd } => run_client(cmd).await,
         Cli::Keys { cmd } => run_keys(cmd),
         Cli::Skills { cmd } => run_skills(cmd),
-        // `main.rs` handles `Attach`/`Daemon`/`Config` itself and never
-        // calls `run` with them; a caller doing so anyway is a
-        // `main.rs` bug, not something to service here.
-        Cli::Attach | Cli::Daemon | Cli::Config => {
+        Cli::Daemon {
+            cmd: Some(DaemonCmd::Reload),
+            ..
+        } => run_daemon_reload().await,
+        // `main.rs` handles bare `Attach`/`Config`, and `Daemon` with no
+        // subcommand (the actual foreground run, fresh or
+        // `--resume-from`), itself, and never calls `run` with those; a
+        // caller doing so anyway is a `main.rs` bug, not something to
+        // service here.
+        Cli::Attach | Cli::Daemon { cmd: None, .. } | Cli::Config => {
             anyhow::bail!(
-                "cli::run called with Attach/Daemon/Config, which main.rs should handle directly"
+                "cli::run called with Attach/Daemon (no subcommand)/Config, which main.rs should handle directly"
             )
         }
+    }
+}
+
+/// `dimax daemon reload`: ask the already-running daemon to hot-reload
+/// itself (module doc reference: `daemon::mod`'s "Hot reload"). Note
+/// this only reports that the daemon *attempted* the reload -- see
+/// `DaemonCmd::Reload`'s doc comment for why a definitive success/
+/// failure can't be reported over this same connection.
+async fn run_daemon_reload() -> anyhow::Result<()> {
+    let mut client = Client::connect().await?;
+    match client.request(Request::DaemonReload).await? {
+        Response::Ack => {
+            println!("reload attempted -- run `dimax server ls` to confirm the daemon came back");
+            Ok(())
+        }
+        Response::Error { message } => anyhow::bail!(message),
+        other => anyhow::bail!("unexpected response to DaemonReload: {other:?}"),
     }
 }
 

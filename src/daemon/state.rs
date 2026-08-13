@@ -21,7 +21,9 @@ use crate::protocol::{
     WorkspaceId, WorkspaceInfo,
 };
 use crate::term::{ServerPane, ServerPaneEvent};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::os::fd::RawFd;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
 
@@ -166,6 +168,62 @@ pub struct State {
 }
 
 struct Workspace {
+    info_number: u8,
+    name: Option<String>,
+    tree: Option<SplitTree>,
+}
+
+/// Everything needed to rebuild an equivalent `State` on the other side
+/// of a hot reload's `execve` (see `daemon::mod`'s "Hot reload" module
+/// doc) -- written to a temp file just before the exec, read back by
+/// `State::from_resume` right after. Deliberately excludes anything
+/// that's per-connection (`subscribers`, `scroll_offsets`) or reloadable
+/// from disk on its own (`pinned_dirs`, via `pinned_dirs::load`): those
+/// either don't survive the exec anyway (no connections are inherited,
+/// only the listening socket -- see `daemon::mod::prepare_reload`) or
+/// don't need to.
+#[derive(Serialize, Deserialize)]
+pub struct ResumeState {
+    server_panes: Vec<ResumeServerPane>,
+    workspaces: Vec<ResumeWorkspace>,
+    client_pane_sizes: HashMap<ClientPaneId, Size>,
+    used_shell_fallback: bool,
+    next_server_short_id: u64,
+    next_client_short_id: u64,
+}
+
+impl ResumeState {
+    /// Every PTY master fd this snapshot references -- `daemon::mod`'s
+    /// `prepare_reload` must clear `FD_CLOEXEC` on each of these (plus
+    /// the listening socket, which isn't part of `State` at all) before
+    /// the `execve` that carries this snapshot across, or the kernel
+    /// closes them the instant the new process image starts.
+    pub fn pty_fds(&self) -> impl Iterator<Item = RawFd> + '_ {
+        self.server_panes.iter().map(|p| p.fd)
+    }
+}
+
+/// One server-pane's metadata plus the two OS-level handles
+/// `ServerPane::from_inherited` needs to reconstruct it around the
+/// *same* PTY/shell rather than spawning a new one -- `fd` is only
+/// meaningful because `daemon::mod::prepare_reload` clears its
+/// `FD_CLOEXEC` flag before the exec that carries this struct across;
+/// without that, the fd would already be closed by the time the new
+/// process image starts running.
+#[derive(Serialize, Deserialize)]
+struct ResumeServerPane {
+    id: ServerPaneId,
+    name: Option<String>,
+    owner_workspace: Option<WorkspaceId>,
+    short_id: String,
+    size: Size,
+    fd: RawFd,
+    pid: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ResumeWorkspace {
+    id: WorkspaceId,
     info_number: u8,
     name: Option<String>,
     tree: Option<SplitTree>,
@@ -994,6 +1052,108 @@ impl State {
         out.dedup();
         out
     }
+
+    // -- hot reload ------------------------------------------------------
+
+    /// Snapshot everything a fresh process image needs to reconstruct an
+    /// equivalent `State` around the *same* PTYs/shells after `execve`
+    /// (see `daemon::mod`'s "Hot reload" module doc). A pane whose
+    /// `ServerPane::reload_handle` comes back with either half missing
+    /// is dropped from the snapshot rather than carried across with a
+    /// bogus fd/pid -- doesn't happen for any pane this module itself
+    /// constructs, but silently losing one stale/half-broken pane on
+    /// reload is a far better failure mode than a `from_inherited` panic
+    /// on the other side.
+    pub fn to_resume(&self) -> ResumeState {
+        let server_panes = self
+            .server_panes
+            .values()
+            .filter_map(|pane| {
+                let (fd, pid) = pane.reload_handle();
+                Some(ResumeServerPane {
+                    id: pane.id(),
+                    name: pane.name().map(str::to_string),
+                    owner_workspace: pane.owner_workspace(),
+                    short_id: pane.short_id().to_string(),
+                    size: pane.size(),
+                    fd: fd?,
+                    pid: pid?,
+                })
+            })
+            .collect();
+        let workspaces = self
+            .workspaces
+            .iter()
+            .map(|(&id, ws)| ResumeWorkspace {
+                id,
+                info_number: ws.info_number,
+                name: ws.name.clone(),
+                tree: ws.tree.clone(),
+            })
+            .collect();
+        ResumeState {
+            server_panes,
+            workspaces,
+            client_pane_sizes: self.client_pane_sizes.clone(),
+            used_shell_fallback: self.used_shell_fallback,
+            next_server_short_id: self.next_server_short_id,
+            next_client_short_id: self.next_client_short_id,
+        }
+    }
+
+    /// The other side of `to_resume`: rebuild `State` from a snapshot
+    /// taken just before the `execve` that brought this process image
+    /// up, reconstructing every server-pane via `ServerPane::from_inherited`
+    /// around its already-open (fd inherited across the exec, see
+    /// `daemon::mod::prepare_reload`) PTY master instead of spawning a
+    /// fresh one. `pinned_dirs` is deliberately reloaded from disk here
+    /// (`super::pinned_dirs::load`), same as `State::new` -- it was
+    /// never part of `ResumeState` because it's already persisted
+    /// independently of any particular daemon process.
+    pub fn from_resume(resume: ResumeState) -> anyhow::Result<Self> {
+        let (pane_events, pane_events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut server_panes = HashMap::with_capacity(resume.server_panes.len());
+        for p in resume.server_panes {
+            let pane = ServerPane::from_inherited(
+                p.id,
+                p.name,
+                p.size,
+                pane_events.clone(),
+                p.owner_workspace,
+                p.short_id,
+                p.fd,
+                p.pid,
+            )?;
+            server_panes.insert(p.id, pane);
+        }
+        let workspaces = resume
+            .workspaces
+            .into_iter()
+            .map(|w| {
+                (
+                    w.id,
+                    Workspace {
+                        info_number: w.info_number,
+                        name: w.name,
+                        tree: w.tree,
+                    },
+                )
+            })
+            .collect();
+        Ok(Self {
+            server_panes,
+            workspaces,
+            subscribers: HashMap::new(),
+            client_pane_sizes: resume.client_pane_sizes,
+            scroll_offsets: HashMap::new(),
+            pane_events,
+            pane_events_rx: Some(pane_events_rx),
+            pinned_dirs: super::pinned_dirs::load(),
+            used_shell_fallback: resume.used_shell_fallback,
+            next_server_short_id: resume.next_server_short_id,
+            next_client_short_id: resume.next_client_short_id,
+        })
+    }
 }
 
 /// `1`-`9`, the workspace numbers `cmd-1`..`cmd-9` address. Any other
@@ -1047,6 +1207,69 @@ mod tests {
         assert_eq!(encode_short_id(36), "0A");
         assert_eq!(encode_short_id(61), "0Z");
         assert_eq!(encode_short_id(62), "10");
+    }
+
+    #[test]
+    fn to_resume_round_trips_through_json_with_a_real_pane() {
+        // Exercises `to_resume` against a genuinely spawned pane (real
+        // PTY, real fd, real pid) and confirms the snapshot survives a
+        // JSON round-trip -- the exact serialization `daemon::mod`'s
+        // `prepare_reload`/`run_resumed` write to and read from a temp
+        // file across the actual `execve`. Deliberately does NOT call
+        // `from_resume`/`ServerPane::from_inherited` here: that would
+        // construct a *second* `ServerPane` around the same live fd
+        // while the original (still owned by `state`, spawned above)
+        // is also still alive, and having two owners race to close one
+        // fd on drop is exactly the double-close a real reload avoids
+        // by construction (the old process's `ServerPane` never runs
+        // its own `Drop` post-exec -- there's no second owner). The
+        // real reconstruct-from-a-still-open-fd path is covered by a
+        // live smoke test instead (spawn a real daemon, reload it for
+        // real, confirm the pane's output is continuous across it),
+        // not by a unit test that would have to fake its way around
+        // that guarantee.
+        let mut state = State::new();
+        let id = spawn_pane(&mut state, "resume-test");
+
+        let resume = state.to_resume();
+        let json = serde_json::to_vec(&resume).unwrap();
+        let restored: ResumeState = serde_json::from_slice(&json).unwrap();
+
+        assert_eq!(restored.server_panes.len(), 1);
+        let pane = &restored.server_panes[0];
+        assert_eq!(pane.id, id);
+        assert_eq!(pane.name.as_deref(), Some("resume-test"));
+        assert_eq!(pane.short_id, "00");
+        assert!(pane.fd >= 0, "a real spawned pane must have a valid fd");
+        assert!(pane.pid > 0, "a real spawned pane must have a valid pid");
+        assert_eq!(
+            restored.pty_fds().collect::<Vec<_>>(),
+            vec![pane.fd],
+            "pty_fds() must surface exactly the fd prepare_reload needs to clear FD_CLOEXEC on"
+        );
+        assert_eq!(restored.next_server_short_id, 1);
+    }
+
+    #[test]
+    fn to_resume_carries_workspaces_and_counters_across_json() {
+        let mut state = State::new();
+        let sp = spawn_pane(&mut state, "in-a-workspace");
+        let (ws, pane) = workspace_with_bound_pane(&mut state, "1", sp);
+
+        let resume = state.to_resume();
+        let json = serde_json::to_vec(&resume).unwrap();
+        let restored: ResumeState = serde_json::from_slice(&json).unwrap();
+
+        assert_eq!(restored.workspaces.len(), 1);
+        assert_eq!(restored.workspaces[0].id, ws);
+        let tree = restored.workspaces[0].tree.as_ref().unwrap();
+        assert_eq!(tree.find(pane).unwrap().id, pane);
+        // One pane spawned above -- the counter that assigns the *next*
+        // short id must carry the same value across the round-trip, or
+        // a pane spawned right after a real reload could collide with
+        // (or, per PR #39's fix, sort out of true spawn order relative
+        // to) one that already existed before it.
+        assert_eq!(restored.next_server_short_id, 1);
     }
 
     #[test]

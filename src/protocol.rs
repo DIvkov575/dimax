@@ -504,6 +504,19 @@ pub enum Request {
         text: String,
         enter: bool,
     },
+    /// Re-exec the daemon's own process image in place, on whatever
+    /// binary `current_exe()` resolves to right now, without killing any
+    /// server-pane -- see `daemon::mod`'s "Hot reload" module doc for the
+    /// full mechanism (fd inheritance across `execve`, not a restart).
+    /// `Ack` means the daemon *attempted* the re-exec, not that it
+    /// necessarily succeeded: a successful `execve` never returns, so
+    /// there is no way to report success after the fact over this same
+    /// connection -- the `Ack` is sent immediately before attempting it.
+    /// If `execve` itself fails (e.g. the binary vanished), the original
+    /// process survives and logs the error, but any caller already
+    /// treated this as a success. Callers should re-fetch `ServerList`
+    /// afterward to confirm the daemon actually came back.
+    DaemonReload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

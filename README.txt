@@ -209,3 +209,26 @@ CLI session control includes:
     dimax server read <name>
     dimax server rename <name> <new-name>
     dimax server kill <name>
+
+Hot reload
+----------
+
+    dimax daemon reload
+
+Upgrades the running daemon onto whatever binary is currently installed
+(after a `cargo install`/rebuild), without killing any server-pane -- a
+plain restart tears down every PTY the old process owned, since a shell's
+controlling terminal dies with the process holding its master fd. Instead
+the daemon re-executes its own process image in place (same pid), carrying
+every server-pane's PTY and every attached client's connection to the
+listening socket across the transition; the shells inside never notice.
+
+Already-attached `dimax attach` clients see their individual connection
+drop for a moment and silently reconnect -- the same client-side retry
+that recovers from a daemon crash, just faster in practice, since the new
+process image is usually listening again within milliseconds.
+
+`Ack` from this command means the daemon *attempted* the reload, not that
+it necessarily succeeded -- a successful re-exec never returns, so there's
+no way to confirm success back over the same connection. Run `dimax server
+ls` afterward if you want to check.
