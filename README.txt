@@ -278,7 +278,9 @@ CLI session control includes:
 recognized AI-coding CLI tool, `-` otherwise. This is a stable tag (see
 `daemon::state`/`term::session_name` in the source), not something a
 caller needs to re-derive by pattern-matching the `process` column
-itself.
+itself. The same tag shows up as a `[claude]`/`[codex]`/etc. marker in
+the attach menu's row list, so a recognized session stands out at a
+glance there too.
 
 Client-panes and workspaces (the TUI's grid) are also fully scriptable:
 

@@ -9,6 +9,7 @@
 
 use crate::protocol::{
     self, ClientPane, Request, Response, ServerMessage, ServerPaneInfo, ServerPaneStatus,
+    SessionKind,
 };
 use tokio::net::UnixStream;
 
@@ -349,7 +350,7 @@ fn format_server_pane_line(info: &ServerPaneInfo) -> String {
         .foreground
         .as_ref()
         .and_then(|f| f.session_kind)
-        .map_or("-".to_string(), |k| format!("{k:?}").to_lowercase());
+        .map_or("-", SessionKind::as_str);
     format!(
         "{}\t{}\t{}\t{}x{}\t{}\t{}\t{}",
         info.id, name, status, info.size.rows, info.size.cols, process, cwd, kind

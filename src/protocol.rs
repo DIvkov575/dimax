@@ -303,6 +303,23 @@ pub enum SessionKind {
     Herdr,
 }
 
+impl SessionKind {
+    /// Lowercase tool name, matching `term::session_name::classify`'s
+    /// own matching strings -- the one place this mapping is spelled
+    /// out, so `dimax server ls`'s `kind` column and the attach menu's
+    /// `[kind]` tag (see `tui::render::attach_menu_line`) can't drift
+    /// out of sync with each other.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Opencode => "opencode",
+            Self::Omp => "omp",
+            Self::Herdr => "herdr",
+        }
+    }
+}
+
 /// One screen cell. Kept intentionally simple for v1 — enough styling to
 /// render legibly, not a full terminal-attribute model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
