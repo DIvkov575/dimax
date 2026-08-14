@@ -3078,10 +3078,30 @@ pub async fn run() -> anyhow::Result<()> {
                         // real garbage on screen until something else
                         // forces a full repaint -- a terminal resize does
                         // this today, which is the "fiddling" a user
-                        // shouldn't have to do. `clear()` invalidates the
-                        // cache so the very next `draw()` rewrites every
-                        // cell unconditionally.
-                        terminal.clear()?;
+                        // shouldn't have to do.
+                        //
+                        // Deliberately `resize(size)`, NOT `terminal.
+                        // clear()`: `Terminal::clear()` snapshots and
+                        // restores the cursor position, which for a
+                        // `CrosstermBackend` means calling `crossterm::
+                        // cursor::position()` -- that writes `ESC[6n` and
+                        // then blocks on *crossterm's own* internal event
+                        // reader for the terminal's reply. This module
+                        // deliberately reads raw stdin itself instead of
+                        // going through crossterm's event system (see the
+                        // module doc "Raw stdin reads, not crossterm's
+                        // KeyEvents"), so that reply is never delivered to
+                        // crossterm's reader -- `cursor::position()` always
+                        // times out after 2s and surfaces as "Error: The
+                        // cursor position could not be read within a
+                        // normal duration", killing this loop via the `?`
+                        // below on every single reconnect. `resize` forces
+                        // the same full-redraw invalidation via `clear_
+                        // viewport` internally, but for a `Viewport::
+                        // Fullscreen` terminal (what `try_init` sets up)
+                        // it never touches cursor position at all.
+                        let size = terminal.size()?;
+                        terminal.resize(size.into())?;
                         continue;
                     }
                 }
