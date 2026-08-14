@@ -307,11 +307,12 @@ struct RenameState {
 }
 
 /// Live edit state for a group's "+ spawn new in <dir>" row, opened by
-/// typing any printable character while that row is selected (see
-/// `App::handle_attach_menu_input`'s browse-mode dispatch — this is not
+/// pressing space while that row is selected (see `App::
+/// handle_attach_menu_input`'s browse-mode dispatch — this is not
 /// reached via `AttachMenuAction`/`parse_attach_menu_input` like
-/// `StartRename` is, since *any* printable byte opens it, not one
-/// dedicated key). `group_server_index` is the same first-member index
+/// `StartRename` is, since space opens it directly rather than through
+/// a dedicated `AttachMenuAction` variant). `group_server_index` is the
+/// same first-member index
 /// `AttachMenuRow::SpawnNewInGroup` carries, from which the group's cwd
 /// key (`servers[group_server_index].0`) is looked up when the field is
 /// confirmed. `text`/`cursor`/`error` mirror `RenameState` exactly and
@@ -1109,13 +1110,15 @@ impl App {
         // dispatch, distinct from every other row's: only Up/Down
         // (arrows or `j`/`k`) still navigate away from it; Enter/Esc
         // keep their usual meaning (spawn now with no typed command /
-        // close the menu); anything else -- including `x` and `r`,
-        // which are dedicated actions on a *server* row but have
-        // nothing to act on here -- is treated as the first character
-        // of a command to type into the new pane, opening this row's
-        // inline field with it as the starting text. No separate "enter
-        // input mode" key, per this field's whole point: a text box
-        // that happens to be a menu row.
+        // close the menu); a literal space opens this row's inline
+        // field, empty, ready to type a command into. Everything else
+        // -- `x`/`r`/`p`/`a`/`f`/`g`/`d`/`q` included -- falls through to
+        // the normal action dispatch below rather than being swallowed
+        // as the first character of a typed command: those are the
+        // menu's filter/pin/detach toggles, and a user pressing one of
+        // them while a spawn row happens to be selected (easy to land
+        // on, e.g. a lone-pane group's only other row) expects it to
+        // toggle the filter, not silently open a text field instead.
         if let Some(AttachMenuRow::SpawnNewInGroup(server_index)) = self.selected_attach_menu_row()
         {
             match bytes {
@@ -1123,21 +1126,24 @@ impl App {
                 b"\x1b[B" | b"j" => self.move_attach_menu_selection(true),
                 b"\r" | b"\n" => self.confirm_attach_menu(write_half, reader).await?,
                 b"\x1b" => self.attach_menu = None,
-                _ if bytes.first() == Some(&0x1b) => {
-                    // An unrecognized escape sequence -- ignore rather
-                    // than open the field with garbage bytes as content.
-                }
-                _ => {
-                    if let Ok(text) = std::str::from_utf8(bytes)
-                        && let Some(menu) = &mut self.attach_menu
-                    {
+                b" " => {
+                    if let Some(menu) = &mut self.attach_menu {
                         menu.spawn_in_group = Some(SpawnInGroupState {
                             group_server_index: server_index,
-                            text: text.to_string(),
-                            cursor: text.len(),
+                            text: String::new(),
+                            cursor: 0,
                             error: None,
                         });
                     }
+                }
+                _ => {
+                    return self
+                        .dispatch_attach_menu_action(
+                            parse_attach_menu_input(bytes),
+                            write_half,
+                            reader,
+                        )
+                        .await;
                 }
             }
             return Ok(false);
@@ -5996,6 +6002,9 @@ mod tests {
         let existing_id = existing.id;
         open_menu_with_one_group(&mut app, "/tmp", existing);
 
+        app.handle_attach_menu_input(b" ", &mut write_half, &mut reader)
+            .await
+            .unwrap();
         app.handle_attach_menu_input(b"echo hi", &mut write_half, &mut reader)
             .await
             .unwrap();
@@ -6008,7 +6017,7 @@ mod tests {
                 .unwrap()
                 .text,
             "echo hi",
-            "typing while the spawn-in-group row is selected should open its field with that text"
+            "space should open the field, then typing should fill it"
         );
 
         app.handle_attach_menu_input(b"\r", &mut write_half, &mut reader)
@@ -6114,6 +6123,9 @@ mod tests {
         let existing_id = existing.id;
         open_menu_with_one_group(&mut app, "/tmp", existing);
 
+        app.handle_attach_menu_input(b" ", &mut write_half, &mut reader)
+            .await
+            .unwrap();
         app.handle_attach_menu_input(b"echo unbound-test", &mut write_half, &mut reader)
             .await
             .unwrap();
@@ -6257,6 +6269,54 @@ mod tests {
             "up-arrow should move back"
         );
         assert!(app.attach_menu.as_ref().unwrap().spawn_in_group.is_none());
+    }
+
+    /// A filter/action key (`f`, here) pressed while a spawn-in-group row
+    /// happens to be selected must still toggle the filter -- before the
+    /// space-to-open fix, any non-navigation byte on this row opened the
+    /// typed-command field instead, silently swallowing the very keys a
+    /// user would press to fix an attach menu that isn't showing the
+    /// panes they expect (this is exactly the bug report that prompted
+    /// the fix: landing on a lone-pane group's spawn row and pressing a
+    /// filter key did nothing visible).
+    #[tokio::test]
+    async fn spawn_in_group_row_still_dispatches_filter_and_action_keys() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+        let Response::ServerPane(existing) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: Some("/tmp".to_string()),
+                    workspace: None,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        open_menu_with_one_group(&mut app, "/tmp", existing);
+        assert_eq!(
+            app.selected_attach_menu_row(),
+            Some(AttachMenuRow::SpawnNewInGroup(0))
+        );
+        let before = app.agents_only_view;
+
+        app.handle_attach_menu_input(b"f", &mut write_half, &mut reader)
+            .await
+            .unwrap();
+
+        assert!(
+            app.attach_menu.as_ref().unwrap().spawn_in_group.is_none(),
+            "`f` must not open the spawn field"
+        );
+        assert_eq!(
+            app.agents_only_view, !before,
+            "`f` must still toggle agents-only even though a spawn row was selected"
+        );
     }
 
     /// `refresh_attach_menu_preview` fetches the selected server-pane's
