@@ -434,7 +434,22 @@ fn place_cursor(frame: &mut Frame, snapshot: &GridSnapshot, inner: Rect) {
 }
 
 /// Convert a `GridSnapshot`'s row-major cell grid into a `ratatui::Text`,
-/// one `Line` per row and one styled `Span` per `Cell`.
+/// one `Line` per row. Adjacent cells that resolve to the exact same
+/// `Style` are merged into a single `Span` covering their combined text
+/// rather than emitting one `Span` per `Cell` -- ratatui applies a
+/// `Span`'s style to every character it contains regardless of how many
+/// there are, so this changes nothing about what ends up on screen, only
+/// how many `Span`/`String` allocations it costs to get there. Typical
+/// terminal output is runs of identically-styled plain text (a whole
+/// line of default-color shell output collapses to one `Span` instead
+/// of one per character), which is where most of a large pane's render
+/// cost was going -- measured at ~600µs for an 85x246 grid's worth of
+/// individually-allocated single-character `Span`s before this change,
+/// on every `terminal.draw()` call for every leaf currently visible,
+/// not just the one whose content actually changed since the last frame
+/// (see `draw_tree`'s doc comment -- there's no per-leaf dirty-tracking,
+/// so this cost is paid by every visible pane on every frame regardless
+/// of which pane's `GridDelta` triggered it).
 fn grid_to_text(
     snapshot: &GridSnapshot,
     selection: Option<&super::selection::TextSelection>,
@@ -443,24 +458,39 @@ fn grid_to_text(
         .lines
         .iter()
         .enumerate()
-        .map(|(row_index, row)| {
-            let spans: Vec<Span<'static>> = row
-                .iter()
-                .enumerate()
-                .map(|(col_index, cell)| {
-                    cell_to_span(
-                        cell,
-                        selection.is_some_and(|selection| selection.contains(row_index, col_index)),
-                    )
-                })
-                .collect();
-            Line::from(spans)
-        })
+        .map(|(row_index, row)| row_to_line(row, row_index, selection))
         .collect();
     Text::from(lines)
 }
 
-fn cell_to_span(cell: &Cell, selected: bool) -> Span<'static> {
+fn row_to_line(
+    row: &[Cell],
+    row_index: usize,
+    selection: Option<&super::selection::TextSelection>,
+) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run_text = String::new();
+    let mut run_style: Option<Style> = None;
+    for (col_index, cell) in row.iter().enumerate() {
+        let selected = selection.is_some_and(|selection| selection.contains(row_index, col_index));
+        let style = cell_style(cell, selected);
+        match run_style {
+            Some(current) if current == style => run_text.push_str(&cell.text),
+            _ => {
+                if let Some(current) = run_style.replace(style) {
+                    spans.push(Span::styled(std::mem::take(&mut run_text), current));
+                }
+                run_text.push_str(&cell.text);
+            }
+        }
+    }
+    if let Some(style) = run_style {
+        spans.push(Span::styled(run_text, style));
+    }
+    Line::from(spans)
+}
+
+fn cell_style(cell: &Cell, selected: bool) -> Style {
     let mut style = Style::new();
     if let Some((r, g, b)) = cell.fg {
         style = style.fg(Color::Rgb(r, g, b));
@@ -488,7 +518,7 @@ fn cell_to_span(cell: &Cell, selected: bool) -> Span<'static> {
             .fg(Color::White)
             .bg(Color::Rgb(70, 110, 170));
     }
-    Span::styled(cell.text.clone(), style)
+    style
 }
 
 /// Fixed row count of the attach menu's preview panel (see
@@ -905,6 +935,80 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
         content.contains(needle)
+    }
+
+    /// `grid_to_text` merges adjacent identically-styled cells into one
+    /// `Span` rather than emitting one per `Cell` (see its doc comment
+    /// for why -- ratatui applies a `Span`'s style to every character it
+    /// contains, so this is purely a render-cost optimization with no
+    /// visible effect). Three cells, two styles: "ab" plain, "c" colored
+    /// -- must produce exactly two spans, not three, with "ab" merged
+    /// into a single `Span` rather than staying as two.
+    #[test]
+    fn grid_to_text_merges_adjacent_cells_with_identical_style() {
+        let snapshot = GridSnapshot {
+            server_pane: Uuid::new_v4(),
+            size: Size { rows: 1, cols: 3 },
+            cursor: (0, 0),
+            lines: vec![vec![
+                simple_cell("a"),
+                simple_cell("b"),
+                Cell {
+                    text: "c".to_string(),
+                    fg: Some((80, 200, 120)),
+                    bg: None,
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                    reverse: false,
+                },
+            ]],
+            scroll_offset: 0,
+        };
+
+        let text = grid_to_text(&snapshot, None);
+        assert_eq!(text.lines.len(), 1);
+        let spans = &text.lines[0].spans;
+        assert_eq!(
+            spans.len(),
+            2,
+            "expected \"ab\" merged into one span and \"c\" as a second, distinctly-styled span: {spans:?}"
+        );
+        assert_eq!(spans[0].content, "ab");
+        assert_eq!(spans[1].content, "c");
+    }
+
+    /// A style change caused purely by text selection (not by the cells'
+    /// own styling) must still break the merge -- otherwise a selected
+    /// run touching identically-styled unselected text on either side
+    /// would incorrectly merge its highlight into neighboring cells.
+    #[test]
+    fn grid_to_text_breaks_merge_at_a_selection_boundary() {
+        let snapshot = GridSnapshot {
+            server_pane: Uuid::new_v4(),
+            size: Size { rows: 1, cols: 3 },
+            cursor: (0, 0),
+            lines: vec![vec![simple_cell("a"), simple_cell("b"), simple_cell("c")]],
+            scroll_offset: 0,
+        };
+        let pane_id = Uuid::new_v4();
+        let mut selection = super::super::selection::TextSelection::new(
+            pane_id,
+            snapshot.server_pane,
+            super::super::selection::GridPosition { row: 0, col: 1 },
+        );
+        selection.finish(super::super::selection::GridPosition { row: 0, col: 1 });
+
+        let text = grid_to_text(&snapshot, Some(&selection));
+        let spans = &text.lines[0].spans;
+        assert_eq!(
+            spans.len(),
+            3,
+            "\"a\" | \"b\" (selected) | \"c\" must stay three distinct spans: {spans:?}"
+        );
+        assert_eq!(spans[0].content, "a");
+        assert_eq!(spans[1].content, "b");
+        assert_eq!(spans[2].content, "c");
     }
 
     /// Reconstruct one row of `terminal`'s backend buffer as a plain
