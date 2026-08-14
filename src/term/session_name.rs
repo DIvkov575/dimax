@@ -66,6 +66,29 @@ pub fn classify(process_name: &str) -> Option<SessionKind> {
     None
 }
 
+/// Extends [`classify`] to also check `cmd`'s arguments for a recognized
+/// tool's script/binary path -- needed because some tools are invoked
+/// through a runtime whose own name is what the OS (and so `sysinfo`)
+/// reports as the process name, not the tool's. omp is exactly this: a
+/// bun script (`~/.bun/bin/omp`), so `ServerPane::foreground_info`'s
+/// `process_name` is `"bun"` for every omp session, and `classify("bun")`
+/// correctly (for every *other* bun-run process) returns `None` --
+/// `classify` alone can never recognize omp as a result, regardless of
+/// what's actually running. Checks `process_name` first (the common,
+/// cheap case -- most recognized tools *are* the reported process name),
+/// only scanning `cmd`'s argument basenames if that alone didn't match,
+/// so an ordinary `bun`/`node`/`python` invocation unrelated to any
+/// recognized tool costs nothing beyond the one failed `classify` call.
+pub fn classify_with_cmd(process_name: &str, cmd: &[std::ffi::OsString]) -> Option<SessionKind> {
+    if let Some(kind) = classify(process_name) {
+        return Some(kind);
+    }
+    cmd.iter().find_map(|arg| {
+        let basename = Path::new(arg).file_name()?.to_str()?;
+        classify(basename)
+    })
+}
+
 /// Look up a display name for the CLI session running as `cmd` (the
 /// foreground process's full command line, `argv[0]` first) with
 /// current directory `cwd`. Returns `None` if `cmd` isn't recognized as
@@ -99,25 +122,29 @@ fn derive_session_name_under(cmd: &[String], cwd: &str, home: &Path) -> Option<S
 /// Tools recognized purely by their binary name, each just named after
 /// itself -- see the module doc comment for why these don't get a
 /// transcript-derived title the way Claude Code and Codex do.
+///
+/// Checks every element of `cmd`, not just `cmd[0]` -- omp is invoked as
+/// a bun script (`bun ~/.bun/bin/omp`), so `argv[0]` is `"bun"`, with the
+/// tool's own name only showing up as a later argument. Scanning the
+/// whole command line still finds it (and everything else, which is
+/// invoked directly and so matches on the first element same as before).
 fn named_by_binary_only(cmd: &[String]) -> Option<&'static str> {
-    let arg0 = cmd.first()?;
-    let file_name = Path::new(arg0)
-        .file_name()?
-        .to_string_lossy()
-        .to_lowercase();
-    if file_name.contains("opencode") {
-        return Some("opencode");
-    }
-    // "omp" is short enough that a substring match would false-positive
-    // on unrelated binaries (e.g. "compass" contains "omp") -- exact
-    // match only.
-    if file_name == "omp" {
-        return Some("omp");
-    }
-    if file_name.contains("herdr") {
-        return Some("herdr");
-    }
-    None
+    cmd.iter().find_map(|arg| {
+        let file_name = Path::new(arg).file_name()?.to_string_lossy().to_lowercase();
+        if file_name.contains("opencode") {
+            return Some("opencode");
+        }
+        // "omp" is short enough that a substring match would
+        // false-positive on unrelated binaries (e.g. "compass" contains
+        // "omp") -- exact match only.
+        if file_name == "omp" {
+            return Some("omp");
+        }
+        if file_name.contains("herdr") {
+            return Some("herdr");
+        }
+        None
+    })
 }
 
 /// `true` if `cmd`'s first element looks like a Claude Code CLI
@@ -435,6 +462,36 @@ mod tests {
         assert_eq!(classify("bash"), None);
         assert_eq!(classify("vim"), None);
         assert_eq!(classify(""), None);
+    }
+
+    #[test]
+    fn classify_with_cmd_recognizes_omp_run_through_bun() {
+        // omp's real invocation: the OS-reported process name is "bun"
+        // (the runtime), with the omp script's path as an argument --
+        // `classify` alone can never see "omp" here.
+        let cmd = [
+            std::ffi::OsString::from("bun"),
+            std::ffi::OsString::from("/Users/dev/.bun/bin/omp"),
+        ];
+        assert_eq!(classify_with_cmd("bun", &cmd), Some(SessionKind::Omp));
+    }
+
+    #[test]
+    fn classify_with_cmd_does_not_misclassify_an_unrelated_bun_script() {
+        let cmd = [
+            std::ffi::OsString::from("bun"),
+            std::ffi::OsString::from("--watch"),
+            std::ffi::OsString::from("/Users/dev/project/server.ts"),
+        ];
+        assert_eq!(classify_with_cmd("bun", &cmd), None);
+    }
+
+    #[test]
+    fn classify_with_cmd_prefers_the_process_name_when_it_already_matches() {
+        // A directly-invoked tool never needs the cmd fallback at all --
+        // covers the common, cheap path staying cheap.
+        let cmd = [std::ffi::OsString::from("claude")];
+        assert_eq!(classify_with_cmd("claude", &cmd), Some(SessionKind::Claude));
     }
 
     #[test]
@@ -779,6 +836,20 @@ mod tests {
     fn named_by_binary_only_none_for_unrelated_commands() {
         assert_eq!(named_by_binary_only(&["bash".to_string()]), None);
         assert_eq!(named_by_binary_only(&[]), None);
+    }
+
+    #[test]
+    fn named_by_binary_only_finds_omp_run_through_bun() {
+        // omp's real invocation: `argv[0]` is "bun" (the runtime), with
+        // the omp script's path as a later argument.
+        assert_eq!(
+            named_by_binary_only(&["bun".to_string(), "/Users/dev/.bun/bin/omp".to_string()]),
+            Some("omp")
+        );
+        assert_eq!(
+            named_by_binary_only(&["bun".to_string(), "server.ts".to_string()]),
+            None
+        );
     }
 
     #[test]
