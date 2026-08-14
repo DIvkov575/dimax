@@ -1338,10 +1338,17 @@ impl App {
         }
     }
 
-    /// `p` on a group header: pin the directory if it isn't pinned yet,
-    /// unpin it if it is (see `state::State::toggle_pinned_dir`'s doc
-    /// comment for the exact ordering rule). A no-op on any other row --
-    /// there's no directory to pin from a server/spawn/spawn-new row.
+    /// `p` on a group header, or on a server row: pin that row's
+    /// directory if it isn't pinned yet, unpin it if it is (see
+    /// `state::State::toggle_pinned_dir`'s doc comment for the exact
+    /// ordering rule). Both row kinds carry the same group-key index
+    /// into `menu.servers` (see `AttachMenuRow::Server`/`GroupHeader`'s
+    /// own doc comments), so a server row works identically to its
+    /// group's header -- the only way to pin at all in the flat/
+    /// ungrouped view (`App.grouped_view`), which has no header rows.
+    /// A no-op on a spawn/spawn-new row -- neither carries a directory
+    /// of its own to pin (`SpawnNewInGroup` carries one, but that row's
+    /// own dispatch never reaches here -- see `handle_attach_menu_input`).
     /// Re-fetches and re-groups the server list afterward since pin
     /// order can move every group's position, not just the toggled
     /// one's, then clamps `selected` the same way `toggle_group_collapse`
@@ -1352,8 +1359,11 @@ impl App {
         write_half: &mut OwnedWriteHalf,
         reader: &mut FrameReader,
     ) -> anyhow::Result<()> {
-        let Some(AttachMenuRow::GroupHeader(server_index)) = self.selected_attach_menu_row() else {
-            return Ok(());
+        let server_index = match self.selected_attach_menu_row() {
+            Some(
+                AttachMenuRow::GroupHeader(server_index) | AttachMenuRow::Server(server_index),
+            ) => server_index,
+            _ => return Ok(()),
         };
         let Some(menu) = &self.attach_menu else {
             return Ok(());
@@ -6743,15 +6753,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir_z);
     }
 
-    /// `toggle_directory_pin` on a non-header row must be a genuine
-    /// no-op: no request sent (verified indirectly -- if a request had
-    /// been sent, this daemon has nothing pinned, and `app.pinned_dirs`
-    /// would be mutated by the response handling either way, so
-    /// asserting it's still empty after calling this on a `Server` row
+    /// `p` on a `Server` row must pin that row's own directory, exactly
+    /// as if its group's header had been selected instead -- the only
+    /// way to pin at all while `App.grouped_view` is off (see
+    /// `toggle_directory_pin`'s doc comment), since the flat view has no
+    /// header rows to select in the first place.
+    #[tokio::test]
+    async fn toggle_directory_pin_on_a_server_row_pins_its_group() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "dmx-am-pin-server-row-config-{}",
+            std::process::id()
+        ));
+        let _guard = PIN_ENV_LOCK.lock().await;
+        let (mut app, mut write_half, mut reader) =
+            app_against_real_daemon_with_fake_pin_config(&config_dir).await;
+
+        let dir =
+            std::env::temp_dir().join(format!("dmx-am-pin-server-row-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let Response::ServerPane(existing) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: Some(dir.to_str().unwrap().to_string()),
+                    workspace: None,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        let resolved = existing
+            .foreground
+            .as_ref()
+            .and_then(|f| f.cwd.clone())
+            .expect("cwd should resolve for `cat`");
+        open_menu_with_one_group(&mut app, &resolved, existing);
+        app.attach_menu.as_mut().unwrap().selected = 1; // the server row, not the header
+        assert_eq!(
+            app.selected_attach_menu_row(),
+            Some(AttachMenuRow::Server(0))
+        );
+
+        app.toggle_directory_pin(&mut write_half, &mut reader)
+            .await
+            .unwrap();
+
+        assert_eq!(app.pinned_dirs, vec![resolved]);
+
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&config_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `toggle_directory_pin` on the trailing generic `SpawnNew` row
+    /// must stay a genuine no-op: it carries no group index at all, so
+    /// there is no directory to pin from it (verified indirectly -- if a
+    /// request had been sent, this daemon has nothing pinned, and
+    /// `app.pinned_dirs` would be mutated by the response handling
+    /// either way, so asserting it's still empty after calling this
     /// confirms the early-return path, not just "nothing happened to
     /// look at").
     #[tokio::test]
-    async fn toggle_directory_pin_on_a_non_header_row_is_a_no_op() {
+    async fn toggle_directory_pin_on_the_spawn_new_row_is_a_no_op() {
         let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
         let Response::ServerPane(existing) = app
             .request(
@@ -6770,10 +6840,10 @@ mod tests {
             panic!("expected ServerPane");
         };
         open_menu_with_one_group(&mut app, "/tmp", existing);
-        app.attach_menu.as_mut().unwrap().selected = 1; // the server row, not the header
+        app.attach_menu.as_mut().unwrap().selected = 3; // header(0), server(1), spawn-in-group(2), spawn-new(3)
         assert_eq!(
             app.selected_attach_menu_row(),
-            Some(AttachMenuRow::Server(0))
+            Some(AttachMenuRow::SpawnNew)
         );
 
         app.toggle_directory_pin(&mut write_half, &mut reader)
@@ -6781,7 +6851,7 @@ mod tests {
             .unwrap();
         assert!(
             app.pinned_dirs.is_empty(),
-            "toggling on a non-header row must not pin anything"
+            "toggling on the spawn-new row must not pin anything"
         );
     }
 }

@@ -408,6 +408,12 @@ impl ServerPane {
     /// itself. That PID is then looked up via `sysinfo` for its command
     /// name and working directory.
     ///
+    /// `session_kind` uses [`session_name::classify_with_cmd`], not just
+    /// [`session_name::classify`], on `process_name` alone -- some tools
+    /// (omp) are invoked through a runtime whose own name is what the OS
+    /// reports, e.g. `"bun"` for every omp session, not `"omp"` itself;
+    /// see that function's doc comment.
+    ///
     /// Returns `None` if there's no foreground process to query (a
     /// `Dead` pane, or the OS call itself failing) or the PID can no
     /// longer be found in the process table (a race between the lookup
@@ -429,7 +435,7 @@ impl ServerPane {
         );
         let process = system.process(sysinfo_pid)?;
         let process_name = process.name().to_string_lossy().into_owned();
-        let session_kind = session_name::classify(&process_name);
+        let session_kind = session_name::classify_with_cmd(&process_name, process.cmd());
 
         Some(ForegroundProcessInfo {
             process_name,

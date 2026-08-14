@@ -320,8 +320,11 @@ Directory pinning
 ------------------
 
 The attach menu groups server-panes by working directory; a pinned
-directory always sorts first. Pinning is scriptable, not just reachable
-via the attach menu's `p` key:
+directory always sorts first. `p` pins/unpins the directory of whichever
+row is currently selected -- a group header if the menu is in its
+grouped view, or a server-pane row directly if `g` has toggled grouping
+off, so pinning works the same way in either view. Pinning is
+scriptable, not just reachable via the attach menu's `p` key:
 
     dimax pin add <dir>
     dimax pin remove <dir>
