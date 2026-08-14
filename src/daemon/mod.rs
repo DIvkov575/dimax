@@ -1110,21 +1110,24 @@ struct GridBroadcast {
 ///
 /// Must be called with the state lock held (it needs `state.server_pane`/
 /// `subscribers_for_server_pane`), but is itself fast — `ServerPane::
-/// snapshot()` is a plain cell-grid walk-and-clone, measured at ~2ms for
-/// a 50x200 pane. Returns `None` immediately, without touching the grid
-/// at all, if nobody is subscribed — a pane nobody is currently viewing
-/// (e.g. producing background scroll in an unwatched workspace) should
-/// cost nothing, not even a wasted snapshot.
+/// snapshot()` is a plain cell-grid walk-and-clone. Returns `None`
+/// immediately, without touching the grid at all, if nobody is
+/// subscribed — a pane nobody is currently viewing (e.g. producing
+/// background scroll in an unwatched workspace) should cost nothing, not
+/// even a wasted snapshot.
 ///
 /// Deliberately does NOT serialize the snapshot to `ServerMessage`'s
 /// wire bytes here — that's `broadcast_grid_send`'s job, called only
 /// after the caller has released the state lock. Serializing a full grid
-/// to JSON is the actually expensive step (~22ms measured for the same
-/// 50x200 pane, roughly 10x the snapshot itself) — doing it while every
-/// other request in the daemon is blocked on the same global lock is
-/// what caused dimax to visibly freeze (stop responding to keystrokes in
-/// any other pane) whenever a watched pane produced output rapidly
-/// enough (e.g. an animated startup banner).
+/// to JSON is the more expensive step of the two (~1.8ms measured for an
+/// 85x246 pane in a release build — `cargo test`'s default debug build
+/// measures roughly 30x higher than this and does not reflect what the
+/// installed daemon binary actually costs; always re-measure with
+/// `cargo test --release` before trusting a number here) — doing it
+/// while every other request in the daemon is blocked on the same global
+/// lock is what caused dimax to visibly freeze (stop responding to
+/// keystrokes in any other pane) whenever a watched pane produced output
+/// rapidly enough (e.g. an animated startup banner).
 fn broadcast_grid_prepare(state: &State, server_pane: ServerPaneId) -> Option<GridBroadcast> {
     let subscribers = state.subscribers_for_server_pane(server_pane);
     if subscribers.is_empty() {
@@ -2630,11 +2633,12 @@ mod tests {
     /// server-pane producing rapid output must not block an UNRELATED
     /// request on a separate connection. Before the
     /// `broadcast_grid_prepare`/`broadcast_grid_send` split, every
-    /// `Changed` event serialized the busy pane's grid to JSON (measured
-    /// at ~22ms for a modest 50x200 pane) while holding the daemon's one
-    /// global state lock -- a fast-scrolling pane could keep that lock
-    /// saturated closely enough to starve every other request, which is
-    /// what made typing in an unrelated pane appear to freeze.
+    /// `Changed` event serialized the busy pane's grid to JSON (a few ms
+    /// per event even in a release build, for a large pane -- see
+    /// `broadcast_grid_prepare`'s doc comment) while holding the daemon's
+    /// one global state lock -- a fast-scrolling pane could keep that
+    /// lock saturated closely enough to starve every other request,
+    /// which is what made typing in an unrelated pane appear to freeze.
     #[tokio::test]
     async fn busy_watched_pane_does_not_starve_unrelated_requests() {
         let guard = start_daemon().await;
@@ -2708,7 +2712,7 @@ mod tests {
 
         // Generous bound: each of these 10 requests should complete in
         // well under a second combined on any reasonable machine once
-        // they're not queueing behind a busy pane's own ~22ms-per-event
+        // they're not queueing behind a busy pane's own per-event
         // serialize-while-locked cost repeated many times a second. This
         // is deliberately loose (not asserting a tight ms bound, which
         // would be flaky across machines/CI) -- it exists to catch a
