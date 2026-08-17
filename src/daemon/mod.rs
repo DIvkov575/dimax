@@ -64,6 +64,7 @@
 //! must reconnect (see `tui::mod`'s reconnect loop).
 
 pub mod pinned_dirs;
+pub mod session_persistence;
 pub mod state;
 
 use crate::protocol::{
@@ -106,9 +107,28 @@ pub struct Daemon {
 /// fallback for the crash case this handler can't catch. Used both by
 /// `dimax attach`'s auto-spawn path and directly by integration tests
 /// with a temp path.
-pub async fn run(socket_path: std::path::PathBuf) -> anyhow::Result<Daemon> {
+///
+/// `enable_session_persistence` gates `session_persistence`'s whole
+/// feature (module doc for the full rationale): `true` restores
+/// whatever recognized sessions the last unclean shutdown left behind
+/// and starts the periodic on-disk snapshot task in [`start`]; `false`
+/// skips both entirely. Every real caller (`main.rs`) passes `true`;
+/// every test-only caller passes `false` deliberately -- these spin up
+/// throwaway daemons against the developer's *real* `$HOME`/
+/// `$XDG_CONFIG_HOME` (no fake path, unlike `pinned_dirs`' own
+/// dedicated tests), so leaving this enabled by default would have
+/// every test run silently spawn real processes from -- and overwrite
+/// -- whatever the user's actual daemon had legitimately persisted.
+pub async fn run(
+    socket_path: std::path::PathBuf,
+    enable_session_persistence: bool,
+) -> anyhow::Result<Daemon> {
     let listener = bind_socket(&socket_path).await?;
-    start(State::new(), listener, socket_path)
+    let mut state = State::new();
+    if enable_session_persistence {
+        state.restore_sessions_from_disk();
+    }
+    start(state, listener, socket_path, enable_session_persistence)
 }
 
 /// The other side of a hot reload's `execve` (module doc "Hot reload"):
@@ -137,20 +157,28 @@ pub async fn run_resumed(
     std_listener.set_nonblocking(true)?;
     let listener = UnixListener::from_std(std_listener)?;
     let state = State::from_resume(file.state)?;
-    start(state, listener, socket_path)
+    // Always on: a resumed daemon is never a test daemon (see `run`'s
+    // doc comment) -- there's no throwaway-daemon-pollutes-real-`$HOME`
+    // risk to guard against here, and every pane this resumed already
+    // carries across via its live fd deserves the same crash-safety
+    // net going forward as one restored from scratch would.
+    start(state, listener, socket_path, true)
 }
 
 /// Shared tail of [`run`]/[`run_resumed`]: install the signal handler,
 /// spin up the grid-broadcast and accept-loop tasks. `state` is either
 /// freshly constructed or rebuilt from a resume snapshot; `listener` is
 /// either freshly bound or an inherited fd re-wrapped -- identical from
-/// here on either way.
+/// here on either way. `enable_session_persistence` (see [`run`]'s doc
+/// comment) additionally gates the periodic on-disk session-snapshot
+/// task started below.
 fn start(
     mut inner_state: State,
     listener: UnixListener,
     socket_path: std::path::PathBuf,
+    enable_session_persistence: bool,
 ) -> anyhow::Result<Daemon> {
-    spawn_cleanup_on_signal(socket_path.clone())?;
+    spawn_cleanup_on_signal(socket_path.clone(), enable_session_persistence)?;
     // Claim the pane-event stream exactly once, right here at start-up
     // (module doc / `state::State::take_pane_events` doc comment) — this
     // is the *only* caller, so `expect` is warranted: a `None` here would
@@ -197,6 +225,26 @@ fn start(
             }
         }
     });
+
+    // Periodic on-disk snapshot of every recognized-tool session (see
+    // `session_persistence`'s module doc) -- the safety net a genuine
+    // crash/power-loss needs, since nothing about that kind of death
+    // gives this process a chance to save anything on its way out
+    // (unlike `spawn_cleanup_on_signal`'s graceful-shutdown path, which
+    // instead *deletes* this same file). 30s bounds how stale the
+    // snapshot can be without costing anything noticeable -- this is a
+    // best-effort recovery aid, not a transactional log.
+    if enable_session_persistence {
+        let snapshot_state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                let sessions = snapshot_state.lock().await.restorable_sessions();
+                session_persistence::save(&sessions);
+            }
+        });
+    }
 
     let path_for_task = socket_path.clone();
     tokio::spawn(async move {
@@ -352,7 +400,18 @@ async fn bind_socket(socket_path: &Path) -> anyhow::Result<UnixListener> {
 /// background task that waits for either signal once, removes the file
 /// (best-effort — nothing further to do if that fails), and exits the
 /// process.
-fn spawn_cleanup_on_signal(socket_path: PathBuf) -> anyhow::Result<()> {
+///
+/// When `clear_session_persistence` is set, also deletes
+/// `session_persistence`'s snapshot file first -- a *graceful* shutdown
+/// reaching this handler at all is exactly the signal that the next
+/// fresh start should NOT auto-restore anything (see that module's doc
+/// comment): only a death that never reaches here (a crash, `SIGKILL`,
+/// real power loss) leaves the file behind, which is what makes finding
+/// it at the next start meaningful in the first place.
+fn spawn_cleanup_on_signal(
+    socket_path: PathBuf,
+    clear_session_persistence: bool,
+) -> anyhow::Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     tokio::spawn(async move {
@@ -361,6 +420,9 @@ fn spawn_cleanup_on_signal(socket_path: PathBuf) -> anyhow::Result<()> {
             _ = sigint.recv() => {}
         }
         let _ = std::fs::remove_file(&socket_path);
+        if clear_session_persistence {
+            session_persistence::clear();
+        }
         std::process::exit(0);
     });
     Ok(())
@@ -1196,7 +1258,12 @@ mod tests {
 
     async fn start_daemon() -> SocketGuard {
         let path = std::env::temp_dir().join(format!("dimax-test-{}.sock", Uuid::new_v4()));
-        run(path.clone())
+        // `false`: a test daemon runs against the developer's real
+        // `$HOME`/`$XDG_CONFIG_HOME` (no fake path, unlike `pinned_dirs`'
+        // own tests) -- enabling session persistence here would spawn
+        // real processes from, and overwrite, whatever the user's real
+        // daemon has actually persisted. See `run`'s doc comment.
+        run(path.clone(), false)
             .await
             .expect("daemon should bind and start");
         SocketGuard(path)
@@ -1225,7 +1292,8 @@ mod tests {
         );
 
         // A real daemon must still be able to start at this path.
-        run(path.clone())
+        // `false`: see `start_daemon`'s comment above.
+        run(path.clone(), false)
             .await
             .expect("daemon should clean up the stale file and bind");
 

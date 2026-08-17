@@ -14,7 +14,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(path) => {
                     dimax::daemon::run_resumed(dimax::protocol::socket_path(), path).await?
                 }
-                None => dimax::daemon::run(dimax::protocol::socket_path()).await?,
+                None => dimax::daemon::run(dimax::protocol::socket_path(), true).await?,
             };
             let _ = daemon;
             std::future::pending::<()>().await;

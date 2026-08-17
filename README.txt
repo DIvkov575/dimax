@@ -355,3 +355,39 @@ process image is usually listening again within milliseconds.
 it necessarily succeeded -- a successful re-exec never returns, so there's
 no way to confirm success back over the same connection. Run `dimax server
 ls` afterward if you want to check.
+
+Recovering from a crash or power loss
+--------------------------------------
+
+A hot reload survives on purpose -- it never actually stops the daemon
+process. An unclean death (a crash, `SIGKILL`, or the machine losing
+power) is different: every PTY and every process under it dies for
+real, along with anything about them the daemon held only in memory.
+There is no way to get that back -- no software can run code after
+the machine has actually lost power.
+
+What dimax does instead: every ~30s while the daemon runs, it saves a
+snapshot of every server-pane whose foreground process is a recognized
+AI-coding CLI tool (see the `kind` column above) -- just enough to
+re-launch the same tool in the same directory, not the pane's actual
+prior screen contents or conversation state, which are genuinely gone.
+Plain shells and editors aren't snapshotted; there's no "resume"
+concept worth re-launching for those, and restoring every idle shell
+that ever existed would be noise, not signal.
+
+If the next daemon start (after such a death) finds this snapshot, it
+re-spawns each described session as a fresh, unbound ("orphan") pane,
+picked up the same way any orphan pane is via the attach menu or
+`dimax server ls`. Most recognized tools have their own session-resume
+mechanism (e.g. `claude --continue`) that starting back up in the same
+directory puts back within reach.
+
+A *clean* shutdown (a normal `kill`/`Ctrl-C` to the daemon) deletes
+this snapshot on its way out, precisely so the next start doesn't
+mistake an intentional stop for a crash and resurrect sessions nobody
+wanted back.
+
+Workspace/client-pane layout (splits, tabs, which pane was bound
+where) is not part of this snapshot -- recreating that automatically
+would need to remap ids a fresh restart can't reuse, and unlike a
+session, a layout is trivial to rebuild by hand in a few keystrokes.
