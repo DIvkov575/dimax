@@ -513,28 +513,9 @@ async fn dispatch(
                 message: format!("preparing hot reload: {e}"),
             },
         },
-        Request::ServerSpawn {
-            name,
-            cmd,
-            cwd,
-            workspace,
-        } => {
+        Request::ServerSpawn { name, cmd, cwd } => {
             let mut state = state.lock().await;
-            let owner = match workspace {
-                Some(target) => match state.resolve_workspace(&target) {
-                    Ok(id) => Some(id),
-                    Err(err) => {
-                        return Response::Error {
-                            message: err.to_string(),
-                        };
-                    }
-                },
-                None => None,
-            };
-            ok_or_err(
-                state.server_spawn(name, cmd, cwd, owner),
-                Response::ServerPane,
-            )
+            ok_or_err(state.server_spawn(name, cmd, cwd), Response::ServerPane)
         }
 
         Request::ServerKill { target } => {
@@ -1350,7 +1331,6 @@ mod tests {
                 name: None,
                 cmd: Some("printf hello".to_string()),
                 cwd: None,
-                workspace: None,
             })
             .await
         {
@@ -1502,7 +1482,6 @@ mod tests {
                 name: None,
                 cmd: Some("cat".to_string()),
                 cwd: None,
-                workspace: None,
             })
             .await
         {
@@ -1591,7 +1570,6 @@ mod tests {
                 name: None,
                 cmd: Some("cat".to_string()),
                 cwd: None,
-                workspace: None,
             })
             .await
         {
@@ -1688,7 +1666,6 @@ mod tests {
                 name: None,
                 cmd: Some("cat".to_string()),
                 cwd: None,
-                workspace: None,
             })
             .await
         {
@@ -1756,7 +1733,6 @@ mod tests {
                 name: None,
                 cmd: Some("cat".to_string()),
                 cwd: None,
-                workspace: None,
             })
             .await
         {
@@ -1816,7 +1792,6 @@ mod tests {
                 name: None,
                 cmd: Some("pwd".to_string()),
                 cwd: Some("/tmp".to_string()),
-                workspace: None,
             })
             .await
         {
@@ -1891,7 +1866,6 @@ mod tests {
                 name: None,
                 cmd: Some("cat".to_string()),
                 cwd: None,
-                workspace: None,
             })
             .await
         {
@@ -1966,7 +1940,6 @@ mod tests {
                     name: None,
                     cmd: Some("cat".to_string()),
                     cwd: None,
-                    workspace: None,
                 })
                 .await
             {
@@ -2144,7 +2117,6 @@ mod tests {
                     name: None,
                     cmd: Some(format!("printf {text}")),
                     cwd: None,
-                    workspace: None,
                 })
                 .await
             {
@@ -2446,7 +2418,6 @@ mod tests {
                 name: None,
                 cmd: Some("cat".to_string()),
                 cwd: None,
-                workspace: None,
             })
             .await
         {
@@ -2505,7 +2476,6 @@ mod tests {
                 name: None,
                 cmd: Some("cat".to_string()),
                 cwd: None,
-                workspace: None,
             })
             .await
         {
@@ -2653,7 +2623,6 @@ mod tests {
                 name: None,
                 cmd: Some("yes".to_string()),
                 cwd: None,
-                workspace: None,
             })
             .await
         {
@@ -2700,7 +2669,6 @@ mod tests {
                     name: Some(format!("unrelated-{i}")),
                     cmd: None,
                     cwd: None,
-                    workspace: None,
                 })
                 .await
             {

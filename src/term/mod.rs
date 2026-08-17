@@ -16,7 +16,7 @@ mod inherited;
 pub mod session_name;
 
 use crate::protocol::{
-    Cell, ForegroundProcessInfo, GridSnapshot, ServerPaneId, ServerPaneStatus, Size, WorkspaceId,
+    Cell, ForegroundProcessInfo, GridSnapshot, ServerPaneId, ServerPaneStatus, Size,
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair, PtySize, native_pty_system};
 use std::io::{Read, Write};
@@ -86,9 +86,6 @@ struct Inner {
 pub struct ServerPane {
     id: ServerPaneId,
     name: Option<String>,
-    /// See `protocol::ServerPaneInfo::owner_workspace`'s doc comment --
-    /// set once at construction, never mutated afterward.
-    owner_workspace: Option<WorkspaceId>,
     /// See `protocol::ServerPaneInfo::short_id`'s doc comment -- set once
     /// at construction from the daemon's sequential counter, never
     /// mutated afterward.
@@ -111,7 +108,6 @@ impl ServerPane {
         cwd: Option<String>,
         size: Size,
         events: UnboundedSender<ServerPaneEvent>,
-        owner_workspace: Option<WorkspaceId>,
         short_id: String,
     ) -> anyhow::Result<Self> {
         let pty_system = native_pty_system();
@@ -151,16 +147,7 @@ impl ServerPane {
         // would never observe `Died`.
         drop(slave);
 
-        Self::from_parts(
-            id,
-            name,
-            size,
-            events,
-            owner_workspace,
-            short_id,
-            master,
-            child,
-        )
+        Self::from_parts(id, name, size, events, short_id, master, child)
     }
 
     /// Reconstruct a `ServerPane` around a PTY master fd + child pid that
@@ -176,7 +163,6 @@ impl ServerPane {
         name: Option<String>,
         size: Size,
         events: UnboundedSender<ServerPaneEvent>,
-        owner_workspace: Option<WorkspaceId>,
         short_id: String,
         fd: RawFd,
         pid: u32,
@@ -184,25 +170,14 @@ impl ServerPane {
         let master: Box<dyn MasterPty + Send> =
             Box::new(unsafe { inherited::InheritedMasterPty::new(fd) });
         let child: Box<dyn Child + Send + Sync> = Box::new(inherited::InheritedChild::new(pid));
-        Self::from_parts(
-            id,
-            name,
-            size,
-            events,
-            owner_workspace,
-            short_id,
-            master,
-            child,
-        )
+        Self::from_parts(id, name, size, events, short_id, master, child)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn from_parts(
         id: ServerPaneId,
         name: Option<String>,
         size: Size,
         events: UnboundedSender<ServerPaneEvent>,
-        owner_workspace: Option<WorkspaceId>,
         short_id: String,
         master: Box<dyn MasterPty + Send>,
         child: Box<dyn Child + Send + Sync>,
@@ -330,7 +305,6 @@ impl ServerPane {
         Ok(Self {
             id,
             name,
-            owner_workspace,
             short_id,
             inner,
         })
@@ -342,10 +316,6 @@ impl ServerPane {
 
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
-    }
-
-    pub fn owner_workspace(&self) -> Option<WorkspaceId> {
-        self.owner_workspace
     }
 
     pub fn short_id(&self) -> &str {
@@ -743,7 +713,6 @@ mod tests {
             None,
             Size { rows: 24, cols: 80 },
             tx,
-            None,
             "test-short-id".to_string(),
         )
         .unwrap();
@@ -772,7 +741,6 @@ mod tests {
             None,
             Size { rows: 24, cols: 80 },
             tx,
-            None,
             "test-short-id".to_string(),
         )
         .unwrap();
@@ -800,7 +768,6 @@ mod tests {
             None,
             Size { rows: 24, cols: 80 },
             tx,
-            None,
             "test-short-id".to_string(),
         )
         .unwrap();
@@ -838,7 +805,6 @@ mod tests {
             None,
             Size { rows: 24, cols: 80 },
             tx,
-            None,
             "test-short-id".to_string(),
         )
         .unwrap();
@@ -882,7 +848,6 @@ mod tests {
             None,
             Size { rows: 24, cols: 80 },
             tx,
-            None,
             "test-short-id".to_string(),
         )
         .unwrap();
@@ -923,7 +888,6 @@ mod tests {
             None,
             Size { rows: 24, cols: 80 },
             tx,
-            None,
             "test-short-id".to_string(),
         )
         .unwrap();
@@ -948,7 +912,6 @@ mod tests {
             Some("/tmp".to_string()),
             Size { rows: 24, cols: 80 },
             tx,
-            None,
             "test-short-id".to_string(),
         )
         .unwrap();
@@ -973,7 +936,6 @@ mod tests {
             None,
             Size { rows: 24, cols: 80 },
             tx,
-            None,
             "test-short-id".to_string(),
         )
         .unwrap();
@@ -993,7 +955,6 @@ mod tests {
             None,
             Size { rows: 5, cols: 80 },
             tx,
-            None,
             "test-short-id".to_string(),
         )
         .unwrap();
@@ -1057,7 +1018,6 @@ mod tests {
             None,
             Size { rows: 24, cols: 80 },
             tx,
-            None,
             "test-short-id".to_string(),
         )
         .unwrap();
@@ -1101,7 +1061,6 @@ mod tests {
             None,
             Size { rows: 24, cols: 80 },
             tx,
-            None,
             "test-short-id".to_string(),
         )
         .unwrap();

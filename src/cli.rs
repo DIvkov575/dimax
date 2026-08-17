@@ -659,7 +659,6 @@ async fn run_server(cmd: ServerCmd) -> anyhow::Result<()> {
                 name: Some(name),
                 cmd,
                 cwd,
-                workspace: None,
             };
             match client.request(req).await? {
                 Response::ServerPane(info) => {
@@ -1012,7 +1011,6 @@ mod tests {
                 cwd: Some("/home/dev".to_string()),
                 session_kind: None,
             }),
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -1034,7 +1032,6 @@ mod tests {
             size: Size { rows: 10, cols: 20 },
             status: ServerPaneStatus::Dead,
             foreground: None,
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -1054,7 +1051,6 @@ mod tests {
                 cwd: Some("/home/dev".to_string()),
                 session_kind: Some(crate::protocol::SessionKind::Claude),
             }),
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
