@@ -17,8 +17,8 @@
 //! that never claims it will render nothing.
 
 use crate::protocol::{
-    AttachedBinding, ClientPane, ClientPaneId, ServerPaneId, ServerPaneInfo, Size, SplitDir,
-    SplitId, SplitTree, WorkspaceId, WorkspaceInfo,
+    AttachedBinding, ClientPane, ClientPaneId, GridSnapshot, ServerPaneId, ServerPaneInfo, Size,
+    SplitDir, SplitId, SplitTree, WorkspaceId, WorkspaceInfo,
 };
 use crate::term::{ServerPane, ServerPaneEvent};
 use serde::{Deserialize, Serialize};
@@ -210,12 +210,22 @@ impl ResumeState {
 /// `FD_CLOEXEC` flag before the exec that carries this struct across;
 /// without that, the fd would already be closed by the time the new
 /// process image starts running.
+///
+/// `grid` is the pane's actual on-screen content at snapshot time --
+/// carried across so `from_inherited` can repopulate the fresh
+/// `wezterm_term::Terminal` it constructs (which otherwise starts
+/// blank regardless of what the inherited fd/pid represent; see
+/// `term::restore_grid_content`'s doc comment). The PTY and the shell
+/// process survive a reload by construction; this in-memory rendering
+/// of what that shell had already printed does not, unless carried
+/// across explicitly like every other field here.
 #[derive(Serialize, Deserialize)]
 struct ResumeServerPane {
     id: ServerPaneId,
     name: Option<String>,
     short_id: String,
     size: Size,
+    grid: GridSnapshot,
     fd: RawFd,
     pid: u32,
 }
@@ -1115,6 +1125,7 @@ impl State {
                     name: pane.name().map(str::to_string),
                     short_id: pane.short_id().to_string(),
                     size: pane.size(),
+                    grid: pane.snapshot(0),
                     fd: fd?,
                     pid: pid?,
                 })
@@ -1161,6 +1172,7 @@ impl State {
                 p.short_id,
                 p.fd,
                 p.pid,
+                p.grid,
             )?;
             server_panes.insert(p.id, pane);
         }
