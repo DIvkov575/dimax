@@ -311,6 +311,64 @@ impl State {
         Ok(info)
     }
 
+    /// Every currently-live recognized agent-tool session, in the shape
+    /// `session_persistence` persists to disk -- see that module's doc
+    /// comment for the whole feature's scope and rationale. Deliberately
+    /// only recognized sessions (`ForegroundProcessInfo::session_kind`,
+    /// e.g. `claude`/`codex`/`omp`), not every server-pane: a plain
+    /// shell or editor has no "resume" concept worth re-launching after
+    /// a crash, and blindly respawning every idle shell that ever
+    /// existed would clutter the daemon with noise instead of bringing
+    /// back what was actually valuable. `cmd` is `SessionKind::as_str()`
+    /// (the bare tool name, e.g. `"claude"`), not the pane's original
+    /// spawn `cmd` -- that's never retained past spawn time (see
+    /// `ServerPane`'s doc comment), and the *current* foreground tool is
+    /// a better restore target anyway if the pane's own foreground
+    /// process changed since it was first spawned. `cwd` is likewise the
+    /// tool's current directory, not necessarily its original spawn
+    /// one, for the same live-is-more-useful-than-original reason.
+    pub fn restorable_sessions(&self) -> Vec<super::session_persistence::RestorableSession> {
+        self.server_panes
+            .values()
+            .filter_map(|pane| {
+                let foreground = pane.foreground_info()?;
+                let kind = foreground.session_kind?;
+                Some(super::session_persistence::RestorableSession {
+                    name: pane.name().map(str::to_string),
+                    cmd: kind.as_str().to_string(),
+                    cwd: foreground.cwd,
+                })
+            })
+            .collect()
+    }
+
+    /// Re-spawn every session `session_persistence::load()` returns, as
+    /// unbound ("orphan") server-panes -- called exactly once, by
+    /// `daemon::mod::run`'s fresh-start path, right after constructing a
+    /// new empty `State`. Never called from `State::new` itself: every
+    /// test in this module (and plenty elsewhere) constructs `State::
+    /// new()` directly and must not have that silently start spawning
+    /// real processes based on whatever happens to be on disk.
+    ///
+    /// Deliberately does not attempt to restore workspace/client-pane
+    /// layout at all, even though `ResumeState` (the *hot-reload*
+    /// snapshot) has one: a split-tree references server-panes by their
+    /// UUID, which a genuine restart can't reuse (these are freshly
+    /// spawned, with new ids) without a remapping layer this feature
+    /// doesn't have, and unlike the session itself, a layout is trivial
+    /// for a person to recreate by hand in a few keystrokes -- not worth
+    /// the added complexity for what a crash actually costs someone.
+    ///
+    /// Best-effort per pane: a spawn failure (e.g. a name collision,
+    /// which shouldn't happen against a genuinely fresh `State` but
+    /// isn't worth failing every *other* restorable session over) is
+    /// silently skipped rather than aborting the rest of the list.
+    pub fn restore_sessions_from_disk(&mut self) {
+        for session in super::session_persistence::load() {
+            let _ = self.server_spawn(session.name, Some(session.cmd), session.cwd);
+        }
+    }
+
     /// Resolve `target` against both pane name and id-as-string, per the
     /// CLI surface's `<name-or-id>` addressing.
     pub fn resolve_server_pane(&self, target: &str) -> anyhow::Result<ServerPaneId> {
@@ -1640,6 +1698,133 @@ mod tests {
         let list = state.server_list();
         let info = list.iter().find(|p| p.id == orphan).unwrap();
         assert!(info.attached_to.is_empty());
+    }
+
+    /// Copies `/bin/cat` to `dir/name` and makes it executable, then
+    /// returns the new path -- a real, directly-executable binary whose
+    /// OS-reported process name is `name`, used to exercise
+    /// `session_kind` classification against a genuine live process
+    /// without needing an actual `claude`/`codex` install in CI (same
+    /// technique the `session_name` module's own doc comment describes
+    /// for omp: the OS only ever sees the executable's own basename,
+    /// which this constructs directly rather than trying to fake at a
+    /// different layer).
+    fn fake_binary_named(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(name);
+        std::fs::copy("/bin/cat", &path).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    /// Poll `state.server_pane(id)`'s `foreground_info` until its
+    /// `session_kind` resolves to `Some`, or a generous deadline passes
+    /// -- there's a brief window right after spawn where the foreground
+    /// process is still `/bin/sh`, before it execs into the target
+    /// binary (same race `term::tests::foreground_info_reports_the_
+    /// running_shell_command` documents and polls around).
+    fn wait_for_recognized_session_kind(state: &State, id: ServerPaneId) {
+        // Generous: this test creates a brand-new, never-before-run
+        // binary at a fresh path every time, and under the full test
+        // suite's parallel load (hundreds of other tests spawning real
+        // processes concurrently) that first real exec can take
+        // noticeably longer than the usual couple of polls other tests
+        // in this codebase need for an already-cached/known binary
+        // like `cat`/`sh` -- measured flaky at 2s under full-suite load,
+        // reliable at this deadline.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            let recognized = state
+                .server_pane(id)
+                .and_then(|p| p.foreground_info())
+                .is_some_and(|f| f.session_kind.is_some());
+            if recognized {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("session_kind never resolved to Some within the deadline");
+    }
+
+    #[test]
+    fn restorable_sessions_includes_only_recognized_tools() {
+        let dir = std::env::temp_dir().join(format!("dmx-restore-test-{}", std::process::id()));
+        let claude_path = fake_binary_named(&dir, "claude");
+
+        let mut state = State::new();
+        let claude_id = state
+            .server_spawn(
+                Some("agent".to_string()),
+                Some(claude_path.to_str().unwrap().to_string()),
+                None,
+            )
+            .unwrap()
+            .id;
+        let plain_id = spawn_pane(&mut state, "plain-shell");
+        wait_for_recognized_session_kind(&state, claude_id);
+
+        let sessions = state.restorable_sessions();
+        assert_eq!(
+            sessions.len(),
+            1,
+            "a plain (unrecognized) pane must not be captured: {sessions:?}"
+        );
+        assert_eq!(sessions[0].cmd, "claude");
+        assert_eq!(sessions[0].name.as_deref(), Some("agent"));
+
+        // `plain_id` genuinely exists but was correctly excluded --
+        // this line only guards against the assertion above silently
+        // passing because `plain_id` was never actually spawned.
+        assert!(state.server_pane(plain_id).is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_sessions_from_disk_respawns_every_saved_session() {
+        let config_dir =
+            std::env::temp_dir().join(format!("dmx-restore-config-{}", std::process::id()));
+        let bin_dir = std::env::temp_dir().join(format!("dmx-restore-bin-{}", std::process::id()));
+        let claude_path = fake_binary_named(&bin_dir, "claude");
+
+        // See `crate::ENV_FAKE_HOME_LOCK`'s doc comment: shared across
+        // every module's tests that fake this same process-global env
+        // var, not just this module's own.
+        let guard = crate::ENV_FAKE_HOME_LOCK.blocking_lock();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &config_dir);
+        }
+        super::super::session_persistence::save(&[
+            super::super::session_persistence::RestorableSession {
+                name: Some("restored-agent".to_string()),
+                cmd: claude_path.to_str().unwrap().to_string(),
+                cwd: None,
+            },
+        ]);
+
+        let mut state = State::new();
+        state.restore_sessions_from_disk();
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        drop(guard);
+
+        let names: Vec<Option<String>> = state.server_list().into_iter().map(|i| i.name).collect();
+        assert_eq!(
+            names,
+            vec![Some("restored-agent".to_string())],
+            "the saved session must have been re-spawned as a real server-pane"
+        );
+
+        let _ = std::fs::remove_dir_all(&config_dir);
+        let _ = std::fs::remove_dir_all(&bin_dir);
     }
 
     #[test]

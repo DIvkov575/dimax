@@ -76,14 +76,11 @@ pub fn save(dirs: &[String]) {
 mod tests {
     use super::*;
 
-    /// Serializes every test in this module -- both `load`/`save`
-    /// read `$XDG_CONFIG_HOME`/`$HOME`, which are process-global, so
-    /// two such tests running concurrently (the default under `cargo
-    /// test`) could otherwise stomp on each other's env state mid-test.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn with_fake_config_home<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap();
+        // See `crate::ENV_FAKE_HOME_LOCK`'s doc comment: shared across
+        // every module's tests that fake this same process-global env
+        // var, not just this module's own.
+        let _guard = crate::ENV_FAKE_HOME_LOCK.blocking_lock();
         let prev = std::env::var_os("XDG_CONFIG_HOME");
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", dir);

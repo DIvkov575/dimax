@@ -4379,7 +4379,12 @@ mod tests {
         let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let socket_path =
             std::env::temp_dir().join(format!("dmx-am-{}-{id}.sock", std::process::id()));
-        crate::daemon::run(socket_path.clone())
+        // `false`: this runs against the developer's real `$HOME`/
+        // `$XDG_CONFIG_HOME` (no fake path) -- enabling session
+        // persistence would spawn real processes from, and overwrite,
+        // whatever the user's real daemon has actually persisted. See
+        // `daemon::run`'s doc comment.
+        crate::daemon::run(socket_path.clone(), false)
             .await
             .expect("daemon should bind and start");
         let stream = tokio::net::UnixStream::connect(&socket_path)
@@ -4514,7 +4519,7 @@ mod tests {
         // Short filename -- see `app_against_real_daemon` for why.
         let socket_path =
             std::env::temp_dir().join(format!("dmx-boot1-{}.sock", std::process::id()));
-        crate::daemon::run(socket_path.clone())
+        crate::daemon::run(socket_path.clone(), false)
             .await
             .expect("daemon should bind and start");
         let stream = tokio::net::UnixStream::connect(&socket_path)
@@ -4574,7 +4579,7 @@ mod tests {
         // scheme (see its doc comment for why this stays short).
         let socket_path =
             std::env::temp_dir().join(format!("dmx-boot2-{}.sock", std::process::id()));
-        crate::daemon::run(socket_path.clone())
+        crate::daemon::run(socket_path.clone(), false)
             .await
             .expect("daemon should bind and start");
 
@@ -6280,15 +6285,6 @@ mod tests {
         );
     }
 
-    /// Serializes every test in this module that spawns a real daemon
-    /// AND toggles a pin: `State::new`/`toggle_pinned_dir` both read or
-    /// write `$XDG_CONFIG_HOME` (process-global) via `daemon::pinned_dirs`,
-    /// so without this a concurrently-running such test could read/write
-    /// the wrong fake config dir mid-test -- and without redirecting
-    /// `$XDG_CONFIG_HOME` at all, these tests would otherwise touch the
-    /// real user's `~/.config/dimax/pinned_dirs.json`.
-    static PIN_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     async fn app_against_real_daemon_with_fake_pin_config(
         config_dir: &std::path::Path,
     ) -> (App, OwnedWriteHalf, FrameReader) {
@@ -6308,7 +6304,10 @@ mod tests {
     async fn toggle_directory_pin_on_a_header_row_sorts_it_first() {
         let config_dir =
             std::env::temp_dir().join(format!("dmx-am-pin-config-{}", std::process::id()));
-        let _guard = PIN_ENV_LOCK.lock().await;
+        // See `crate::ENV_FAKE_HOME_LOCK`'s doc comment: shared across
+        // every module's tests that fake this same process-global env
+        // var, not just this module's own.
+        let _guard = crate::ENV_FAKE_HOME_LOCK.lock().await;
         let (mut app, mut write_half, mut reader) =
             app_against_real_daemon_with_fake_pin_config(&config_dir).await;
 
@@ -6441,7 +6440,10 @@ mod tests {
             "dmx-am-pin-server-row-config-{}",
             std::process::id()
         ));
-        let _guard = PIN_ENV_LOCK.lock().await;
+        // See `crate::ENV_FAKE_HOME_LOCK`'s doc comment: shared across
+        // every module's tests that fake this same process-global env
+        // var, not just this module's own.
+        let _guard = crate::ENV_FAKE_HOME_LOCK.lock().await;
         let (mut app, mut write_half, mut reader) =
             app_against_real_daemon_with_fake_pin_config(&config_dir).await;
 
