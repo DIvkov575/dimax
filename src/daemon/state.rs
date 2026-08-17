@@ -214,7 +214,6 @@ impl ResumeState {
 struct ResumeServerPane {
     id: ServerPaneId,
     name: Option<String>,
-    owner_workspace: Option<WorkspaceId>,
     short_id: String,
     size: Size,
     fd: RawFd,
@@ -268,7 +267,6 @@ impl State {
         name: Option<String>,
         cmd: Option<String>,
         cwd: Option<String>,
-        workspace: Option<WorkspaceId>,
     ) -> anyhow::Result<ServerPaneInfo> {
         if let Some(name) = &name
             && self.find_server_pane_by_name(name).is_some()
@@ -285,7 +283,6 @@ impl State {
             cwd,
             DEFAULT_PTY_SIZE,
             self.pane_events.clone(),
-            workspace,
             short_id.clone(),
         )?;
         let info = ServerPaneInfo {
@@ -294,7 +291,6 @@ impl State {
             size: pane.size(),
             status: pane.status(),
             foreground: pane.foreground_info(),
-            owner_workspace: pane.owner_workspace(),
             short_id,
             // A pane is never attached at spawn time -- `client_bind`/
             // `client_add_tab` haven't run yet. Populated live by
@@ -441,7 +437,6 @@ impl State {
                 size: p.size(),
                 status: p.status(),
                 foreground: p.foreground_info(),
-                owner_workspace: p.owner_workspace(),
                 short_id: p.short_id().to_string(),
                 attached_to: attached_to.remove(&p.id()).unwrap_or_default(),
             })
@@ -1118,7 +1113,6 @@ impl State {
                 Some(ResumeServerPane {
                     id: pane.id(),
                     name: pane.name().map(str::to_string),
-                    owner_workspace: pane.owner_workspace(),
                     short_id: pane.short_id().to_string(),
                     size: pane.size(),
                     fd: fd?,
@@ -1164,7 +1158,6 @@ impl State {
                 p.name,
                 p.size,
                 pane_events.clone(),
-                p.owner_workspace,
                 p.short_id,
                 p.fd,
                 p.pid,
@@ -1374,13 +1367,13 @@ mod tests {
     fn server_spawn_assigns_sequential_short_ids_starting_at_00() {
         let mut state = State::new();
         let a = state
-            .server_spawn(None, Some("cat".to_string()), None, None)
+            .server_spawn(None, Some("cat".to_string()), None)
             .unwrap();
         let b = state
-            .server_spawn(None, Some("cat".to_string()), None, None)
+            .server_spawn(None, Some("cat".to_string()), None)
             .unwrap();
         let c = state
-            .server_spawn(None, Some("cat".to_string()), None, None)
+            .server_spawn(None, Some("cat".to_string()), None)
             .unwrap();
         assert_eq!(a.short_id, "00");
         assert_eq!(b.short_id, "01");
@@ -1391,12 +1384,7 @@ mod tests {
     fn short_id_survives_into_server_list() {
         let mut state = State::new();
         state
-            .server_spawn(
-                Some("shell".to_string()),
-                Some("cat".to_string()),
-                None,
-                None,
-            )
+            .server_spawn(Some("shell".to_string()), Some("cat".to_string()), None)
             .unwrap();
         let listed = state.server_list();
         assert_eq!(listed[0].short_id, "00");
@@ -1407,7 +1395,7 @@ mod tests {
     /// exercised without depending on process timing.
     fn spawn_pane(state: &mut State, name: &str) -> ServerPaneId {
         state
-            .server_spawn(Some(name.to_string()), Some("cat".to_string()), None, None)
+            .server_spawn(Some(name.to_string()), Some("cat".to_string()), None)
             .unwrap()
             .id
     }
@@ -1439,12 +1427,7 @@ mod tests {
     fn server_spawn_returns_info_and_lists_it() {
         let mut state = State::new();
         let info = state
-            .server_spawn(
-                Some("shell".to_string()),
-                Some("cat".to_string()),
-                None,
-                None,
-            )
+            .server_spawn(Some("shell".to_string()), Some("cat".to_string()), None)
             .unwrap();
         assert_eq!(info.name.as_deref(), Some("shell"));
         assert_eq!(info.size, DEFAULT_PTY_SIZE);
@@ -1459,12 +1442,7 @@ mod tests {
         let mut state = State::new();
         spawn_pane(&mut state, "shell");
         let err = state
-            .server_spawn(
-                Some("shell".to_string()),
-                Some("cat".to_string()),
-                None,
-                None,
-            )
+            .server_spawn(Some("shell".to_string()), Some("cat".to_string()), None)
             .unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
         assert_eq!(state.server_list().len(), 1);
@@ -1474,10 +1452,10 @@ mod tests {
     fn server_spawn_allows_repeated_anonymous_panes() {
         let mut state = State::new();
         state
-            .server_spawn(None, Some("cat".to_string()), None, None)
+            .server_spawn(None, Some("cat".to_string()), None)
             .unwrap();
         state
-            .server_spawn(None, Some("cat".to_string()), None, None)
+            .server_spawn(None, Some("cat".to_string()), None)
             .unwrap();
         assert_eq!(state.server_list().len(), 2);
     }
@@ -1569,7 +1547,7 @@ mod tests {
     fn server_list_leaves_unnamed_non_session_panes_unnamed() {
         let mut state = State::new();
         state
-            .server_spawn(None, Some("cat".to_string()), None, None)
+            .server_spawn(None, Some("cat".to_string()), None)
             .unwrap();
         let names: Vec<Option<String>> = state.server_list().into_iter().map(|i| i.name).collect();
         assert_eq!(names, vec![None]);
@@ -1878,7 +1856,7 @@ mod tests {
     fn client_and_server_short_ids_are_independent_sequences() {
         let mut state = State::new();
         state
-            .server_spawn(None, Some("cat".to_string()), None, None)
+            .server_spawn(None, Some("cat".to_string()), None)
             .unwrap();
         let ws = state.resolve_or_create_workspace("1").unwrap();
         let pane = state.client_spawn(ws, None, None, None).unwrap();
@@ -2550,7 +2528,7 @@ mod tests {
     fn scroll_server_pane_clamps_at_zero() {
         let mut state = State::new();
         let info = state
-            .server_spawn(None, Some("cat".to_string()), None, None)
+            .server_spawn(None, Some("cat".to_string()), None)
             .unwrap();
         let offset = state.scroll_server_pane(1, info.id, 5);
         assert_eq!(offset, 0);
@@ -2561,7 +2539,7 @@ mod tests {
     fn scroll_server_pane_absent_entry_defaults_to_zero_before_first_call() {
         let mut state = State::new();
         let info = state
-            .server_spawn(None, Some("cat".to_string()), None, None)
+            .server_spawn(None, Some("cat".to_string()), None)
             .unwrap();
         let offset = state.scroll_server_pane(1, info.id, -5);
         assert_eq!(offset, 0);
@@ -2584,7 +2562,6 @@ mod tests {
             .server_spawn(
                 Some("greeter".to_string()),
                 Some("printf hi".to_string()),
-                None,
                 None,
             )
             .unwrap();

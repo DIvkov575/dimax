@@ -245,15 +245,6 @@ pub struct ServerPaneInfo {
     /// pane has no foreground process to look up) or on a platform where
     /// this isn't supported.
     pub foreground: Option<ForegroundProcessInfo>,
-    /// The workspace this server-pane was spawned from, if any. Set once
-    /// at `ServerSpawn` time from the request's own `workspace` field and
-    /// never changed afterward — binding/adding this pane as a tab into a
-    /// *different* workspace's client-pane does not transfer ownership.
-    /// `None` for a pane spawned with no workspace context (e.g. `dimax
-    /// server spawn` from the CLI) — an "orphan" pane, always shown in
-    /// every workspace's attach menu regardless of the
-    /// same-workspace-only filter (see `tui::filter_servers_for_menu`).
-    pub owner_workspace: Option<WorkspaceId>,
     /// A short, human-friendly display label assigned once at spawn time
     /// from a per-daemon sequential counter (see `daemon::state::encode_short_id`):
     /// `"aa"`, `"ab"`, ..., `"az"`, `"ba"`, ..., `"zz"`, `"Aa"`, ...,
@@ -397,16 +388,6 @@ pub enum Request {
         /// default). Set by the attach menu's per-group "spawn new
         /// here" row to start the new pane in that group's directory.
         cwd: Option<String>,
-        /// Same name-or-number-or-id addressing as `ClientSpawn`'s
-        /// `workspace` field, but optional: `Some` records this pane's
-        /// `owner_workspace` (every TUI-driven spawn passes the current
-        /// workspace); `None` leaves it unowned/orphaned (e.g. `dimax
-        /// server spawn` from the CLI, which has no workspace context).
-        /// Unlike `ClientSpawn`, a `Some` value here never creates a
-        /// workspace that doesn't already exist -- there is no
-        /// client-pane to put in it, so an unknown workspace is just an
-        /// error.
-        workspace: Option<String>,
     },
     /// `target` is matched against both pane name and id (as a string).
     ServerKill {

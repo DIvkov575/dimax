@@ -532,7 +532,7 @@ const PREVIEW_PANEL_HEIGHT: u16 = 12;
 /// Rendered along the row-list block's bottom border -- must stay in sync
 /// with `parse_attach_menu_input`'s actual byte matches (`tui/mod.rs`),
 /// which is the source of truth this is only a display of.
-const ATTACH_MENU_KEY_HINTS: &str = "↑↓ move · Enter attach · x del · r rename · p pin · f agents · a all-ws · g group · d detach · q quit · Esc cancel";
+const ATTACH_MENU_KEY_HINTS: &str = "↑↓ move · Enter attach · x del · r rename · p pin · f agents · g group · d detach · q quit · Esc cancel";
 
 /// Overlay for `cmd-shift-z`'s attach menu: lists every server-pane
 /// (grouped under selectable per-cwd headers) plus a trailing "spawn
@@ -1457,7 +1457,6 @@ mod tests {
                 size: Size { rows: 24, cols: 80 },
                 status: ServerPaneStatus::Running,
                 foreground: None,
-                owner_workspace: None,
                 short_id: "aa".to_string(),
                 attached_to: Vec::new(),
             },
@@ -1498,7 +1497,6 @@ mod tests {
                 size: Size { rows: 1, cols: 4 },
                 status: ServerPaneStatus::Running,
                 foreground: None,
-                owner_workspace: None,
                 short_id: "aa".to_string(),
                 attached_to: Vec::new(),
             },
@@ -1511,7 +1509,6 @@ mod tests {
                 size: Size { rows: 1, cols: 5 },
                 status: ServerPaneStatus::Running,
                 foreground: None,
-                owner_workspace: None,
                 short_id: "ab".to_string(),
                 attached_to: Vec::new(),
             },
@@ -1797,7 +1794,6 @@ mod tests {
                 cwd: Some("/home/dev/project".to_string()),
                 session_kind: None,
             }),
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -1839,7 +1835,6 @@ mod tests {
                 cwd: None,
                 session_kind: Some(crate::protocol::SessionKind::Claude),
             }),
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -1868,7 +1863,6 @@ mod tests {
                 cwd: Some("/home/dev/project".to_string()),
                 session_kind: Some(crate::protocol::SessionKind::Claude),
             }),
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -1903,7 +1897,6 @@ mod tests {
                 cwd: Some("/home/dev".to_string()),
                 session_kind: None,
             }),
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -1934,7 +1927,6 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -1949,7 +1941,6 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: vec![crate::protocol::AttachedBinding {
                 workspace_number: 1,
@@ -1968,7 +1959,6 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: vec![crate::protocol::AttachedBinding {
                 workspace_number: 2,
@@ -1987,7 +1977,6 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: vec![
                 crate::protocol::AttachedBinding {
@@ -2018,7 +2007,6 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: vec![crate::protocol::AttachedBinding {
                 workspace_number: 1,
@@ -2092,7 +2080,6 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -2129,7 +2116,6 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -2185,7 +2171,6 @@ mod tests {
                 cwd: Some("/home/dev/project".to_string()),
                 session_kind: None,
             }),
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -2230,7 +2215,6 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -2276,7 +2260,6 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -2341,7 +2324,6 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Dead,
             foreground: None,
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -2402,7 +2384,6 @@ mod tests {
                 cwd: Some("/home/dev/api".to_string()),
                 session_kind: None,
             }),
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -2416,7 +2397,6 @@ mod tests {
                 cwd: Some("/home/dev/web".to_string()),
                 session_kind: None,
             }),
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -2459,7 +2439,6 @@ mod tests {
                 cwd: Some("/home/dev/api".to_string()),
                 session_kind: None,
             }),
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -2469,7 +2448,6 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Dead,
             foreground: None,
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -2507,7 +2485,6 @@ mod tests {
                 cwd: Some("/home/dev/api".to_string()),
                 session_kind: None,
             }),
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -2521,7 +2498,6 @@ mod tests {
                 cwd: Some("/home/dev/web".to_string()),
                 session_kind: None,
             }),
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -2569,7 +2545,6 @@ mod tests {
                 cwd: Some("/home/dev/api".to_string()),
                 session_kind: None,
             }),
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -2618,7 +2593,6 @@ mod tests {
                 cwd: Some("/home/dev/api".to_string()),
                 session_kind: None,
             }),
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -2662,7 +2636,6 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -2696,7 +2669,6 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -2706,7 +2678,6 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -2747,7 +2718,6 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
@@ -2780,7 +2750,6 @@ mod tests {
             size: Size { rows: 24, cols: 80 },
             status: ServerPaneStatus::Running,
             foreground: None,
-            owner_workspace: None,
             short_id: "aa".to_string(),
             attached_to: Vec::new(),
         };
