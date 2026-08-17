@@ -24,7 +24,9 @@ use std::os::fd::RawFd;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
 use wezterm_term::color::ColorAttribute;
-use wezterm_term::{Intensity, Terminal, TerminalConfiguration, TerminalSize, Underline};
+use wezterm_term::{
+    CellAttributes, Intensity, Terminal, TerminalConfiguration, TerminalSize, Underline,
+};
 
 /// Pushed by the background reader thread. `events` is an
 /// `UnboundedSender` because tokio's unbounded sender can be used from a
@@ -147,7 +149,7 @@ impl ServerPane {
         // would never observe `Died`.
         drop(slave);
 
-        Self::from_parts(id, name, size, events, short_id, master, child)
+        Self::from_parts(id, name, size, events, short_id, master, child, None)
     }
 
     /// Reconstruct a `ServerPane` around a PTY master fd + child pid that
@@ -156,7 +158,12 @@ impl ServerPane {
     /// `daemon::mod`'s "Hot reload" doc). Everything from here on is
     /// identical to a freshly `spawn`ed pane: a new reader thread, a new
     /// `wezterm_term::Terminal`, the same `Inner`/`Self` shape -- only
-    /// *how* `master`/`child` were obtained differs.
+    /// *how* `master`/`child` were obtained differs, plus `restored_grid`
+    /// re-populating the fresh `Terminal`'s screen with whatever was
+    /// actually on it before the exec (see `restore_grid_content`'s doc
+    /// comment for why this matters: without it, every pane renders
+    /// completely blank immediately after a reload, indefinitely for one
+    /// sitting idle at a prompt with nothing new to print).
     #[allow(clippy::too_many_arguments)]
     pub fn from_inherited(
         id: ServerPaneId,
@@ -166,13 +173,24 @@ impl ServerPane {
         short_id: String,
         fd: RawFd,
         pid: u32,
+        restored_grid: GridSnapshot,
     ) -> anyhow::Result<Self> {
         let master: Box<dyn MasterPty + Send> =
             Box::new(unsafe { inherited::InheritedMasterPty::new(fd) });
         let child: Box<dyn Child + Send + Sync> = Box::new(inherited::InheritedChild::new(pid));
-        Self::from_parts(id, name, size, events, short_id, master, child)
+        Self::from_parts(
+            id,
+            name,
+            size,
+            events,
+            short_id,
+            master,
+            child,
+            Some(restored_grid),
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn from_parts(
         id: ServerPaneId,
         name: Option<String>,
@@ -181,9 +199,10 @@ impl ServerPane {
         short_id: String,
         master: Box<dyn MasterPty + Send>,
         child: Box<dyn Child + Send + Sync>,
+        restored_grid: Option<GridSnapshot>,
     ) -> anyhow::Result<Self> {
         let writer = SharedWriter(Arc::new(Mutex::new(master.take_writer()?)));
-        let terminal = Terminal::new(
+        let mut terminal = Terminal::new(
             TerminalSize {
                 rows: size.rows as usize,
                 cols: size.cols as usize,
@@ -196,6 +215,9 @@ impl ServerPane {
             env!("CARGO_PKG_VERSION"),
             Box::new(writer.clone()),
         );
+        if let Some(grid) = &restored_grid {
+            restore_grid_content(&mut terminal, grid);
+        }
         let mut reader = master.try_clone_reader()?;
         // `try_clone_reader` dups the master's fd (see `unix.rs` in the
         // vendored `portable-pty` source); per POSIX, file *status*
@@ -667,6 +689,59 @@ fn color_attr_to_rgb(attr: ColorAttribute) -> Option<(u8, u8, u8)> {
     }
 }
 
+/// Repopulate a freshly constructed `Terminal`'s screen with `grid`'s
+/// content -- the inverse of `line_to_cells`/`color_attr_to_rgb`. Used
+/// only by `from_inherited`: a hot reload carries a server-pane's PTY
+/// fd/pid across `execve`, but `Terminal::new` always starts with a
+/// blank screen model regardless of what was actually inherited, since
+/// the *shell process* survives the reload but this in-memory rendering
+/// of its output does not. Without this, every pane would render
+/// completely blank right after a reload -- indefinitely, for one
+/// sitting idle at a prompt with nothing new to print -- even though
+/// the shell underneath it never stopped or lost anything.
+///
+/// Deliberately does not restore cursor position: `wezterm_term`
+/// exposes no public setter for it, and the shell's own next prompt
+/// redraw corrects it long before it would be noticeable -- a much
+/// smaller gap than the pane's entire visible content vanishing.
+fn restore_grid_content(terminal: &mut Terminal, grid: &GridSnapshot) {
+    let screen = terminal.screen_mut();
+    for (y, row) in grid.lines.iter().enumerate() {
+        for (x, cell) in row.iter().enumerate() {
+            let term_cell = wezterm_term::Cell::new_grapheme(&cell.text, cell_to_attrs(cell), None);
+            screen.set_cell(x, y as i64, &term_cell, 0);
+        }
+    }
+}
+
+fn cell_to_attrs(cell: &Cell) -> CellAttributes {
+    let mut attrs = CellAttributes::default();
+    attrs.set_foreground(rgb_to_color_attr(cell.fg));
+    attrs.set_background(rgb_to_color_attr(cell.bg));
+    attrs.set_intensity(if cell.bold {
+        Intensity::Bold
+    } else {
+        Intensity::Normal
+    });
+    attrs.set_italic(cell.italic);
+    attrs.set_underline(if cell.underline {
+        Underline::Single
+    } else {
+        Underline::None
+    });
+    attrs.set_reverse(cell.reverse);
+    attrs
+}
+
+fn rgb_to_color_attr(rgb: Option<(u8, u8, u8)>) -> ColorAttribute {
+    match rgb {
+        Some((r, g, b)) => ColorAttribute::TrueColorWithDefaultFallback(
+            wezterm_term::color::SrgbaTuple::from((r, g, b)),
+        ),
+        None => ColorAttribute::Default,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1068,5 +1143,78 @@ mod tests {
         // The process group leader is gone once killed; there's nothing
         // left to query.
         assert!(pane.foreground_info().is_none());
+    }
+
+    /// Regression test for "every pane goes blank after a hot reload":
+    /// `Terminal::new` always starts with an empty screen regardless of
+    /// what's being reconstructed around, so `from_inherited` must
+    /// explicitly repopulate it via `restore_grid_content` or a pane
+    /// sitting idle at a prompt (nothing new to print, so nothing to
+    /// naturally overwrite the blank state) stays blank indefinitely.
+    /// Round-trips a `GridSnapshot` through `restore_grid_content` and
+    /// back out through `line_to_cells` (the same extraction `snapshot`
+    /// itself uses) and checks the result is identical to the original
+    /// -- text, colors, and style attributes all included.
+    #[test]
+    fn restore_grid_content_round_trips_text_and_styling() {
+        let rows = 2;
+        let cols = 5;
+        let mut terminal = Terminal::new(
+            TerminalSize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: 0,
+            },
+            Arc::new(Config),
+            "dimax",
+            env!("CARGO_PKG_VERSION"),
+            Box::new(Vec::new()),
+        );
+
+        let styled = Cell {
+            text: "H".to_string(),
+            fg: Some((10, 20, 30)),
+            bg: Some((200, 210, 220)),
+            bold: true,
+            italic: true,
+            underline: true,
+            reverse: true,
+        };
+        let plain = blank_cell();
+        let grid = GridSnapshot {
+            server_pane: Uuid::new_v4(),
+            size: Size {
+                rows: rows as u16,
+                cols: cols as u16,
+            },
+            cursor: (0, 0),
+            lines: vec![
+                vec![
+                    styled.clone(),
+                    plain.clone(),
+                    plain.clone(),
+                    plain.clone(),
+                    plain.clone(),
+                ],
+                vec![plain.clone(); cols],
+            ],
+            scroll_offset: 0,
+        };
+
+        restore_grid_content(&mut terminal, &grid);
+
+        let screen = terminal.screen();
+        let phys_range = screen.scrollback_or_visible_range(&(0..rows as i32));
+        let restored: Vec<Vec<Cell>> = screen
+            .lines_in_phys_range(phys_range)
+            .iter()
+            .map(|line| line_to_cells(line, cols))
+            .collect();
+        assert_eq!(
+            restored, grid.lines,
+            "restored screen content must match the original snapshot exactly"
+        );
     }
 }
