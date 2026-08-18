@@ -234,10 +234,24 @@ fn start(
     // instead *deletes* this same file). 30s bounds how stale the
     // snapshot can be without costing anything noticeable -- this is a
     // best-effort recovery aid, not a transactional log.
+    //
+    // Deliberately `interval_at(now + period, period)`, NOT plain
+    // `interval(period)`: the latter's *first* tick fires immediately,
+    // not after the given period (documented tokio behavior, easy to
+    // miss). On a fresh start that just ran `restore_sessions_from_disk`,
+    // an immediate first tick would race a just-respawned pane's shell
+    // still being `sh` (not yet exec'd into the recognized tool -- see
+    // `state::tests::wait_for_recognized_session_kind`'s own doc comment
+    // for how real that window is) -- `restorable_sessions` would find
+    // it unclassified, and overwrite the snapshot with that session
+    // missing, before the tool ever got a chance to actually start.
+    // Losing the very session a restore just brought back, this fast,
+    // defeats the whole feature.
     if enable_session_persistence {
         let snapshot_state = state.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            let period = std::time::Duration::from_secs(30);
+            let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
             loop {
                 tick.tick().await;
                 let sessions = snapshot_state.lock().await.restorable_sessions();

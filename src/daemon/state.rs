@@ -319,23 +319,29 @@ impl State {
     /// shell or editor has no "resume" concept worth re-launching after
     /// a crash, and blindly respawning every idle shell that ever
     /// existed would clutter the daemon with noise instead of bringing
-    /// back what was actually valuable. `cmd` is `SessionKind::as_str()`
-    /// (the bare tool name, e.g. `"claude"`), not the pane's original
-    /// spawn `cmd` -- that's never retained past spawn time (see
-    /// `ServerPane`'s doc comment), and the *current* foreground tool is
-    /// a better restore target anyway if the pane's own foreground
-    /// process changed since it was first spawned. `cwd` is likewise the
-    /// tool's current directory, not necessarily its original spawn
-    /// one, for the same live-is-more-useful-than-original reason.
+    /// back what was actually valuable. `cmd` is the pane's actual live
+    /// `argv`, safely re-quoted (`ServerPane::foreground_restore_command`),
+    /// not just `SessionKind::as_str()`'s bare tool name -- omp in
+    /// particular is only ever invoked as a bun script, so a bare `omp`
+    /// isn't guaranteed to be independently runnable via the daemon's
+    /// own `$PATH` even though the real invocation always is. Not the
+    /// pane's *original* spawn `cmd` either -- that's never retained
+    /// past spawn time (see `ServerPane`'s doc comment), and the
+    /// *current* foreground tool is a better restore target anyway if
+    /// the pane's own foreground process changed since it was first
+    /// spawned. `cwd` is likewise the tool's current directory, not
+    /// necessarily its original spawn one, for the same
+    /// live-is-more-useful-than-original reason.
     pub fn restorable_sessions(&self) -> Vec<super::session_persistence::RestorableSession> {
         self.server_panes
             .values()
             .filter_map(|pane| {
                 let foreground = pane.foreground_info()?;
-                let kind = foreground.session_kind?;
+                foreground.session_kind?;
+                let cmd = pane.foreground_restore_command()?;
                 Some(super::session_persistence::RestorableSession {
                     name: pane.name().map(str::to_string),
-                    cmd: kind.as_str().to_string(),
+                    cmd,
                     cwd: foreground.cwd,
                 })
             })
@@ -1700,52 +1706,93 @@ mod tests {
         assert!(info.attached_to.is_empty());
     }
 
-    /// Copies `/bin/cat` to `dir/name` and makes it executable, then
-    /// returns the new path -- a real, directly-executable binary whose
-    /// OS-reported process name is `name`, used to exercise
-    /// `session_kind` classification against a genuine live process
-    /// without needing an actual `claude`/`codex` install in CI (same
-    /// technique the `session_name` module's own doc comment describes
-    /// for omp: the OS only ever sees the executable's own basename,
-    /// which this constructs directly rather than trying to fake at a
-    /// different layer).
+    /// Compiles a trivial, real, directly-executable binary at
+    /// `dir/name` that just blocks forever -- a genuine live process to
+    /// exercise `session_kind` classification against, without needing
+    /// an actual `claude`/`codex` install in CI (same technique the
+    /// `session_name` module's own doc comment describes for omp: the
+    /// OS only ever sees the executable's own basename, which this
+    /// constructs directly rather than trying to fake at a different
+    /// layer).
+    ///
+    /// Deliberately compiles a fresh tiny C program with `cc` rather
+    /// than copying an existing system binary (e.g. `/bin/cat`) to a
+    /// new path: on current macOS, Apple's own platform binaries carry
+    /// a code-signing flag tying them to their original, SIP-protected
+    /// install location -- copy one elsewhere and the kernel SIGKILLs
+    /// it on exec (confirmed directly: `cp /bin/cat /tmp/x; /tmp/x`
+    /// dies with signal 9, no matter who runs it). A binary this
+    /// fixture compiles itself carries no such restriction, same as any
+    /// real third-party CLI tool -- `claude`/`codex`/`omp` are never
+    /// Apple-signed platform binaries either. `cc` (Xcode command line
+    /// tools) is a safe assumption here: cargo's own default macOS
+    /// linker depends on it, so anything that can build this crate
+    /// already has it.
     fn fake_binary_named(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
         std::fs::create_dir_all(dir).unwrap();
         let path = dir.join(name);
-        std::fs::copy("/bin/cat", &path).unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
+        let source = dir.join(format!("{name}.c"));
+        std::fs::write(
+            &source,
+            "#include <unistd.h>\nint main(void) { for (;;) pause(); }\n",
+        )
+        .unwrap();
+        let status = std::process::Command::new("cc")
+            .arg("-o")
+            .arg(&path)
+            .arg(&source)
+            .status()
+            .expect("cc (Xcode command line tools) must be available to build this fixture");
+        assert!(
+            status.success(),
+            "cc failed to compile the fake binary at {path:?}"
+        );
         path
     }
 
-    /// Poll `state.server_pane(id)`'s `foreground_info` until its
-    /// `session_kind` resolves to `Some`, or a generous deadline passes
-    /// -- there's a brief window right after spawn where the foreground
-    /// process is still `/bin/sh`, before it execs into the target
-    /// binary (same race `term::tests::foreground_info_reports_the_
-    /// running_shell_command` documents and polls around).
-    fn wait_for_recognized_session_kind(state: &State, id: ServerPaneId) {
-        // Generous: this test creates a brand-new, never-before-run
-        // binary at a fresh path every time, and under the full test
-        // suite's parallel load (hundreds of other tests spawning real
-        // processes concurrently) that first real exec can take
-        // noticeably longer than the usual couple of polls other tests
-        // in this codebase need for an already-cached/known binary
-        // like `cat`/`sh` -- measured flaky at 2s under full-suite load,
-        // reliable at this deadline.
+    /// Poll `state.server_pane(id)`'s `foreground_info` until
+    /// `process_name` actually becomes `expected_process_name`, or a
+    /// generous deadline passes -- there's a brief window right after
+    /// spawn where the foreground process is still `/bin/sh`, before it
+    /// execs into the target binary (same race `term::tests::
+    /// foreground_info_reports_the_running_shell_command` documents and
+    /// polls around). Deliberately does NOT just wait for `session_kind`
+    /// to resolve to `Some`: `classify_with_cmd`'s cmd-fallback scan
+    /// (needed for e.g. omp) can already recognize the target binary
+    /// from the still-running shell's own argv (`sh -c '<path>'` has the
+    /// target's basename right there as an argument), before the exec
+    /// actually happens -- so that weaker check races
+    /// `foreground_restore_command`, which needs the *exec'd* process's
+    /// own argv, not the launching shell's.
+    fn wait_for_recognized_session_kind(
+        state: &State,
+        id: ServerPaneId,
+        expected_process_name: &str,
+    ) {
+        // Generous: under the full test suite's parallel load (hundreds
+        // of other tests spawning real processes concurrently), the
+        // shell-to-target exec can take noticeably longer than the
+        // couple of polls other tests in this codebase need for an
+        // already-cached/known binary like `cat`/`sh`.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut last = None;
+        let mut last_status = None;
         while std::time::Instant::now() < deadline {
-            let recognized = state
-                .server_pane(id)
-                .and_then(|p| p.foreground_info())
-                .is_some_and(|f| f.session_kind.is_some());
+            let pane = state.server_pane(id);
+            last_status = pane.map(|p| p.status());
+            let info = pane.and_then(|p| p.foreground_info());
+            let recognized = info
+                .as_ref()
+                .is_some_and(|f| f.process_name == expected_process_name);
             if recognized {
                 return;
             }
+            last = info;
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        panic!("session_kind never resolved to Some within the deadline");
+        panic!(
+            "process_name never became {expected_process_name:?} within the deadline; last observed: {last:?}; last status: {last_status:?}"
+        );
     }
 
     #[test]
@@ -1763,7 +1810,7 @@ mod tests {
             .unwrap()
             .id;
         let plain_id = spawn_pane(&mut state, "plain-shell");
-        wait_for_recognized_session_kind(&state, claude_id);
+        wait_for_recognized_session_kind(&state, claude_id, "claude");
 
         let sessions = state.restorable_sessions();
         assert_eq!(
@@ -1771,7 +1818,14 @@ mod tests {
             1,
             "a plain (unrecognized) pane must not be captured: {sessions:?}"
         );
-        assert_eq!(sessions[0].cmd, "claude");
+        // The reconstructed, faithful invocation (see
+        // `ServerPane::foreground_restore_command`), not the bare tool
+        // name -- here that's just the fake binary's own absolute path,
+        // single-quoted, since it was spawned with no extra arguments.
+        assert_eq!(
+            sessions[0].cmd,
+            format!("'{}'", claude_path.to_str().unwrap())
+        );
         assert_eq!(sessions[0].name.as_deref(), Some("agent"));
 
         // `plain_id` genuinely exists but was correctly excluded --

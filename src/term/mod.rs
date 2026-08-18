@@ -436,6 +436,58 @@ impl ServerPane {
         })
     }
 
+    /// A shell command that would faithfully re-launch this pane's
+    /// current foreground process, if it's a recognized session --
+    /// `None` for everything else, same recognition rule as
+    /// `foreground_info`'s `session_kind`. Used by `daemon::state::
+    /// State::restorable_sessions` to persist something a plain `sh -c`
+    /// can actually run back, rather than just `SessionKind::as_str()`
+    /// (the bare tool name): omp is invoked only ever as a bun script
+    /// (`bun ~/.bun/bin/omp`, see `session_name::classify_with_cmd`'s
+    /// doc comment) with no guarantee a bare `omp` is independently on
+    /// the *daemon's* `$PATH` (which doesn't always match an
+    /// interactive shell's -- e.g. a daemon launched from a
+    /// minimal-`$PATH` service manager) -- restoring the bare name can
+    /// fail outright for exactly the tool that needs this most.
+    /// Reconstructs the live process's real `argv`, each element
+    /// single-quoted (embedded `'` escaped the standard POSIX way) so
+    /// arguments containing spaces or shell metacharacters survive the
+    /// round trip through `sh -c` unchanged. A recognized process with
+    /// no argv at all (never observed in practice, but defensive
+    /// against it anyway) falls back to the bare tool name rather than
+    /// producing an empty, useless command.
+    ///
+    /// Does its own separate `sysinfo` lookup, same rationale as
+    /// [`Self::derive_session_name`]'s: `foreground_info` only exposes
+    /// `process.name()`, not the full command line this needs.
+    pub fn foreground_restore_command(&self) -> Option<String> {
+        let guard = self.inner.lock().unwrap();
+        let pid = guard.master.process_group_leader()?;
+        drop(guard);
+
+        let mut system = sysinfo::System::new();
+        let sysinfo_pid = sysinfo::Pid::from_u32(pid as u32);
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[sysinfo_pid]),
+            true,
+            sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
+        );
+        let process = system.process(sysinfo_pid)?;
+        let process_name = process.name().to_string_lossy().into_owned();
+        let kind = session_name::classify_with_cmd(&process_name, process.cmd())?;
+        if process.cmd().is_empty() {
+            return Some(kind.as_str().to_string());
+        }
+        Some(
+            process
+                .cmd()
+                .iter()
+                .map(|arg| shell_quote(&arg.to_string_lossy()))
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    }
+
     /// A display name derived from this pane's foreground process, if
     /// it's a Claude Code or Codex CLI session with a resolvable title
     /// -- see [`session_name::derive_session_name`]. Returns `None` for
@@ -740,6 +792,17 @@ fn rgb_to_color_attr(rgb: Option<(u8, u8, u8)>) -> ColorAttribute {
         ),
         None => ColorAttribute::Default,
     }
+}
+
+/// Single-quote `arg` for safe use as one word in a POSIX `sh -c`
+/// command line -- used by [`ServerPane::foreground_restore_command`]
+/// to rebuild a faithful, round-trippable invocation from a live
+/// process's real `argv`. Standard POSIX trick for an embedded `'`:
+/// close the quote, emit a double-quoted literal `'`, reopen the
+/// quote -- nothing inside single quotes is special to `sh` except `'`
+/// itself, so this is the only character that needs escaping at all.
+fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', r#"'"'"'"#))
 }
 
 #[cfg(test)]
