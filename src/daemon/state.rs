@@ -17,8 +17,8 @@
 //! that never claims it will render nothing.
 
 use crate::protocol::{
-    AttachedBinding, ClientPane, ClientPaneId, GridSnapshot, ServerPaneId, ServerPaneInfo, Size,
-    SplitDir, SplitId, SplitTree, WorkspaceId, WorkspaceInfo,
+    AttachedBinding, ClientPane, ClientPaneId, ForegroundProcessInfo, GridSnapshot, ServerPaneId,
+    ServerPaneInfo, SessionKind, Size, SplitDir, SplitId, SplitTree, WorkspaceId, WorkspaceInfo,
 };
 use crate::term::{ServerPane, ServerPaneEvent};
 use serde::{Deserialize, Serialize};
@@ -451,12 +451,54 @@ impl State {
     /// skips a pane whose derived name collides with one already taken
     /// -- worth quietly falling back to no name rather than erroring
     /// out of `server_list` entirely over a cosmetic naming clash.
+    ///
+    /// Also skips every still-unnamed Codex pane that shares a `cwd`
+    /// with another still-unnamed Codex pane, rather than deriving a
+    /// name for either. Codex has no session-identifying flag at all
+    /// (see the `session_name` module doc), so `derive_session_name`
+    /// can only guess by matching `cwd` against on-disk rollout files
+    /// and taking whichever was modified most recently -- the same
+    /// answer for every pane asking about that `cwd`, regardless of
+    /// which pane's own session it actually is. Left unguarded, two
+    /// concurrent Codex sessions in the same directory would have
+    /// whichever pane this loop happens to visit first (via
+    /// `HashMap` iteration, so effectively unpredictable) steal that
+    /// shared answer as its own permanent name -- title text visibly
+    /// "belonging" to the wrong pane, resolved differently across
+    /// daemon restarts, which is exactly the "pane titles sometimes
+    /// swap" symptom this guards against. The ambiguity naturally
+    /// clears once only one such pane is left unnamed.
     fn apply_pending_session_names(&mut self) {
-        let to_name: Vec<(ServerPaneId, String)> = self
+        let unnamed_foreground: Vec<(ServerPaneId, ForegroundProcessInfo)> = self
             .server_panes
             .iter()
             .filter(|(_, pane)| pane.name().is_none())
-            .filter_map(|(&id, pane)| pane.derive_session_name().map(|name| (id, name)))
+            .filter_map(|(&id, pane)| pane.foreground_info().map(|f| (id, f)))
+            .collect();
+
+        let mut codex_cwd_counts: HashMap<String, usize> = HashMap::new();
+        for (_, foreground) in &unnamed_foreground {
+            if foreground.session_kind == Some(SessionKind::Codex)
+                && let Some(cwd) = &foreground.cwd
+            {
+                *codex_cwd_counts.entry(cwd.clone()).or_insert(0) += 1;
+            }
+        }
+        let cwd_is_ambiguous = |foreground: &ForegroundProcessInfo| {
+            foreground.session_kind == Some(SessionKind::Codex)
+                && foreground
+                    .cwd
+                    .as_ref()
+                    .is_some_and(|cwd| codex_cwd_counts.get(cwd).copied().unwrap_or(0) > 1)
+        };
+
+        let to_name: Vec<(ServerPaneId, String)> = unnamed_foreground
+            .iter()
+            .filter(|(_, foreground)| !cwd_is_ambiguous(foreground))
+            .filter_map(|(id, _)| {
+                let pane = self.server_panes.get(id)?;
+                Some((*id, pane.derive_session_name()?))
+            })
             .collect();
         for (id, name) in to_name {
             if self.find_server_pane_by_name(&name).is_some() {
@@ -1879,6 +1921,182 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&config_dir);
         let _ = std::fs::remove_dir_all(&bin_dir);
+    }
+
+    /// Writes a Codex rollout file under `home/.codex/sessions/2026/01/01/`
+    /// that `codex_title_for_cwd` can resolve `cwd` against -- a
+    /// `session_meta` line recording `cwd` (what `rollout_cwd` reads)
+    /// followed by a `user_message` line (what `first_codex_user_message`
+    /// reads for the derived title text).
+    fn write_codex_rollout(home: &std::path::Path, filename: &str, cwd: &str, first_message: &str) {
+        let sessions_dir = home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("01")
+            .join("01");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let session_meta_line = format!(r#"{{"type":"session_meta","payload":{{"cwd":{cwd:?}}}}}"#);
+        let user_message_line = format!(
+            r#"{{"type":"event_msg","payload":{{"type":"user_message","message":{first_message:?}}}}}"#
+        );
+        std::fs::write(
+            sessions_dir.join(filename),
+            format!("{session_meta_line}\n{user_message_line}\n"),
+        )
+        .unwrap();
+    }
+
+    /// Regression test for "pane titles sometimes swap": Codex has no
+    /// session-identifying flag (see `session_name` module doc), so its
+    /// title-derivation can only match a still-unnamed pane's `cwd`
+    /// against on-disk rollout files -- the same answer no matter which
+    /// of two panes sharing that `cwd` is asking. Without
+    /// `apply_pending_session_names`'s ambiguity guard, whichever pane
+    /// this loop visits first (unpredictable `HashMap` iteration order)
+    /// would steal that shared answer as its own permanent name.
+    #[test]
+    fn apply_pending_session_names_skips_ambiguous_codex_panes_sharing_a_cwd() {
+        let home_dir =
+            std::env::temp_dir().join(format!("dmx-codex-ambiguous-home-{}", std::process::id()));
+        let bin_dir =
+            std::env::temp_dir().join(format!("dmx-codex-ambiguous-bin-{}", std::process::id()));
+        let target_cwd_raw =
+            std::env::temp_dir().join(format!("dmx-codex-ambiguous-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&target_cwd_raw).unwrap();
+        // Canonicalize: `std::env::temp_dir()` on macOS returns a
+        // `/var/...` path that's itself a symlink to `/private/var/...`,
+        // which is what a live process's own reported cwd (`getcwd()`,
+        // read back via `foreground_info`) actually resolves to -- the
+        // rollout file's recorded `cwd` and the spawned pane's cwd must
+        // match that same resolved form for `find_codex_transcript` to
+        // find it at all.
+        let target_cwd = std::fs::canonicalize(&target_cwd_raw)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        write_codex_rollout(&home_dir, "only.jsonl", &target_cwd, "fix the parser");
+
+        let codex_a = fake_binary_named(&bin_dir.join("a"), "codex");
+        let codex_b = fake_binary_named(&bin_dir.join("b"), "codex");
+
+        let guard = crate::ENV_FAKE_HOME_LOCK.blocking_lock();
+        let prev = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home_dir);
+        }
+
+        let mut state = State::new();
+        let pane_a = state
+            .server_spawn(
+                None,
+                Some(codex_a.to_str().unwrap().to_string()),
+                Some(target_cwd.clone()),
+            )
+            .unwrap()
+            .id;
+        let pane_b = state
+            .server_spawn(
+                None,
+                Some(codex_b.to_str().unwrap().to_string()),
+                Some(target_cwd.clone()),
+            )
+            .unwrap()
+            .id;
+        wait_for_recognized_session_kind(&state, pane_a, "codex");
+        wait_for_recognized_session_kind(&state, pane_b, "codex");
+
+        let names: HashMap<ServerPaneId, Option<String>> = state
+            .server_list()
+            .into_iter()
+            .map(|p| (p.id, p.name))
+            .collect();
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        drop(guard);
+
+        assert_eq!(
+            names[&pane_a], None,
+            "ambiguous cwd match must not steal the other pane's derived title"
+        );
+        assert_eq!(
+            names[&pane_b], None,
+            "ambiguous cwd match must not steal the other pane's derived title"
+        );
+
+        let _ = std::fs::remove_dir_all(&home_dir);
+        let _ = std::fs::remove_dir_all(&bin_dir);
+        let _ = std::fs::remove_dir_all(&target_cwd);
+    }
+
+    /// Control for the ambiguity guard above: a *lone* Codex pane in a
+    /// cwd with a matching rollout file must still get auto-named --
+    /// confirming the guard only suppresses genuinely ambiguous cases,
+    /// not Codex auto-naming in general.
+    #[test]
+    fn apply_pending_session_names_names_an_unambiguous_codex_pane() {
+        let home_dir =
+            std::env::temp_dir().join(format!("dmx-codex-lone-home-{}", std::process::id()));
+        let bin_dir =
+            std::env::temp_dir().join(format!("dmx-codex-lone-bin-{}", std::process::id()));
+        let target_cwd_raw =
+            std::env::temp_dir().join(format!("dmx-codex-lone-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&target_cwd_raw).unwrap();
+        // See the sibling ambiguity test's comment on canonicalizing
+        // this: macOS's `/var` -> `/private/var` symlink means the raw
+        // temp path and the live process's own reported cwd otherwise
+        // don't match as strings.
+        let target_cwd = std::fs::canonicalize(&target_cwd_raw)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        write_codex_rollout(&home_dir, "only.jsonl", &target_cwd, "fix the parser");
+
+        let codex_bin = fake_binary_named(&bin_dir, "codex");
+
+        let guard = crate::ENV_FAKE_HOME_LOCK.blocking_lock();
+        let prev = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home_dir);
+        }
+
+        let mut state = State::new();
+        let pane = state
+            .server_spawn(
+                None,
+                Some(codex_bin.to_str().unwrap().to_string()),
+                Some(target_cwd.clone()),
+            )
+            .unwrap()
+            .id;
+        wait_for_recognized_session_kind(&state, pane, "codex");
+
+        let names: HashMap<ServerPaneId, Option<String>> = state
+            .server_list()
+            .into_iter()
+            .map(|p| (p.id, p.name))
+            .collect();
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        drop(guard);
+
+        assert_eq!(names[&pane], Some("fix the parser".to_string()));
+
+        let _ = std::fs::remove_dir_all(&home_dir);
+        let _ = std::fs::remove_dir_all(&bin_dir);
+        let _ = std::fs::remove_dir_all(&target_cwd);
     }
 
     #[test]
