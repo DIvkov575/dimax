@@ -1512,8 +1512,16 @@ mod tests {
     /// output until its PTY master is dropped, so pane bookkeeping is
     /// exercised without depending on process timing.
     fn spawn_pane(state: &mut State, name: &str) -> ServerPaneId {
+        // Explicit cwd: portable-pty falls back to chdir($HOME) when the
+        // cwd is unset, and $HOME is process-global -- other tests fake
+        // it to temp dirs they delete afterward, which fails this spawn
+        // with ENOENT. The temp dir always exists.
         state
-            .server_spawn(Some(name.to_string()), Some("cat".to_string()), None)
+            .server_spawn(
+                Some(name.to_string()),
+                Some("cat".to_string()),
+                Some(std::env::temp_dir().to_string_lossy().into_owned()),
+            )
             .unwrap()
             .id
     }
@@ -1639,7 +1647,17 @@ mod tests {
 
         state.server_kill("shared").unwrap();
 
-        assert!(state.server_list().is_empty());
+        // Removal/unbinding is EOF-driven and asynchronous (see
+        // `wait_for_tabs`): poll until every observable effect has landed
+        // before asserting, rather than racing the death-detection thread.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !state.server_list().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "killed pane was never removed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert!(state.server_pane(sp).is_none());
         // Design doc: the client-panes survive as unbound placeholders.
         for (ws, pane) in [(ws_a, pane_a), (ws_b, pane_b)] {
@@ -1846,8 +1864,14 @@ mod tests {
         let claude_id = state
             .server_spawn(
                 Some("agent".to_string()),
-                Some(claude_path.to_str().unwrap().to_string()),
-                None,
+                // `exec` so the foreground group leader IS the tool on
+                // Linux too (dash forks `sh -c cmd`; the leader would
+                // otherwise stay `sh` and never be recognized by name).
+                Some(format!("exec {}", claude_path.to_str().unwrap())),
+                // Explicit cwd for the same reason as `spawn_pane`:
+                // an unset cwd makes portable-pty chdir($HOME), which
+                // other tests are concurrently faking/deleting.
+                Some(std::env::temp_dir().to_string_lossy().into_owned()),
             )
             .unwrap()
             .id;
@@ -1991,7 +2015,7 @@ mod tests {
         let pane_a = state
             .server_spawn(
                 None,
-                Some(codex_a.to_str().unwrap().to_string()),
+                Some(format!("exec {}", codex_a.to_str().unwrap())),
                 Some(target_cwd.clone()),
             )
             .unwrap()
@@ -1999,7 +2023,7 @@ mod tests {
         let pane_b = state
             .server_spawn(
                 None,
-                Some(codex_b.to_str().unwrap().to_string()),
+                Some(format!("exec {}", codex_b.to_str().unwrap())),
                 Some(target_cwd.clone()),
             )
             .unwrap()
@@ -2071,7 +2095,7 @@ mod tests {
         let pane = state
             .server_spawn(
                 None,
-                Some(codex_bin.to_str().unwrap().to_string()),
+                Some(format!("exec {}", codex_bin.to_str().unwrap())),
                 Some(target_cwd.clone()),
             )
             .unwrap()
@@ -2125,13 +2149,13 @@ mod tests {
 
     /// Serializes every test in this section: `toggle_pinned_dir` saves
     /// to disk via `pinned_dirs::save`, which reads `$XDG_CONFIG_HOME`
-    /// (process-global), so two such tests running concurrently (the
-    /// default under `cargo test`) could otherwise stomp on each
-    /// other's env state or on-disk file mid-test.
-    static PIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// (process-global). Takes `crate::ENV_FAKE_HOME_LOCK` -- not a
+    /// module-local mutex -- because other modules' tests fake this
+    /// same var (and `HOME`, whose `.config` fallback this var
+    /// overrides); a private lock only serializes this section against
+    /// itself.
     fn with_fake_config_home<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let _guard = PIN_ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_FAKE_HOME_LOCK.blocking_lock();
         let prev = std::env::var_os("XDG_CONFIG_HOME");
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", dir);
@@ -2777,9 +2801,29 @@ mod tests {
         // active_tab is 1 (sp2); sp1 is a *background* tab.
         state.server_kill("a").unwrap();
 
-        let leaf = leaf_of(&state, ws, pane);
+        let leaf = wait_for_tabs(&state, ws, pane, &[sp2]);
         assert_eq!(leaf.tabs, vec![sp2]);
         assert_eq!(leaf.active_tab, 0);
+    }
+
+    /// `server_kill` unbinds the pane from tabs when its EOF-driven death
+    /// detection fires on a background thread, so the removal becomes
+    /// visible here asynchronously -- poll for it rather than asserting
+    /// immediately (same deadline pattern as `wait_for_recognized_session_kind`).
+    fn wait_for_tabs(
+        state: &State,
+        workspace: WorkspaceId,
+        pane: ClientPaneId,
+        expected: &[ServerPaneId],
+    ) -> ClientPane {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let leaf = leaf_of(state, workspace, pane);
+            if leaf.tabs == expected || std::time::Instant::now() > deadline {
+                return leaf;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     /// A background tab *before* the active one is removed: `active_tab`
@@ -2803,7 +2847,7 @@ mod tests {
 
         state.server_kill("a").unwrap();
 
-        let leaf = leaf_of(&state, ws, pane);
+        let leaf = wait_for_tabs(&state, ws, pane, &[sp2, sp3]);
         assert_eq!(leaf.tabs, vec![sp2, sp3]);
         assert_eq!(
             leaf.active_bound(),
@@ -3031,14 +3075,21 @@ mod tests {
             .server_spawn(
                 Some("greeter".to_string()),
                 Some("printf hi".to_string()),
-                None,
+                Some(std::env::temp_dir().to_string_lossy().into_owned()),
             )
             .unwrap();
         // `blocking_recv` outside a runtime is explicitly supported by
-        // tokio, so this stays a plain synchronous unit test.
-        let event = events
-            .blocking_recv()
-            .expect("pane reader thread sent nothing");
+        // tokio, so this stays a plain synchronous unit test -- but bound
+        // the wait: an event delayed or dropped under heavy parallel load
+        // would otherwise hang the whole suite forever.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(events.blocking_recv());
+        });
+        let event = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("pane reader thread sent nothing within 10s")
+            .expect("event stream ended without a pane event");
         match event {
             ServerPaneEvent::Changed(id) | ServerPaneEvent::Died(id) => assert_eq!(id, info.id),
         }

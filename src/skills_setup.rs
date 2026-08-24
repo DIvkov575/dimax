@@ -40,13 +40,13 @@ pub fn install() -> anyhow::Result<std::path::PathBuf> {
 mod tests {
     use super::*;
 
-    /// Serializes tests that mutate `HOME` (process-global) so two can't
-    /// stomp on each other's env state mid-test -- same pattern as
-    /// `kitty_setup`'s `ENV_LOCK`.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// Serializes tests that mutate `HOME` (process-global). Takes the
+    /// crate-wide `crate::ENV_FAKE_HOME_LOCK` -- not a module-local mutex
+    /// -- because `daemon::state`'s tests fake `HOME` too, and two
+    /// different locks let those tests run in parallel with these,
+    /// stomping each other's `HOME` mid-test.
     fn with_fake_home<T>(home: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_FAKE_HOME_LOCK.blocking_lock();
         let prev = std::env::var_os("HOME");
         unsafe {
             std::env::set_var("HOME", home);

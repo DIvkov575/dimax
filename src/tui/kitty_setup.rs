@@ -175,13 +175,10 @@ pub fn ensure_config_written() -> anyhow::Result<PathBuf> {
 mod tests {
     use super::*;
 
-    /// Serializes every test in this module that mutates
-    /// `KITTY_WINDOW_ID`/`KITTY_CONFIG_DIRECTORY` -- both are
-    /// process-global, so two such tests running concurrently (the
-    /// default under `cargo test`) could otherwise stomp on each
-    /// other's env state mid-test.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    // Tests in this module that fake `KITTY_WINDOW_ID`/`KITTY_CONFIG_DIRECTORY`
+    // (both process-global) do so under `crate::ENV_FAKE_HOME_LOCK` via
+    // `with_fake_kitty_env`, so they can't interleave with other modules'
+    // env fakes.
     /// `render_dimax_conf`'s output must actually round-trip through
     /// `keys::parse` for every chord byte in [`keys::BINDINGS`] -- catches the
     /// exact class of bug this module exists to prevent: the generated
@@ -245,7 +242,7 @@ mod tests {
     /// for `set_var`/`remove_var` themselves (Rust 2024 edition); safe in
     /// practice because the mutex serializes every caller.
     fn with_fake_kitty_env<T>(config_dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_FAKE_HOME_LOCK.blocking_lock();
         let prev_window_id = std::env::var_os("KITTY_WINDOW_ID");
         let prev_config_dir = std::env::var_os("KITTY_CONFIG_DIRECTORY");
         unsafe {

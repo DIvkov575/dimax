@@ -853,12 +853,12 @@ fn has_tmux_prefix(sequence: &[u8]) -> bool {
 mod tests {
     use super::*;
 
-    /// Serializes tests that mutate `XDG_CONFIG_HOME` (process-global) --
-    /// same pattern as `daemon::state`'s `PIN_ENV_LOCK`.
-    static CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// Serializes tests that mutate `XDG_CONFIG_HOME` (process-global).
+    /// Takes `crate::ENV_FAKE_HOME_LOCK` -- not a module-local mutex --
+    /// per that lock's doc comment: every module's env-faking tests must
+    /// share one lock or they race each other's env mid-test.
     fn with_fake_config_home<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let _guard = CONFIG_ENV_LOCK.lock().unwrap();
+        let _guard = crate::ENV_FAKE_HOME_LOCK.blocking_lock();
         let prev = std::env::var_os("XDG_CONFIG_HOME");
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", dir);
