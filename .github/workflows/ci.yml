@@ -5,6 +5,7 @@ on:
     branches: [main, dev, stable]
   pull_request:
     branches: [main, dev, stable]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,6 +18,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # Bounds a wedged test run: the default job timeout is 6 hours,
+    # which a single hung await would otherwise burn in full.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
