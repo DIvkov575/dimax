@@ -1,7 +1,7 @@
 class Dimax < Formula
   desc "Terminal multiplexer with persistent sessions and synchronized workspaces"
   homepage "https://github.com/DIvkov575/dimax"
-  head "https://github.com/DIvkov575/dimax.git", branch: "main"
+  head "https://github.com/DIvkov575/dimax.git", branch: "stable"
 
   depends_on "rust" => :build
 

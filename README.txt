@@ -62,6 +62,10 @@ For Homebrew, use the repository as a source-build tap:
     brew tap divkov575/dimax https://github.com/DIvkov575/dimax
     brew install --HEAD divkov575/dimax/dimax
 
+`brew install --HEAD` builds the `stable` branch -- the last line the
+full test suite passed on -- rather than `main`, so taps never ship a
+broken tip.
+
 All install methods above only place the binary; they never touch your
 terminal config or `~/.claude` on their own. Run `dimax keys install
 --mode <mode>` yourself afterward, or let the first-run wizard do it

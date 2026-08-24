@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev, stable]
+  pull_request:
+    branches: [main, dev, stable]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Edition 2024 needs Rust >= 1.85; stable toolchain satisfies that.
+      - name: Build
+        run: cargo build --locked --all-targets
+
+      - name: Format
+        run: cargo fmt --check
+
+      # Advisory: reports lints but does not fail the build yet.
+      - name: Clippy
+        run: cargo clippy --locked --all-targets
+
+      - name: Test
+        run: cargo test --locked
