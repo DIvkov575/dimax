@@ -3036,6 +3036,14 @@ mod tests {
     use crate::protocol::{ClientPane, SessionKind};
     use uuid::Uuid;
 
+    /// Explicit cwd for test `ServerSpawn`s: the daemon runs in-process
+    /// here, and portable-pty chdirs to `$HOME` when the cwd is unset --
+    /// which other tests are concurrently faking to temp dirs they then
+    /// delete, failing spawns with ENOENT. The temp dir always exists.
+    fn test_cwd() -> String {
+        std::env::temp_dir().to_string_lossy().into_owned()
+    }
+
     fn leaf(id: ClientPaneId) -> SplitTree {
         SplitTree::Leaf(ClientPane {
             id,
@@ -4447,7 +4455,7 @@ mod tests {
                     Request::ServerSpawn {
                         name: Some(name.to_string()),
                         cmd: None,
-                        cwd: None,
+                        cwd: Some(test_cwd()),
                     },
                 )
                 .await
@@ -4636,7 +4644,7 @@ mod tests {
                 Request::ServerSpawn {
                     name: None,
                     cmd: Some("cat".to_string()),
-                    cwd: None,
+                    cwd: Some(test_cwd()),
                 },
             )
             .await
@@ -4725,7 +4733,7 @@ mod tests {
                 Request::ServerSpawn {
                     name: None,
                     cmd: Some("cat".to_string()),
-                    cwd: None,
+                    cwd: Some(test_cwd()),
                 },
             )
             .await
@@ -4857,7 +4865,7 @@ mod tests {
                 Request::ServerSpawn {
                     name: None,
                     cmd: Some("cat".to_string()),
-                    cwd: None,
+                    cwd: Some(test_cwd()),
                 },
             )
             .await
@@ -4872,7 +4880,7 @@ mod tests {
                 Request::ServerSpawn {
                     name: None,
                     cmd: Some("cat".to_string()),
-                    cwd: None,
+                    cwd: Some(test_cwd()),
                 },
             )
             .await
@@ -4979,7 +4987,7 @@ mod tests {
                 Request::ServerSpawn {
                     name: None,
                     cmd: Some("cat".to_string()),
-                    cwd: None,
+                    cwd: Some(test_cwd()),
                 },
             )
             .await
@@ -5073,7 +5081,7 @@ mod tests {
                 Request::ServerSpawn {
                     name: None,
                     cmd: Some("cat".to_string()),
-                    cwd: None,
+                    cwd: Some(test_cwd()),
                 },
             )
             .await
@@ -5231,7 +5239,7 @@ mod tests {
                 Request::ServerSpawn {
                     name: None,
                     cmd: Some("cat".to_string()),
-                    cwd: None,
+                    cwd: Some(test_cwd()),
                 },
             )
             .await
@@ -5246,7 +5254,7 @@ mod tests {
                 Request::ServerSpawn {
                     name: None,
                     cmd: Some("cat".to_string()),
-                    cwd: None,
+                    cwd: Some(test_cwd()),
                 },
             )
             .await
@@ -5364,7 +5372,7 @@ mod tests {
                 Request::ServerSpawn {
                     name: None,
                     cmd: Some("cat".to_string()),
-                    cwd: None,
+                    cwd: Some(test_cwd()),
                 },
             )
             .await
@@ -5379,7 +5387,7 @@ mod tests {
                 Request::ServerSpawn {
                     name: None,
                     cmd: Some("cat".to_string()),
-                    cwd: None,
+                    cwd: Some(test_cwd()),
                 },
             )
             .await
@@ -5394,7 +5402,7 @@ mod tests {
                 Request::ServerSpawn {
                     name: None,
                     cmd: Some("cat".to_string()),
-                    cwd: None,
+                    cwd: Some(test_cwd()),
                 },
             )
             .await
@@ -5506,7 +5514,7 @@ mod tests {
                 Request::ServerSpawn {
                     name: None,
                     cmd: Some("cat".to_string()),
-                    cwd: None,
+                    cwd: Some(test_cwd()),
                 },
             )
             .await
@@ -5521,7 +5529,7 @@ mod tests {
                 Request::ServerSpawn {
                     name: None,
                     cmd: Some("cat".to_string()),
-                    cwd: None,
+                    cwd: Some(test_cwd()),
                 },
             )
             .await
@@ -5617,7 +5625,7 @@ mod tests {
                 Request::ServerSpawn {
                     name: None,
                     cmd: Some("cat".to_string()),
-                    cwd: None,
+                    cwd: Some(test_cwd()),
                 },
             )
             .await

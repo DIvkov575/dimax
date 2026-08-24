@@ -1257,6 +1257,14 @@ mod tests {
     use tokio::net::UnixStream;
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
+    /// Explicit cwd for test `ServerSpawn`s: the daemon runs in-process
+    /// here, and portable-pty chdirs to `$HOME` when the cwd is unset --
+    /// which other tests are concurrently faking to temp dirs they then
+    /// delete, failing spawns with ENOENT. The temp dir always exists.
+    fn test_cwd() -> String {
+        std::env::temp_dir().to_string_lossy().into_owned()
+    }
+
     /// Owns the socket file path `run()` binds and removes it on drop.
     /// `UnixListener::bind` requires the path not to already exist, and
     /// nothing un-links the file once the daemon's accept-loop task is
@@ -1412,7 +1420,7 @@ mod tests {
             .request(Request::ServerSpawn {
                 name: None,
                 cmd: Some("printf hello".to_string()),
-                cwd: None,
+                cwd: Some(test_cwd()),
             })
             .await
         {
@@ -1563,7 +1571,7 @@ mod tests {
             .request(Request::ServerSpawn {
                 name: None,
                 cmd: Some("cat".to_string()),
-                cwd: None,
+                cwd: Some(test_cwd()),
             })
             .await
         {
@@ -1651,7 +1659,7 @@ mod tests {
             .request(Request::ServerSpawn {
                 name: None,
                 cmd: Some("cat".to_string()),
-                cwd: None,
+                cwd: Some(test_cwd()),
             })
             .await
         {
@@ -1747,7 +1755,7 @@ mod tests {
             .request(Request::ServerSpawn {
                 name: None,
                 cmd: Some("cat".to_string()),
-                cwd: None,
+                cwd: Some(test_cwd()),
             })
             .await
         {
@@ -1814,7 +1822,7 @@ mod tests {
             .request(Request::ServerSpawn {
                 name: None,
                 cmd: Some("cat".to_string()),
-                cwd: None,
+                cwd: Some(test_cwd()),
             })
             .await
         {
@@ -1947,7 +1955,7 @@ mod tests {
             .request(Request::ServerSpawn {
                 name: None,
                 cmd: Some("cat".to_string()),
-                cwd: None,
+                cwd: Some(test_cwd()),
             })
             .await
         {
@@ -2021,7 +2029,7 @@ mod tests {
                 .request(Request::ServerSpawn {
                     name: None,
                     cmd: Some("cat".to_string()),
-                    cwd: None,
+                    cwd: Some(test_cwd()),
                 })
                 .await
             {
@@ -2198,7 +2206,7 @@ mod tests {
                 .request(Request::ServerSpawn {
                     name: None,
                     cmd: Some(format!("printf {text}")),
-                    cwd: None,
+                    cwd: Some(test_cwd()),
                 })
                 .await
             {
@@ -2499,7 +2507,7 @@ mod tests {
             .request(Request::ServerSpawn {
                 name: None,
                 cmd: Some("cat".to_string()),
-                cwd: None,
+                cwd: Some(test_cwd()),
             })
             .await
         {
@@ -2557,7 +2565,7 @@ mod tests {
             .request(Request::ServerSpawn {
                 name: None,
                 cmd: Some("cat".to_string()),
-                cwd: None,
+                cwd: Some(test_cwd()),
             })
             .await
         {
@@ -2704,7 +2712,7 @@ mod tests {
             .request(Request::ServerSpawn {
                 name: None,
                 cmd: Some("yes".to_string()),
-                cwd: None,
+                cwd: Some(test_cwd()),
             })
             .await
         {
@@ -2750,7 +2758,7 @@ mod tests {
                 .request(Request::ServerSpawn {
                     name: Some(format!("unrelated-{i}")),
                     cmd: None,
-                    cwd: None,
+                    cwd: Some(test_cwd()),
                 })
                 .await
             {

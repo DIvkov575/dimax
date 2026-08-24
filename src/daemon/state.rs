@@ -1485,13 +1485,13 @@ mod tests {
     fn server_spawn_assigns_sequential_short_ids_starting_at_00() {
         let mut state = State::new();
         let a = state
-            .server_spawn(None, Some("cat".to_string()), None)
+            .server_spawn(None, Some("cat".to_string()), Some(test_cwd()))
             .unwrap();
         let b = state
-            .server_spawn(None, Some("cat".to_string()), None)
+            .server_spawn(None, Some("cat".to_string()), Some(test_cwd()))
             .unwrap();
         let c = state
-            .server_spawn(None, Some("cat".to_string()), None)
+            .server_spawn(None, Some("cat".to_string()), Some(test_cwd()))
             .unwrap();
         assert_eq!(a.short_id, "00");
         assert_eq!(b.short_id, "01");
@@ -1502,7 +1502,11 @@ mod tests {
     fn short_id_survives_into_server_list() {
         let mut state = State::new();
         state
-            .server_spawn(Some("shell".to_string()), Some("cat".to_string()), None)
+            .server_spawn(
+                Some("shell".to_string()),
+                Some("cat".to_string()),
+                Some(test_cwd()),
+            )
             .unwrap();
         let listed = state.server_list();
         assert_eq!(listed[0].short_id, "00");
@@ -1512,18 +1516,21 @@ mod tests {
     /// output until its PTY master is dropped, so pane bookkeeping is
     /// exercised without depending on process timing.
     fn spawn_pane(state: &mut State, name: &str) -> ServerPaneId {
-        // Explicit cwd: portable-pty falls back to chdir($HOME) when the
-        // cwd is unset, and $HOME is process-global -- other tests fake
-        // it to temp dirs they delete afterward, which fails this spawn
-        // with ENOENT. The temp dir always exists.
         state
             .server_spawn(
                 Some(name.to_string()),
                 Some("cat".to_string()),
-                Some(std::env::temp_dir().to_string_lossy().into_owned()),
+                Some(test_cwd()),
             )
             .unwrap()
             .id
+    }
+
+    /// Explicit cwd for direct `server_spawn` test calls: unset cwd
+    /// makes portable-pty chdir($HOME), which other tests concurrently
+    /// fake to deleted temp dirs (ENOENT). See `spawn_pane`.
+    fn test_cwd() -> String {
+        std::env::temp_dir().to_string_lossy().into_owned()
     }
 
     /// A workspace with one leaf bound to `server_pane`, returning the leaf.
@@ -1553,7 +1560,11 @@ mod tests {
     fn server_spawn_returns_info_and_lists_it() {
         let mut state = State::new();
         let info = state
-            .server_spawn(Some("shell".to_string()), Some("cat".to_string()), None)
+            .server_spawn(
+                Some("shell".to_string()),
+                Some("cat".to_string()),
+                Some(test_cwd()),
+            )
             .unwrap();
         assert_eq!(info.name.as_deref(), Some("shell"));
         assert_eq!(info.size, DEFAULT_PTY_SIZE);
@@ -1568,7 +1579,11 @@ mod tests {
         let mut state = State::new();
         spawn_pane(&mut state, "shell");
         let err = state
-            .server_spawn(Some("shell".to_string()), Some("cat".to_string()), None)
+            .server_spawn(
+                Some("shell".to_string()),
+                Some("cat".to_string()),
+                Some(test_cwd()),
+            )
             .unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
         assert_eq!(state.server_list().len(), 1);
@@ -1578,10 +1593,10 @@ mod tests {
     fn server_spawn_allows_repeated_anonymous_panes() {
         let mut state = State::new();
         state
-            .server_spawn(None, Some("cat".to_string()), None)
+            .server_spawn(None, Some("cat".to_string()), Some(test_cwd()))
             .unwrap();
         state
-            .server_spawn(None, Some("cat".to_string()), None)
+            .server_spawn(None, Some("cat".to_string()), Some(test_cwd()))
             .unwrap();
         assert_eq!(state.server_list().len(), 2);
     }
@@ -1683,7 +1698,7 @@ mod tests {
     fn server_list_leaves_unnamed_non_session_panes_unnamed() {
         let mut state = State::new();
         state
-            .server_spawn(None, Some("cat".to_string()), None)
+            .server_spawn(None, Some("cat".to_string()), Some(test_cwd()))
             .unwrap();
         let names: Vec<Option<String>> = state.server_list().into_iter().map(|i| i.name).collect();
         assert_eq!(names, vec![None]);
@@ -2349,7 +2364,7 @@ mod tests {
     fn client_and_server_short_ids_are_independent_sequences() {
         let mut state = State::new();
         state
-            .server_spawn(None, Some("cat".to_string()), None)
+            .server_spawn(None, Some("cat".to_string()), Some(test_cwd()))
             .unwrap();
         let ws = state.resolve_or_create_workspace("1").unwrap();
         let pane = state.client_spawn(ws, None, None, None).unwrap();
@@ -3041,7 +3056,7 @@ mod tests {
     fn scroll_server_pane_clamps_at_zero() {
         let mut state = State::new();
         let info = state
-            .server_spawn(None, Some("cat".to_string()), None)
+            .server_spawn(None, Some("cat".to_string()), Some(test_cwd()))
             .unwrap();
         let offset = state.scroll_server_pane(1, info.id, 5);
         assert_eq!(offset, 0);
@@ -3052,7 +3067,7 @@ mod tests {
     fn scroll_server_pane_absent_entry_defaults_to_zero_before_first_call() {
         let mut state = State::new();
         let info = state
-            .server_spawn(None, Some("cat".to_string()), None)
+            .server_spawn(None, Some("cat".to_string()), Some(test_cwd()))
             .unwrap();
         let offset = state.scroll_server_pane(1, info.id, -5);
         assert_eq!(offset, 0);
