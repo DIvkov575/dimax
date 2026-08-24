@@ -16,7 +16,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    # Bounds a wedged test run: the default job timeout is 6 hours,
+    # which a single hung await would otherwise burn in full.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
