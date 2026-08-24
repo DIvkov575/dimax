@@ -4980,7 +4980,7 @@ mod tests {
     async fn detach_and_open_menu_preselects_the_just_detached_pane() {
         let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
 
-        let Response::ServerPane(existing) = app
+        let existing = match app
             .request(
                 &mut write_half,
                 &mut reader,
@@ -4992,8 +4992,9 @@ mod tests {
             )
             .await
             .unwrap()
-        else {
-            panic!("expected ServerPane");
+        {
+            Response::ServerPane(p) => p,
+            other => panic!("expected ServerPane, got {other:?}"),
         };
         let existing_id = existing.id;
         let Response::ClientPaneCreated { pane, .. } = app
@@ -5365,7 +5366,7 @@ mod tests {
     async fn detach_and_reattach_on_a_multi_tab_leaf_preserves_the_other_tab() {
         let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
 
-        let Response::ServerPane(sp1) = app
+        let sp1 = match app
             .request(
                 &mut write_half,
                 &mut reader,
@@ -5377,8 +5378,9 @@ mod tests {
             )
             .await
             .unwrap()
-        else {
-            panic!("expected ServerPane");
+        {
+            Response::ServerPane(p) => p,
+            other => panic!("expected ServerPane, got {other:?}"),
         };
         let Response::ServerPane(sp2) = app
             .request(

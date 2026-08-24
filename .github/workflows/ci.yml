@@ -40,4 +40,6 @@ jobs:
         run: cargo clippy --locked --all-targets
 
       - name: Test
-        run: cargo test --locked
+        run: |
+          ulimit -n 10240 2>/dev/null || true
+          cargo test --locked
