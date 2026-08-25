@@ -920,25 +920,23 @@ impl App {
     /// bound server-pane -- unlike `dimax client close`/`ClientCloseTab`
     /// alone (which deliberately leaves the server-pane running for
     /// scripted callers), this chord is meant to fully clean up what it
-    /// was looking at, the same way `cmd-shift-w` kills on demand. When
-    /// that was the pane's only tab the daemon closes the whole leaf
-    /// instead (see `state::client_close_tab`), so this degrades to the
-    /// old close-the-pane behavior on a single-tab leaf rather than
-    /// needing a separate chord -- in that leaf-closing case focus
-    /// reassignment happens via `reconcile_focus` once the resulting
-    /// `LayoutDelta` lands, rather than being computed here from a tree
-    /// this function doesn't have an up-to-date copy of yet.
-    ///
-    /// A pane that's *already* unbound (no tabs at all -- e.g. right
-    /// after detaching via `cmd-shift-z` and backing out of the picker)
-    /// is a complete no-op: there is no tab to drop and nothing to kill,
-    /// so unlike the daemon's own `client_close_tab` (which treats an
-    /// empty leaf the same as "just removed its last tab" and closes it
-    /// -- a reasonable default for a scripted `dimax client close-tab`
-    /// caller), cmd-w must not fall through to removing the pane from
-    /// the layout. Losing a grid slot you never asked to close is
-    /// exactly the surprise this chord already avoids for the
-    /// multi-tab case.
+    /// was looking at. When that was the pane's only tab the daemon
+    /// closes the whole leaf instead (see `state::client_close_tab`),
+    /// so this degrades to closing the pane itself on a single-tab
+    /// leaf. A pane that's *already* unbound (no tabs at all -- e.g.
+    /// right after detaching via `cmd-shift-z` and backing out of the
+    /// picker) closes the same way: `ClientCloseTab` on an empty leaf
+    /// removes the pane from the layout (the owner's call -- the empty
+    /// placeholder is clutter to clean up, not a grid slot to
+    /// preserve), with no `ServerKill` since nothing is bound to kill.
+    /// Closing the workspace's last pane lands in the empty-workspace
+    /// render state rather than exiting. In every leaf-closing case
+    /// focus reassignment happens via `reconcile_focus` once the
+    /// resulting `LayoutDelta` lands, rather than being computed here
+    /// from a tree this function doesn't have an up-to-date copy of
+    /// yet. The one layout this chord still never touches is a
+    /// multi-tab pane: closing the active tab there must not remove
+    /// the pane from the grid.
     async fn close_tab(
         &mut self,
         write_half: &mut OwnedWriteHalf,
@@ -951,30 +949,30 @@ impl App {
         // `ClientCloseTab` lands, the tab (and, if it was the last one,
         // the leaf itself) is already gone, so there's no later point
         // at which this could still be read back (same reasoning as
-        // `AttachMenu.previously_bound`'s doc comment). `None` here means
-        // the leaf has no tabs at all, not just that the active one
-        // happens to be unbound (every leaf with a non-empty `tabs` has
-        // a valid `active_tab` index, so `active_bound` only returns
-        // `None` when `tabs` is empty) -- see this method's doc comment
-        // for why that case returns early instead of proceeding.
-        let Some(bound) = self
+        // `AttachMenu.previously_bound`'s doc comment). `None` here
+        // means the leaf has no tabs at all, not just that the active
+        // one happens to be unbound (every leaf with a non-empty
+        // `tabs` has a valid `active_tab` index, so `active_bound`
+        // only returns `None` when `tabs` is empty) -- in that case
+        // the pane itself is what closes, and there is no bound
+        // server-pane to kill afterward.
+        let bound = self
             .workspace
             .tree
             .as_ref()
             .and_then(|t| t.find(pane))
-            .and_then(|p| p.active_bound())
-        else {
-            return Ok(());
-        };
+            .and_then(|p| p.active_bound());
         let req = Request::ClientCloseTab {
             workspace: self.workspace.id.to_string(),
             pane,
         };
         let _ = self.request(write_half, reader, req).await?;
-        let req = Request::ServerKill {
-            target: bound.to_string(),
-        };
-        let _ = self.request(write_half, reader, req).await?;
+        if let Some(bound) = bound {
+            let req = Request::ServerKill {
+                target: bound.to_string(),
+            };
+            let _ = self.request(write_half, reader, req).await?;
+        }
         Ok(())
     }
 
@@ -4787,13 +4785,14 @@ mod tests {
         );
     }
 
-    /// `cmd-w` on an already-unbound pane (no tabs at all) must be a
-    /// complete no-op: nothing to drop, nothing to kill, and -- unlike
-    /// the daemon's own `client_close_tab` semantics for a scripted
-    /// `dimax client close-tab` caller -- the empty pane must stay in
-    /// the layout rather than being removed from the grid.
+    /// `cmd-w` on an unbound pane (no tabs at all -- e.g. right after
+    /// detaching via `cmd-shift-z`) must close the pane itself: the
+    /// empty placeholder is clutter to clean up, not a grid slot to
+    /// preserve. Same daemon path as a scripted `ClientCloseTab` on an
+    /// empty leaf (see `state::client_close_tab`), minus the
+    /// `ServerKill` -- nothing is bound, so nothing is killed.
     #[tokio::test]
-    async fn close_tab_on_an_already_unbound_pane_is_a_no_op() {
+    async fn close_tab_on_an_unbound_pane_closes_the_pane() {
         let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
 
         let Response::ClientPaneCreated { pane, .. } = app
@@ -4843,8 +4842,8 @@ mod tests {
             panic!("expected ClientPaneList");
         };
         assert!(
-            panes.iter().any(|p| p.id == pane),
-            "an already-unbound pane must survive cmd-w, not be removed from the layout"
+            !panes.iter().any(|p| p.id == pane),
+            "cmd-w on an unbound pane must close the pane, removing it from the layout"
         );
     }
 
@@ -4968,6 +4967,117 @@ mod tests {
             servers.iter().any(|s| s.id == sp1.id),
             "the remaining tab's server-pane must survive"
         );
+    }
+    /// `cmd-w` closing the workspace's *last* pane must land in the
+    /// empty-workspace state (tree `None`, spec: "dimax keeps running;
+    /// it does not exit") and leave the workspace usable -- a
+    /// subsequent spawn still creates a fresh leaf.
+    #[tokio::test]
+    async fn close_tab_on_an_unbound_last_pane_empties_the_workspace() {
+        let (mut app, mut write_half, mut reader) = app_against_real_daemon().await;
+
+        let Response::ClientPaneCreated { pane, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientSpawn {
+                    workspace: "1".to_string(),
+                    split_of: None,
+                    dir: None,
+                    bind: None,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneCreated");
+        };
+        app.focused = Some(pane);
+        if let Response::Snapshot { workspace, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::Subscribe {
+                    workspace: "1".to_string(),
+                },
+            )
+            .await
+            .unwrap()
+        {
+            app.workspace = workspace;
+        }
+
+        app.close_tab(&mut write_half, &mut reader).await.unwrap();
+
+        let Response::Snapshot { workspace, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::Subscribe {
+                    workspace: "1".to_string(),
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Snapshot");
+        };
+        assert!(
+            workspace.tree.is_none(),
+            "closing the last pane must leave the empty-workspace state, not exit or error"
+        );
+
+        // The workspace must still be usable: a fresh spawn recreates
+        // a leaf.
+        let Response::ServerPane(server) = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ServerSpawn {
+                    name: None,
+                    cmd: Some("cat".to_string()),
+                    cwd: Some(test_cwd()),
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ServerPane");
+        };
+        let Response::ClientPaneCreated { pane, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::ClientSpawn {
+                    workspace: "1".to_string(),
+                    split_of: None,
+                    dir: None,
+                    bind: Some(server.id.to_string()),
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected ClientPaneCreated");
+        };
+        let Response::Snapshot { workspace, .. } = app
+            .request(
+                &mut write_half,
+                &mut reader,
+                Request::Subscribe {
+                    workspace: "1".to_string(),
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected Snapshot");
+        };
+        assert!(
+            workspace.tree.is_some(),
+            "a spawn after emptying the workspace must recreate the tree"
+        );
+        let _ = pane; // pane id only needed for the response shape above
     }
 
     /// `cmd-shift-z` end to end: the picker it opens must already have
